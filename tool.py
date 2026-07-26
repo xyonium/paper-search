@@ -17,13 +17,14 @@ description: |
   2. read_paper(source, paper_id, pdf_url) → 读全文（后端工具 + pdf_url 自动 fallback）
   3. download_paper_to_knowledge(...)      → PDF 下载并加入 Knowledge 知识库
 author: openags-bridge
-requirements: requests, pymupdf
-version: 2.1.0
+requirements: requests, pymupdf, anyio
+version: 2.2.0
 license: MIT
 """
 
 import json
 import os
+import anyio
 import requests
 from pydantic import BaseModel, Field
 
@@ -48,7 +49,7 @@ class Tools:
 
     class UserValves(BaseModel):
         default_sources: str = Field(
-            default="arxiv,pubmed,biorxiv,medrxiv,iacr,semantic,crossref,openalex,pmc,core,europepmc,dblp,openaire,doaj,halc",
+            default="arxiv,pubmed,biorxiv,medrxiv,iacr,semantic,crossref,openalex,pmc,core,europepmc,dblp,openaire,doaj,hal",
             description="默认搜索源：'all'=全部21源（慢，30s+）；或逗号分隔子集如 google_scholar,citeseerx,ssrn,base,ieee,zenodo,unpaywall",
         )
         knowledge_id: str = Field(
@@ -57,6 +58,10 @@ class Tools:
         allow_scihub: bool = Field(
             default=True,
             description="允许 download fallback 链在 OA 源全失败后使用 Sci-Hub（法律风险自担）",
+        )
+        scihub_url: str = Field(
+            default="https://sci-hub.ee",
+            description="Sci-Hub 镜像站 Base URL，例如 https://sci-hub.vg, https://sci-hub.mk, 或者去https://sci-hub.shop查看最新",
         )
 
     # 覆盖全部 21 个源 + 可选 IEEE/ACM（配 key 后动态注册）
@@ -117,30 +122,40 @@ class Tools:
         headers = {}
         if self.valves.mcpo_api_key:
             headers["Authorization"] = f"Bearer {self.valves.mcpo_api_key}"
-        resp = requests.post(
-            f"{self.valves.mcpo_url.rstrip('/')}/{tool}",
-            json=args,
-            headers=headers,
-            timeout=timeout,
-        )
-        resp.raise_for_status()
         try:
-            data = resp.json()
-        except ValueError:
-            return resp.text
-        if isinstance(data, dict) and set(data) == {"result"}:
-            return data["result"]
-        return data
+            resp = requests.post(
+                f"{self.valves.mcpo_url.rstrip('/')}/{tool}",
+                json=args,
+                headers=headers,
+                timeout=timeout,
+            )
+            resp.raise_for_status()
+            try:
+                data = resp.json()
+            except ValueError:
+                return resp.text
+            if isinstance(data, dict) and set(data) == {"result"}:
+                return data["result"]
+            return data
+        except requests.exceptions.Timeout:
+            raise RuntimeError(f"后端 mcpo 调用超时 ({timeout}s)")
+        except requests.exceptions.RequestException as e:
+            raise RuntimeError(f"后端 mcpo 请求失败: {e}")
 
     def _owui_headers(self, __request__=None) -> dict:
-        token = None
-        if __request__ is not None:
-            token = __request__.headers.get("Authorization")
-        if not token and self.valves.owui_api_key:
-            token = f"Bearer {self.valves.owui_api_key}"
-        if not token:
+        headers = {}
+        if __request__ is not None and hasattr(__request__, "headers"):
+            auth = __request__.headers.get("authorization") or __request__.headers.get("Authorization")
+            if auth:
+                headers["Authorization"] = auth
+            cookie = __request__.headers.get("cookie") or __request__.headers.get("Cookie")
+            if cookie:
+                headers["Cookie"] = cookie
+        if "Authorization" not in headers and self.valves.owui_api_key:
+            headers["Authorization"] = f"Bearer {self.valves.owui_api_key}"
+        if not headers.get("Authorization") and not headers.get("Cookie"):
             raise RuntimeError("无法获取 OpenWebUI 凭证，请在 Valves 配置 owui_api_key")
-        return {"Authorization": token}
+        return headers
 
     @staticmethod
     def _trim_paper(p: dict, max_abstract: int = 600) -> dict:
@@ -175,27 +190,65 @@ class Tools:
     ) -> str:
         headers = self._owui_headers(__request__)
         safe = "".join(c if c.isalnum() or c in " ._-" else "_" for c in title)[:80]
-        r = requests.post(
-            f"{self.valves.openwebui_url.rstrip('/')}/api/v1/files/",
-            headers=headers,
-            files={"file": (f"{safe}.pdf", data, "application/pdf")},
-            timeout=120,
-        )
-        r.raise_for_status()
-        file_id = r.json()["id"]
-        if knowledge_id:
+        try:
+            files = {"file": (f"{safe}.pdf", data, "application/pdf")}
+            form_data = {}
+            if knowledge_id:
+                form_data["metadata"] = json.dumps({"knowledge_id": knowledge_id})
+
             r = requests.post(
-                f"{self.valves.openwebui_url.rstrip('/')}/api/v1/knowledge/{knowledge_id}/file/add",
-                headers={**headers, "Content-Type": "application/json"},
-                json={"file_id": file_id},
-                timeout=60,
+                f"{self.valves.openwebui_url.rstrip('/')}/api/v1/files/",
+                headers=headers,
+                files=files,
+                data=form_data if form_data else None,
+                timeout=120,
             )
-            r.raise_for_status()
-            return f"✅ 已下载《{title}》并加入 Knowledge（file_id: {file_id}），可被 RAG 检索引用。"
-        return f"✅ 已下载《{title}》并上传（file_id: {file_id}）。未配置 knowledge_id，未入库。"
+            if not r.ok:
+                err_detail = r.text
+                try:
+                    err_detail = r.json().get("detail", r.text)
+                except Exception:
+                    pass
+                raise RuntimeError(
+                    f"上传文件到 /api/v1/files/ 失败 ({r.status_code}): {err_detail}"
+                )
+
+            file_id = r.json().get("id")
+            if not file_id:
+                raise RuntimeError(f"上传成功但响应中无 id: {r.text}")
+
+            if knowledge_id:
+                add_url = f"{self.valves.openwebui_url.rstrip('/')}/api/v1/knowledge/{knowledge_id}/file/add"
+                add_resp = requests.post(
+                    add_url,
+                    headers={**headers, "Content-Type": "application/json"},
+                    json={"file_id": file_id},
+                    timeout=60,
+                )
+                if not add_resp.ok:
+                    add_err = add_resp.text
+                    try:
+                        add_err = add_resp.json().get("detail", add_resp.text)
+                    except Exception:
+                        pass
+                    # 如果由于 metadata 已自动关联或重复内容导致 400/409，视作已成功
+                    if add_resp.status_code in (400, 409) and any(
+                        kw in str(add_err).lower()
+                        for kw in ["already", "exist", "duplicate", "in knowledge"]
+                    ):
+                        pass
+                    else:
+                        raise RuntimeError(
+                            f"关联文件到 Knowledge ({knowledge_id}) 失败 ({add_resp.status_code}): {add_err}"
+                        )
+
+                return f"✅ 已下载《{title}》并加入 Knowledge（file_id: {file_id}），可被 RAG 检索引用。"
+            return f"✅ 已下载《{title}》并上传（file_id: {file_id}）。未配置 knowledge_id，未入库。"
+        except Exception as e:
+            raise RuntimeError(f"上传文件到 OpenWebUI 失败: {e}")
 
     # ---------- 暴露给 LLM ----------
-    def search_papers(
+    async def search_papers(
         self,
         query: str,
         max_results_per_source: int = 5,
@@ -219,16 +272,21 @@ class Tools:
             or (uv.default_sources if uv else None)
             or "arxiv,semantic,openalex,pubmed,pmc,core,europepmc"
         )
-        result = self._mcp_call(
-            "search_papers",
-            {
-                "query": query,
-                "max_results_per_source": max_results_per_source,
-                "sources": src,
-            },
-        )
+        try:
+            result = await anyio.to_thread.run_sync(
+                self._mcp_call,
+                "search_papers",
+                {
+                    "query": query,
+                    "max_results_per_source": max_results_per_source,
+                    "sources": src,
+                },
+            )
+        except Exception as e:
+            return json.dumps({"error": f"后端 search_papers 调用失败: {e}"}, ensure_ascii=False)
+
         if not isinstance(result, dict):
-            return json.dumps({"error": "backend 返回异常", "raw": str(result)[:500]})
+            return json.dumps({"error": "backend 返回异常", "raw": str(result)[:500]}, ensure_ascii=False)
         papers = [self._trim_paper(p) for p in result.get("papers", [])]
         return json.dumps(
             {
@@ -242,7 +300,7 @@ class Tools:
             indent=2,
         )
 
-    def read_paper(
+    async def read_paper(
         self,
         source: str,
         paper_id: str = "",
@@ -262,13 +320,20 @@ class Tools:
         :param pdf_url: search 结果的 pdf_url 字段（强烈建议总是提供，作 fallback）
         :param max_chars: 最大返回字符数
         """
+        try:
+            max_chars = int(max_chars)
+        except (TypeError, ValueError):
+            max_chars = 25000
+
         src = (source or "").strip().lower()
         backend_tool = self._READ_TOOLS.get(src)
         backend_err = ""
 
         if backend_tool and paper_id:
             try:
-                text = self._mcp_call(backend_tool, {"paper_id": paper_id}, timeout=300)
+                text = await anyio.to_thread.run_sync(
+                    self._mcp_call, backend_tool, {"paper_id": paper_id}, 300
+                )
                 if not self._is_unsupported_msg(text):
                     return text[:max_chars] + (
                         "\n\n[…全文截断…]" if len(text) > max_chars else ""
@@ -283,21 +348,24 @@ class Tools:
 
         if pdf_url:
             try:
-                r = requests.get(
-                    pdf_url,
-                    timeout=180,
-                    headers={"User-Agent": "Mozilla/5.0"},
-                    allow_redirects=True,
-                )
-                r.raise_for_status()
-                if not r.content.startswith(b"%PDF"):
-                    raise RuntimeError("返回非 PDF（可能付费墙页面）")
-                text = self._pdf_to_text(r.content)
+                def _fetch_pdf():
+                    r = requests.get(
+                        pdf_url,
+                        timeout=180,
+                        headers={"User-Agent": "Mozilla/5.0"},
+                        allow_redirects=True,
+                    )
+                    r.raise_for_status()
+                    if not r.content.startswith(b"%PDF"):
+                        raise RuntimeError("返回非 PDF（可能付费墙页面）")
+                    return self._pdf_to_text(r.content)
+
+                text = await anyio.to_thread.run_sync(_fetch_pdf)
                 if text:
                     return text[:max_chars] + (
                         "\n\n[…全文截断…]" if len(text) > max_chars else ""
                     )
-                return json.dumps({"error": "PDF 提取为空（扫描版图片 PDF）"})
+                return json.dumps({"error": "PDF 提取为空（扫描版图片 PDF）"}, ensure_ascii=False)
             except Exception as e:
                 return json.dumps(
                     {
@@ -315,7 +383,7 @@ class Tools:
             ensure_ascii=False,
         )
 
-    def download_paper_to_knowledge(
+    async def download_paper_to_knowledge(
         self,
         title: str,
         source: str = "",
@@ -337,19 +405,26 @@ class Tools:
         uv = __user__.get("valves") if __user__ else None
         knowledge_id = (uv.knowledge_id if uv else "") or ""
         allow_scihub = uv.allow_scihub if uv else True
+        scihub_url = (uv.scihub_url if uv else "https://sci-hub.ee") or "https://sci-hub.ee"
 
         # 路径1: 直接 pdf_url 下载（最快，不依赖共享卷）
         if pdf_url:
             try:
-                r = requests.get(
-                    pdf_url,
-                    timeout=180,
-                    headers={"User-Agent": "Mozilla/5.0"},
-                    allow_redirects=True,
-                )
-                r.raise_for_status()
-                if r.content.startswith(b"%PDF"):
-                    return self._upload_pdf(r.content, title, knowledge_id, __request__)
+                def _direct_download():
+                    r = requests.get(
+                        pdf_url,
+                        timeout=180,
+                        headers={"User-Agent": "Mozilla/5.0"},
+                        allow_redirects=True,
+                    )
+                    r.raise_for_status()
+                    if r.content.startswith(b"%PDF"):
+                        return self._upload_pdf(r.content, title, knowledge_id, __request__)
+                    return None
+
+                res = await anyio.to_thread.run_sync(_direct_download)
+                if res:
+                    return res
             except Exception:
                 pass  # 静默落入 fallback 链
 
@@ -363,19 +438,31 @@ class Tools:
                 ensure_ascii=False,
             )
 
-        result = self._mcp_call(
-            "download_with_fallback",
-            {
-                "source": source
-                or "crossref",  # crossref 必失败 → 直接进 OA fallback 链（有意为之）
-                "paper_id": paper_id or doi or title,
-                "doi": doi,
-                "title": title,
-                "save_path": self.valves.shared_download_dir,
-                "use_scihub": allow_scihub,
-            },
-            timeout=600,
-        )
+        try:
+            result = await anyio.to_thread.run_sync(
+                self._mcp_call,
+                "download_with_fallback",
+                {
+                    "source": source
+                    or "crossref",  # crossref 必失败 → 直接进 OA fallback 链（有意为之）
+                    "paper_id": paper_id or doi or title,
+                    "doi": doi,
+                    "title": title,
+                    "save_path": self.valves.shared_download_dir,
+                    "use_scihub": allow_scihub,
+                    "scihub_base_url": scihub_url,
+                },
+                600,
+            )
+        except Exception as e:
+            return json.dumps(
+                {
+                    "error": "下载请求异常/超时",
+                    "detail": str(e),
+                    "hint": "可检查后端日志或手动确认该论文 DOI 是否在 Open Access 仓储中可用",
+                },
+                ensure_ascii=False,
+            )
 
         if isinstance(result, str) and result.endswith(".pdf"):
             local_path = result
@@ -394,22 +481,34 @@ class Tools:
                         },
                         ensure_ascii=False,
                     )
-            with open(local_path, "rb") as f:
-                data = f.read()
             try:
-                os.remove(local_path)  # 上传后清理，避免共享卷膨胀
-            except OSError:
-                pass
-            msg = self._upload_pdf(data, title, knowledge_id, __request__)
-            if "scihub" in result.lower() or "sci-hub" in result.lower():
-                msg += "（来源：Sci-Hub fallback）"
-            return msg
+                def _read_and_upload():
+                    with open(local_path, "rb") as f:
+                        data = f.read()
+                    try:
+                        os.remove(local_path)  # 上传后清理，避免共享卷膨胀
+                    except OSError:
+                        pass
+                    return self._upload_pdf(data, title, knowledge_id, __request__)
+
+                msg = await anyio.to_thread.run_sync(_read_and_upload)
+                if "scihub" in result.lower() or "sci-hub" in result.lower():
+                    msg += "（来源：Sci-Hub fallback）"
+                return msg
+            except Exception as e:
+                return json.dumps(
+                    {
+                        "error": "读取落盘 PDF 并上传到 OpenWebUI 失败",
+                        "detail": str(e),
+                    },
+                    ensure_ascii=False,
+                )
 
         return json.dumps(
             {
                 "error": "完整 fallback 链均未获取到 PDF",
                 "detail": str(result)[:500],
-                "hint": "该文可能无 OA 版本；可告知用户手动获取，或检查 Sci-Hub 镜像可用性",
+                "hint": "该文可能无 OA 版本；可告知用户手动获取，或检查 Sci-Hub 镜像可用性（也可在 Valves 设置 scihub_url 为可用镜像）",
             },
             ensure_ascii=False,
         )
