@@ -138,6 +138,16 @@ Once installed, OpenWebUI models can call the following tools:
 
 ---
 
+## 🙏 Acknowledgments & Credits
+
+Special thanks to the open-source projects that make this integration possible:
+
+- **[paper-search-mcp](https://github.com/vllm-project/paper-search-mcp)**: The underlying Model Context Protocol (MCP) server providing multi-platform academic search and paper retrieval capabilities.
+- **[mcpo](https://github.com/open-webui/mcpo)**: The OpenAPI-to-MCP bridge by OpenWebUI for exposing MCP servers over HTTP.
+- **[OpenWebUI](https://github.com/open-webui/open-webui)**: The open-source AI user interface and RAG ecosystem.
+
+---
+
 ## 📜 License
 
 Distributed under the [MIT License](./LICENSE).
