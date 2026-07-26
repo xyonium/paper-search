@@ -231,10 +231,17 @@ class Tools:
                         add_err = add_resp.json().get("detail", add_resp.text)
                     except Exception:
                         pass
-                    # 如果由于 metadata 已自动关联或重复内容导致 400/409，视作已成功
+                    # 如果由于 metadata 已自动关联、重复内容或后台异步解析延迟导致 400/409，视作已成功
                     if add_resp.status_code in (400, 409) and any(
                         kw in str(add_err).lower()
-                        for kw in ["already", "exist", "duplicate", "in knowledge"]
+                        for kw in [
+                            "already",
+                            "exist",
+                            "duplicate",
+                            "in knowledge",
+                            "content provided is empty",
+                            "empty",
+                        ]
                     ):
                         pass
                     else:
