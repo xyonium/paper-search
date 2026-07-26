@@ -1,0 +1,150 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Overview & Architecture
+
+This repository integrates multi-source academic paper searching, reading, and downloading into **OpenWebUI** using **mcpo** (MCP-to-OpenAPI bridge) and a custom OpenWebUI Python Tool.
+
+```
+[User / OpenWebUI UI]
+        │
+        ├── Native Remote MCP (Streamable HTTP): Consensus MCP / Exa MCP
+        │
+        └── OpenWebUI Python Tool (Bridge & Interceptor Layer)
+                 │
+                 ├── search_papers()  ──► POST http://mcp:8000/papers/search_papers
+                 │                        (Aggregates 16 active academic platforms)
+                 │
+                 ├── read_paper()     ──► Backend Tool (_READ_TOOLS) ──► PDF Direct Fallback
+                 │
+                 └── download_paper_to_knowledge()
+                          │
+                          ├─► [Path 1] Direct pdf_url download (fastest)
+                          │
+                          └─► [Path 2] mcpo POST /papers/download_with_fallback
+                                   │  (Saves PDF to shared Docker volume)
+                                   ▼
+                             Read from `/downloads/` (shared volume)
+                                   │
+                             Push to OpenWebUI `/api/v1/files/`
+                                   │
+                             Add to Knowledge Collection (`/api/v1/knowledge/{id}/file/add`)
+```
+
+---
+
+## Environment & Service Setup
+
+### Docker Compose
+`mcp` (`mcpo` wrapping `paper-search-mcp`) and `open-webui` containers share the `paper-downloads` volume at `/downloads`:
+
+```yaml
+services:
+  mcp:
+    image: ghcr.io/open-webui/mcpo:main
+    command: --port 8000 --api-key "YOUR_MCPO_API_KEY" --config /config/config.json --hot-reload
+    volumes:
+      - ./config.json:/config/config.json
+      - paper-downloads:/downloads
+
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    environment:
+      - OPENWEBUI_URL=http://open-webui:8080
+    volumes:
+      - open-webui-data:/app/backend/data
+      - paper-downloads:/downloads
+
+volumes:
+  paper-downloads:
+  open-webui-data:
+```
+
+### mcpo Configuration (`config.json`)
+Maps server name `"papers"` to `http://mcp:8000/papers`:
+
+```json
+{
+  "mcpServers": {
+    "papers": {
+      "command": "uvx",
+      "args": ["paper-search-mcp"],
+      "env": {
+        "PAPER_SEARCH_MCP_UNPAYWALL_EMAIL": "your_email@example.com",
+        "PAPER_SEARCH_MCP_SEMANTIC_SCHOLAR_API_KEY": "s2k-xxx",
+        "PAPER_SEARCH_MCP_DOAJ_API_KEY": "xxx",
+        "PAPER_SEARCH_MCP_ZENODO_ACCESS_TOKEN": "xxx",
+        "NCBI_API_KEY": "xxx",
+        "PAPER_SEARCH_MCP_GOOGLE_SCHOLAR_PROXY_URL": "http://your_proxy:port"
+      }
+    }
+  }
+}
+```
+
+---
+
+## Data Sources Matrix
+
+### Verified Active Sources (16 Selected)
+Default selection in UserValves:
+`default_sources = "arxiv,pubmed,biorxiv,medrxiv,google_scholar,iacr,semantic,crossref,openalex,pmc,core,europepmc,dblp,openaire,doaj,hal"`
+
+| Platform | Search | Read Tool | Native Download | Notes |
+|---|---|---|---|---|
+| **arXiv** | ✅ | `read_arxiv_paper` | ✅ | Open PDF, fast & reliable |
+| **PubMed** | ✅ | ⚠️ metadata only | ❌ | Requires `NCBI_API_KEY` for rate limits |
+| **bioRxiv / medRxiv** | ✅ | `read_biorxiv/medrxiv_paper` | ✅ | Open preprints (DOI based) |
+| **Semantic Scholar** | ✅ | `read_semantic_paper` | ✅ (OA) | Requires `SEMANTIC_SCHOLAR_API_KEY` |
+| **Crossref** | ✅ | ⚠️ metadata only | ❌ | Citation & DOI backbone |
+| **OpenAlex** | ✅ | ⚠️ metadata only | ❌ | Open metadata backbone |
+| **PMC / Europe PMC** | ✅ | ⚠️ Fallback to PDF | ✅ (OA) | High quality biomedical full-text |
+| **CORE** | ✅ | ⚠️ Fallback to PDF | ✅ (OA) | Global repository aggregator |
+| **Google Scholar** | ✅ | ❌ | ❌ | May return 403 without proxy |
+| **IACR** | ✅ | `read_iacr_paper` | ✅ | Cryptography ePrints |
+| **OpenAIRE / DOAJ / HAL / dblp** | ✅ | Varies / Fallback | Record-dependent | Domain repositories |
+
+### Excluded / Disabled Sources
+- **CiteSeerX**: API Endpoint permanently dead (redirects to archive.org 404).
+- **SSRN**: Cloudflare 403 anti-bot challenge active.
+- **BASE**: OAI-PMH endpoint times out / SSL EOF errors.
+- **Zenodo**: Bug in `zenodo.py` (`'str' object has no attribute 'isoformat'`).
+- **IEEE Xplore / ACM**: Connectors are un-implemented skeletons (`search is not yet implemented`).
+- **Unpaywall**: DOI lookup only (keywords search unsupported).
+
+---
+
+## Fallback & Download Mechanics
+
+### 1. `download_with_fallback` Pipeline
+```
+[Request: source, paper_id, doi, title]
+   │
+   ▼
+1. Source-native Download
+   (arXiv, bioRxiv, medrxiv, iacr, semantic, pmc, core, europepmc, etc.)
+   │ Failed?
+   ▼
+2. Open Access Repository Search
+   Query OpenAIRE / CORE / Europe PMC / PMC using DOI or Title
+   │ Failed?
+   ▼
+3. Unpaywall Resolution
+   Query Unpaywall API using DOI -> Resolve direct open access PDF URL
+   │ Failed?
+   ▼
+4. Sci-Hub Fallback (If use_scihub=True)
+   Attempt download via Sci-Hub mirror (default: https://sci-hub.se)
+```
+
+### 2. File Ingestion into OpenWebUI Knowledge Base
+1. **Fetch**: Direct Stream via `pdf_url` OR backend `download_with_fallback` reading from `/downloads/{filename}.pdf`.
+2. **Upload**: `POST {OPENWEBUI_URL}/api/v1/files/` with multipart form-data.
+3. **Associate**: `POST {OPENWEBUI_URL}/api/v1/knowledge/{knowledge_id}/file/add` with `{"file_id": "file_id_xxx"}`.
+4. **Cleanup**: Remove local file from `/downloads/` after upload.
+
+---
+
+## Code Reference: OpenWebUI Tool Script
+in:./tool.py

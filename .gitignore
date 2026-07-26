@@ -1,0 +1,23 @@
+# CodeGraph local runtime files
+.codegraph/*
+!.codegraph/.gitignore
+
+# Byte-compiled / Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environment files
+.env
+.env.local
+
+# Virtual environment
+.venv/
+env/
+venv/
+
+# Claude local settings
+.claude/settings.local.json
+
+# Downloaded files
+downloads/
