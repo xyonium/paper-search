@@ -16,8 +16,8 @@ __pycache__/
 env/
 venv/
 
-# Claude local settings
-.claude/settings.local.json
+# Local settings & temporary files
+.claude/settings.local.json*
 
 # Downloaded files
 downloads/
