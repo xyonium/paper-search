@@ -219,6 +219,32 @@ class Tools:
             "url": bib.get("website") or "",
         }
 
+    async def _zhihuiya_search(self, query: str, limit: int, key: str) -> list:
+        """search_literature + literature_bibliography 两步，返回 map 后的 paper 列表。"""
+        search_resp = await self._zhihuiya_call(
+            "search_literature",
+            {"text": query, "type": "all", "limit": max(1, min(int(limit), 100))},
+            key,
+        )
+        results = ((search_resp or {}).get("data") or {}).get("results") or []
+        if not results:
+            return []
+
+        ids = [r.get("paper_id") for r in results if r.get("paper_id")]
+        bib_by_id = {}
+        if ids:
+            bib_resp = await self._zhihuiya_call(
+                "literature_bibliography", {"paper_id": ",".join(ids[:100])}, key
+            )
+            for b in (bib_resp or {}).get("data") or []:
+                if isinstance(b, dict) and b.get("paper_id"):
+                    bib_by_id[b["paper_id"]] = b
+
+        return [
+            self._zhihuiya_map_paper(r, bib_by_id.get(r.get("paper_id")))
+            for r in results
+        ]
+
     def _mcp_call(self, tool: str, args: dict, timeout: int = 180):
         headers = {}
         if self.valves.mcpo_api_key:

@@ -137,3 +137,52 @@ def test_map_paper_handles_missing_bib_and_list_fields():
     assert out["authors"] == ""
     assert out["abstract"] == ""
     assert out["published_date"] == ""
+
+
+@pytest.mark.asyncio
+async def test_zhihuiya_search_two_step_merges_abstract():
+    t = Tools()
+    search_resp = {
+        "success": True,
+        "data": {"results": [
+            {"paper_id": "p1", "doi": "10.1/a", "title": ["T1"], "author": ["A"]},
+            {"paper_id": "p2", "doi": "10.1/b", "title": ["T2"], "author": ["B"]},
+        ]},
+    }
+    bib_resp = {
+        "success": True,
+        "data": [
+            {"paper_id": "p1", "abstract": [{"lang": "EN", "text": "abs1"}],
+             "publication_year": "2020"},
+            {"paper_id": "p2", "abstract": [{"lang": "EN", "text": "abs2"}],
+             "publication_year": "2021"},
+        ],
+    }
+    calls = []
+
+    async def fake_call(tool_name, args, key, timeout=30):
+        calls.append((tool_name, args))
+        return search_resp if tool_name == "search_literature" else bib_resp
+
+    t._zhihuiya_call = fake_call
+    papers = await t._zhihuiya_search("CRISPR", 2, "key")
+
+    assert [c[0] for c in calls] == ["search_literature", "literature_bibliography"]
+    # bibliography 批量一次调用，逗号分隔
+    assert calls[1][1]["paper_id"] == "p1,p2"
+    assert len(papers) == 2
+    assert papers[0]["abstract"] == "abs1"
+    assert papers[1]["abstract"] == "abs2"
+    assert all(p["source"] == "zhihuiya" for p in papers)
+
+
+@pytest.mark.asyncio
+async def test_zhihuiya_search_skips_bibliography_when_no_ids():
+    t = Tools()
+
+    async def fake_call(tool_name, args, key, timeout=30):
+        return {"success": True, "data": {"results": []}}
+
+    t._zhihuiya_call = fake_call
+    papers = await t._zhihuiya_search("nothing", 5, "key")
+    assert papers == []
