@@ -46,6 +46,10 @@ class Tools:
             default="/downloads",
             description="mcpo 与 openwebui 共享 volume 的挂载路径（两容器内需一致）",
         )
+        zhihuiya_apikey: str = Field(
+            default="",
+            description="智慧芽(zhihuiya)科学文献 API key（管理员/公司级，留空则不启用该源）",
+        )
 
     class UserValves(BaseModel):
         default_sources: str = Field(
@@ -62,6 +66,15 @@ class Tools:
         scihub_url: str = Field(
             default="https://sci-hub.ee",
             description="Sci-Hub 镜像站 Base URL，例如 https://sci-hub.vg, https://sci-hub.mk, 或者去https://sci-hub.shop查看最新",
+        )
+        zhihuiya_apikey: str = Field(
+            default="",
+            description="智慧芽个人 API key（非空时覆盖管理员 key）",
+            json_schema_extra={"input": {"type": "password"}},
+        )
+        zhihuiya_enabled: bool = Field(
+            default=True,
+            description="是否启用智慧芽文献源（需 admin 或个人已配 key）",
         )
 
     # 覆盖全部 21 个源 + 可选 IEEE/ACM（配 key 后动态注册）
@@ -118,6 +131,17 @@ class Tools:
         self.citation = False
 
     # ---------- 内部 ----------
+    # ---------- 智慧芽 zhihuiya ----------
+    _ZHIHUIYA_MCP_URL = "https://connect.zhihuiya.com/eba075/mcp?apikey={key}"
+
+    def _zhihuiya_enabled_key(self, __user__=None) -> tuple:
+        uv = __user__.get("valves") if __user__ else None
+        user_key = (getattr(uv, "zhihuiya_apikey", "") or "").strip()
+        admin_key = (getattr(self.valves, "zhihuiya_apikey", "") or "").strip()
+        key = user_key or admin_key
+        enabled = bool(getattr(uv, "zhihuiya_enabled", True)) and bool(key)
+        return enabled, key
+
     def _mcp_call(self, tool: str, args: dict, timeout: int = 180):
         headers = {}
         if self.valves.mcpo_api_key:
