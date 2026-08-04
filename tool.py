@@ -11,6 +11,7 @@ description: |
     openaire, doaj, base, zenodo, hal, citeseerx, dblp (CS书目), unpaywall (仅DOI查询)
   · 不稳定源（反爬/间歇故障，失败自动降级不影响整体）: google_scholar, ssrn
   · 可选付费源（需在 mcpo env 配 key 才注册）: ieee, acm
+  · 智慧芽（需配 apikey 才启用，tool.py 直连不经 mcpo）: zhihuiya
 
   【工具用法】
   1. search_papers(query)      → 多源并发搜索+去重，返回标题/作者/摘要/引用数/pdf_url
@@ -18,14 +19,17 @@ description: |
   3. download_paper_to_knowledge(...)      → PDF 下载并加入 Knowledge 知识库
 author: openags-bridge
 requirements: requests, pymupdf, anyio
-version: 2.2.0
+version: 2.3.0
 license: MIT
 """
 
+import asyncio
 import json
 import os
 import anyio
 import requests
+from mcp import ClientSession
+from mcp.client.streamable_http import streamablehttp_client
 from pydantic import BaseModel, Field
 
 
@@ -46,11 +50,15 @@ class Tools:
             default="/downloads",
             description="mcpo 与 openwebui 共享 volume 的挂载路径（两容器内需一致）",
         )
+        zhihuiya_apikey: str = Field(
+            default="",
+            description="智慧芽(zhihuiya)科学文献 API key（管理员/公司级，留空则不启用该源）",
+        )
 
     class UserValves(BaseModel):
         default_sources: str = Field(
             default="arxiv,pubmed,biorxiv,medrxiv,iacr,semantic,crossref,openalex,pmc,core,europepmc,dblp,openaire,doaj,hal",
-            description="默认搜索源：'all'=全部21源（慢，30s+）；或逗号分隔子集如 google_scholar,citeseerx,ssrn,base,ieee,zenodo,unpaywall",
+            description="默认搜索源：'all'=全部21源（慢，30s+）；或逗号分隔子集如 google_scholar,citeseerx,ssrn,base,ieee,zenodo,unpaywall；zhihuiya 需配 apikey 后才会被纳入（可在此加入）",
         )
         knowledge_id: str = Field(
             default="", description="下载 PDF 自动加入的 Knowledge 集合 ID"
@@ -62,6 +70,15 @@ class Tools:
         scihub_url: str = Field(
             default="https://sci-hub.ee",
             description="Sci-Hub 镜像站 Base URL，例如 https://sci-hub.vg, https://sci-hub.mk, 或者去https://sci-hub.shop查看最新",
+        )
+        zhihuiya_apikey: str = Field(
+            default="",
+            description="智慧芽个人 API key（非空时覆盖管理员 key）",
+            json_schema_extra={"input": {"type": "password"}},
+        )
+        zhihuiya_enabled: bool = Field(
+            default=True,
+            description="是否启用智慧芽文献源（需 admin 或个人已配 key）",
         )
 
     # 覆盖全部 21 个源 + 可选 IEEE/ACM（配 key 后动态注册）
@@ -93,6 +110,8 @@ class Tools:
         # ↓ 可选付费源（配 key 后工具存在，未配时调用会 404，被异常处理兜住）
         "ieee": "read_ieee_paper",
         "acm": "read_acm_paper",
+        # ↓ 智慧芽：直连元数据级 read（literature_bibliography），非后端工具
+        "zhihuiya": "zhihuiya_bibliography",
     }
 
     # 后端"不支持"提示的特征串（命中则视为无内容，降级 pdf_url fallback）
@@ -118,6 +137,131 @@ class Tools:
         self.citation = False
 
     # ---------- 内部 ----------
+    # ---------- 智慧芽 zhihuiya ----------
+    _ZHIHUIYA_MCP_URL = "https://connect.zhihuiya.com/eba075/mcp?apikey={key}"
+
+    def _zhihuiya_enabled_key(self, __user__=None) -> tuple:
+        uv = __user__.get("valves") if __user__ else None
+        user_key = (getattr(uv, "zhihuiya_apikey", "") or "").strip()
+        admin_key = (getattr(self.valves, "zhihuiya_apikey", "") or "").strip()
+        key = user_key or admin_key
+        enabled = bool(getattr(uv, "zhihuiya_enabled", True)) and bool(key)
+        return enabled, key
+
+    async def _zhihuiya_call(self, tool_name: str, args: dict, key: str, timeout: int = 30) -> dict:
+        """直连智慧芽 MCP 调用单个工具，返回解析后的 dict。失败抛 RuntimeError。"""
+        url = self._ZHIHUIYA_MCP_URL.format(key=key)
+
+        async def _run():
+            async with streamablehttp_client(url) as (read, write, _):
+                async with ClientSession(read, write) as session:
+                    await session.initialize()
+                    return await session.call_tool(tool_name, args)
+
+        try:
+            result = await asyncio.wait_for(_run(), timeout=timeout)
+        except asyncio.TimeoutError:
+            raise RuntimeError(f"智慧芽 {tool_name} 调用超时 ({timeout}s)")
+        except Exception as e:
+            raise RuntimeError(
+                f"智慧芽 {tool_name} 连接失败: {self._redact_zhihuiya_key(e)}"
+            )
+
+        if getattr(result, "isError", False):
+            msg = ""
+            for c in getattr(result, "content", []) or []:
+                msg = getattr(c, "text", "") or msg
+            raise RuntimeError(
+                f"智慧芽 {tool_name} 返回错误: {self._redact_zhihuiya_key(msg)[:300]}"
+            )
+
+        for c in getattr(result, "content", []) or []:
+            text = getattr(c, "text", None)
+            if not text:
+                continue
+            try:
+                return json.loads(text)
+            except (json.JSONDecodeError, TypeError):
+                return {"raw": text}
+        return {}
+
+    @staticmethod
+    def _redact_zhihuiya_key(text: str) -> str:
+        """错误信息脱敏：避免 httpx 把带 apikey 的 URL 拼进异常导致凭据泄露。"""
+        import re
+        return re.sub(r"apikey=[^&\s]+", "apikey=***", str(text))
+
+    @staticmethod
+    def _zhihuiya_text_list(field) -> str:
+        """智慧芽多语言字段 [{lang,text}] 或纯 list -> 拼接字符串。"""
+        if not field:
+            return ""
+        if isinstance(field, str):
+            return field.strip()
+        parts = []
+        for item in field:
+            if isinstance(item, dict):
+                parts.append((item.get("text") or "").strip())
+            else:
+                parts.append(str(item).strip())
+        return "; ".join(p for p in parts if p)
+
+    @staticmethod
+    def _zhihuiya_map_paper(search_item: dict, bib: dict = None) -> dict:
+        bib = bib or {}
+        title = Tools._zhihuiya_text_list(bib.get("title")) or Tools._zhihuiya_text_list(
+            search_item.get("title")
+        )
+        authors = search_item.get("author") or bib.get("author") or []
+        if isinstance(authors, str):
+            authors = [authors]
+        abstract = Tools._zhihuiya_text_list(bib.get("abstract"))
+        published = (
+            str(bib.get("publication_year") or bib.get("publication_date") or "")[:4]
+        )
+        return {
+            "title": title,
+            "authors": "; ".join(a for a in authors if a),
+            "published_date": published,
+            "abstract": abstract,
+            "paper_id": search_item.get("paper_id") or "",
+            "doi": search_item.get("doi") or bib.get("doi") or "",
+            "source": "zhihuiya",
+            "pdf_url": "",
+            "citations": 0,
+            "url": bib.get("website") or "",
+        }
+
+    async def _zhihuiya_search(self, query: str, limit: int, key: str) -> list:
+        """search_literature + literature_bibliography 两步，返回 map 后的 paper 列表。"""
+        search_resp = await self._zhihuiya_call(
+            "search_literature",
+            {"text": query, "type": "all", "limit": max(1, min(int(limit), 100))},
+            key,
+        )
+        results = ((search_resp or {}).get("data") or {}).get("results") or []
+        if not results:
+            return []
+
+        ids = [r.get("paper_id") for r in results if r.get("paper_id")]
+        bib_by_id = {}
+        if ids:
+            # 富化失败不丢弃搜索结果：降级为空 abstract，继续返回 title/author/doi
+            try:
+                bib_resp = await self._zhihuiya_call(
+                    "literature_bibliography", {"paper_id": ",".join(ids[:100])}, key
+                )
+            except Exception:
+                bib_resp = {}
+            for b in (bib_resp or {}).get("data") or []:
+                if isinstance(b, dict) and b.get("paper_id"):
+                    bib_by_id[b["paper_id"]] = b
+
+        return [
+            self._zhihuiya_map_paper(r, bib_by_id.get(r.get("paper_id")))
+            for r in results
+        ]
+
     def _mcp_call(self, tool: str, args: dict, timeout: int = 180):
         headers = {}
         if self.valves.mcpo_api_key:
@@ -272,6 +416,7 @@ class Tools:
             arxiv, biorxiv, medrxiv, iacr, pmc, europepmc, semantic, openalex,
             crossref, pubmed, core, openaire, doaj, base, zenodo, hal, citeseerx,
             dblp, unpaywall, google_scholar, ssrn (+ieee, acm 若已配 key)
+            zhihuiya（智慧芽，需在 Valves 配 apikey 才启用，直连不经 mcpo）
         """
         uv = __user__.get("valves") if __user__ else None
         src = (
@@ -279,8 +424,14 @@ class Tools:
             or (uv.default_sources if uv else None)
             or "arxiv,semantic,openalex,pubmed,pmc,core,europepmc"
         )
-        try:
-            result = await anyio.to_thread.run_sync(
+
+        zh_enabled, zh_key = self._zhihuiya_enabled_key(__user__)
+        want_zh = zh_enabled and (
+            "zhihuiya" in {s.strip().lower() for s in src.split(",")} or src.strip().lower() == "all"
+        )
+
+        async def _backend():
+            return await anyio.to_thread.run_sync(
                 self._mcp_call,
                 "search_papers",
                 {
@@ -289,18 +440,58 @@ class Tools:
                     "sources": src,
                 },
             )
-        except Exception as e:
-            return json.dumps({"error": f"后端 search_papers 调用失败: {e}"}, ensure_ascii=False)
+
+        async def _zh():
+            return await self._zhihuiya_search(query, max_results_per_source, zh_key)
+
+        backend_result, zh_result = None, None
+        zh_error = None
+        if want_zh:
+            results = await asyncio.gather(_backend(), _zh(), return_exceptions=True)
+            backend_result, zh_result = results[0], results[1]
+            if isinstance(zh_result, Exception):
+                zh_error, zh_result = zh_result, None
+        else:
+            backend_result = await _backend()
+
+        if isinstance(backend_result, Exception):
+            if want_zh and isinstance(zh_result, list) and zh_result:
+                # 后端失败但 zhihuiya 成功：保留 zhihuiya 结果，后端错误进 errors
+                result = {
+                    "papers": [],
+                    "source_results": {},
+                    "errors": {"backend": str(backend_result)},
+                }
+            else:
+                return json.dumps(
+                    {"error": f"后端 search_papers 调用失败: {backend_result}"},
+                    ensure_ascii=False,
+                )
+        else:
+            result = backend_result
 
         if not isinstance(result, dict):
             return json.dumps({"error": "backend 返回异常", "raw": str(result)[:500]}, ensure_ascii=False)
+
         papers = [self._trim_paper(p) for p in result.get("papers", [])]
+        source_results = dict(result.get("source_results", {}))
+        errors = dict(result.get("errors", {}))
+
+        if want_zh:
+            if zh_error is not None:
+                source_results["zhihuiya"] = 0
+                errors["zhihuiya"] = str(zh_error)
+            else:
+                zh_papers = [self._trim_paper(p) for p in (zh_result or [])]
+                papers.extend(zh_papers)
+                source_results["zhihuiya"] = len(zh_papers)
+
         return json.dumps(
             {
                 "query": query,
                 "total": len(papers),
-                "source_results": result.get("source_results", {}),
-                "errors": result.get("errors", {}),
+                "source_results": source_results,
+                "errors": errors,
                 "papers": papers,
             },
             ensure_ascii=False,
@@ -316,12 +507,14 @@ class Tools:
         __user__={},
     ) -> str:
         """
-        阅读论文全文（截断到 max_chars）。支持全部 21 个搜索源 + IEEE/ACM。
+        阅读论文全文（截断到 max_chars）。支持全部 21 个搜索源 + IEEE/ACM + 智慧芽。
         - 后端直接可读: arxiv, biorxiv, medrxiv, iacr, semantic, doaj, base,
           zenodo, hal, openaire, citeseerx（ieee/acm 需配 key）
         - pubmed/crossref/dblp 后端仅返回元数据提示，会自动降级用 pdf_url 提取
         - pmc, core, europepmc, openalex, google_scholar, ssrn, unpaywall:
           请同时传 pdf_url，将自动下载提取全文
+        - zhihuiya（智慧芽）: 元数据级 read（literature_bibliography 取 abstract+著录），
+          全文请用 doi 走 download_paper_to_knowledge 的 OA fallback 链
         :param source: search 结果的 source 字段
         :param paper_id: search 结果的 paper_id 字段
         :param pdf_url: search 结果的 pdf_url 字段（强烈建议总是提供，作 fallback）
@@ -336,7 +529,35 @@ class Tools:
         backend_tool = self._READ_TOOLS.get(src)
         backend_err = ""
 
-        if backend_tool and paper_id:
+        if src == "zhihuiya":
+            zh_enabled, zh_key = self._zhihuiya_enabled_key(__user__)
+            if not zh_enabled:
+                return json.dumps(
+                    {"error": "智慧芽源未启用（未配 apikey 或已关闭）"},
+                    ensure_ascii=False,
+                )
+            if paper_id:
+                try:
+                    bib = await self._zhihuiya_call(
+                        "literature_bibliography", {"paper_id": paper_id}, zh_key
+                    )
+                    data = (bib or {}).get("data") or []
+                    entry = data[0] if data else {}
+                    abstract = self._zhihuiya_text_list(entry.get("abstract"))
+                    if abstract:
+                        header = self._zhihuiya_text_list(entry.get("title"))
+                        pub = entry.get("publication") or ""
+                        year = str(entry.get("publication_year") or "")
+                        meta = " | ".join(x for x in [pub, year] if x)
+                        return (
+                            f"{header}\n{meta}\n\n{abstract}"
+                            "\n\n[智慧芽元数据级 read；全文请用 doi 走 download_paper_to_knowledge 的 OA fallback 链]"
+                        )[:max_chars]
+                    backend_err = "智慧芽无可用 abstract"
+                except Exception as e:
+                    backend_err = f"智慧芽读取失败: {self._redact_zhihuiya_key(e)}"
+
+        if backend_tool and paper_id and src != "zhihuiya":
             try:
                 text = await anyio.to_thread.run_sync(
                     self._mcp_call, backend_tool, {"paper_id": paper_id}, 300
