@@ -178,6 +178,47 @@ class Tools:
                 return {"raw": text}
         return {}
 
+    @staticmethod
+    def _zhihuiya_text_list(field) -> str:
+        """智慧芽多语言字段 [{lang,text}] 或纯 list -> 拼接字符串。"""
+        if not field:
+            return ""
+        if isinstance(field, str):
+            return field.strip()
+        parts = []
+        for item in field:
+            if isinstance(item, dict):
+                parts.append((item.get("text") or "").strip())
+            else:
+                parts.append(str(item).strip())
+        return "; ".join(p for p in parts if p)
+
+    @staticmethod
+    def _zhihuiya_map_paper(search_item: dict, bib: dict = None) -> dict:
+        bib = bib or {}
+        title = Tools._zhihuiya_text_list(bib.get("title")) or Tools._zhihuiya_text_list(
+            search_item.get("title")
+        )
+        authors = search_item.get("author") or bib.get("author") or []
+        if isinstance(authors, str):
+            authors = [authors]
+        abstract = Tools._zhihuiya_text_list(bib.get("abstract"))
+        published = (
+            str(bib.get("publication_year") or bib.get("publication_date") or "")[:4]
+        )
+        return {
+            "title": title,
+            "authors": "; ".join(a for a in authors if a),
+            "published_date": published,
+            "abstract": abstract,
+            "paper_id": search_item.get("paper_id") or "",
+            "doi": search_item.get("doi") or bib.get("doi") or "",
+            "source": "zhihuiya",
+            "pdf_url": "",
+            "citations": 0,
+            "url": bib.get("website") or "",
+        }
+
     def _mcp_call(self, tool: str, args: dict, timeout: int = 180):
         headers = {}
         if self.valves.mcpo_api_key:

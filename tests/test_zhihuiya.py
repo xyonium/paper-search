@@ -103,3 +103,37 @@ async def test_zhihuiya_call_raises_on_error_result():
 
         with pytest.raises(RuntimeError):
             await t._zhihuiya_call("search_literature", {"text": "x", "type": "all"}, "bad")
+
+
+def test_map_paper_merges_search_and_bibliography():
+    search_item = {
+        "paper_id": "p1",
+        "doi": "10.1/abc",
+        "title": ["Some Title"],
+        "author": ["Doe, John", "Roe, Jane"],
+    }
+    bib = {
+        "publication_year": "2021",
+        "publication": "Nature",
+        "abstract": [{"lang": "EN", "text": "An abstract."}],
+        "title": [{"lang": "EN", "text": "Some Title"}],
+    }
+    out = Tools._zhihuiya_map_paper(search_item, bib)
+    assert out["title"] == "Some Title"
+    assert out["authors"] == "Doe, John; Roe, Jane"
+    assert out["published_date"] == "2021"
+    assert out["abstract"] == "An abstract."
+    assert out["paper_id"] == "p1"
+    assert out["doi"] == "10.1/abc"
+    assert out["source"] == "zhihuiya"
+    assert out["pdf_url"] == ""
+    assert out["citations"] == 0
+
+
+def test_map_paper_handles_missing_bib_and_list_fields():
+    search_item = {"paper_id": "p2", "title": ["T"], "author": []}
+    out = Tools._zhihuiya_map_paper(search_item, None)
+    assert out["title"] == "T"
+    assert out["authors"] == ""
+    assert out["abstract"] == ""
+    assert out["published_date"] == ""
