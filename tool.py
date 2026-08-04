@@ -12,14 +12,17 @@ description: |
   · 不稳定源（反爬/间歇故障，失败自动降级不影响整体）: google_scholar, ssrn
   · 可选付费源（需在 mcpo env 配 key 才注册）: ieee, acm
   · 智慧芽（需配 apikey 才启用，tool.py 直连不经 mcpo）: zhihuiya
+  · 智慧芽专利（独立工具 search_patents/read_patent，同 key 启用）: patsnap
 
   【工具用法】
   1. search_papers(query)      → 多源并发搜索+去重，返回标题/作者/摘要/引用数/pdf_url
   2. read_paper(source, paper_id, pdf_url) → 读全文（后端工具 + pdf_url 自动 fallback）
   3. download_paper_to_knowledge(...)      → PDF 下载并加入 Knowledge 知识库
+  4. search_patents(query)     → 智慧芽专利语义检索（需配 zhihuiya_apikey）
+  5. read_patent(patent_number) → 读专利全文 markdown（权利要求+说明书+法律状态）
 author: openags-bridge
 requirements: requests, pymupdf, anyio
-version: 2.3.0
+version: 2.4.0
 license: MIT
 """
 
