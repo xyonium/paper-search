@@ -11,6 +11,7 @@ description: |
     openaire, doaj, base, zenodo, hal, citeseerx, dblp (CS书目), unpaywall (仅DOI查询)
   · 不稳定源（反爬/间歇故障，失败自动降级不影响整体）: google_scholar, ssrn
   · 可选付费源（需在 mcpo env 配 key 才注册）: ieee, acm
+  · 智慧芽（需配 apikey 才启用，tool.py 直连不经 mcpo）: zhihuiya
 
   【工具用法】
   1. search_papers(query)      → 多源并发搜索+去重，返回标题/作者/摘要/引用数/pdf_url
@@ -18,7 +19,7 @@ description: |
   3. download_paper_to_knowledge(...)      → PDF 下载并加入 Knowledge 知识库
 author: openags-bridge
 requirements: requests, pymupdf, anyio
-version: 2.2.0
+version: 2.3.0
 license: MIT
 """
 
@@ -57,7 +58,7 @@ class Tools:
     class UserValves(BaseModel):
         default_sources: str = Field(
             default="arxiv,pubmed,biorxiv,medrxiv,iacr,semantic,crossref,openalex,pmc,core,europepmc,dblp,openaire,doaj,hal",
-            description="默认搜索源：'all'=全部21源（慢，30s+）；或逗号分隔子集如 google_scholar,citeseerx,ssrn,base,ieee,zenodo,unpaywall",
+            description="默认搜索源：'all'=全部21源（慢，30s+）；或逗号分隔子集如 google_scholar,citeseerx,ssrn,base,ieee,zenodo,unpaywall；zhihuiya 需配 apikey 后才会被纳入（可在此加入）",
         )
         knowledge_id: str = Field(
             default="", description="下载 PDF 自动加入的 Knowledge 集合 ID"
@@ -415,6 +416,7 @@ class Tools:
             arxiv, biorxiv, medrxiv, iacr, pmc, europepmc, semantic, openalex,
             crossref, pubmed, core, openaire, doaj, base, zenodo, hal, citeseerx,
             dblp, unpaywall, google_scholar, ssrn (+ieee, acm 若已配 key)
+            zhihuiya（智慧芽，需在 Valves 配 apikey 才启用，直连不经 mcpo）
         """
         uv = __user__.get("valves") if __user__ else None
         src = (
@@ -505,12 +507,14 @@ class Tools:
         __user__={},
     ) -> str:
         """
-        阅读论文全文（截断到 max_chars）。支持全部 21 个搜索源 + IEEE/ACM。
+        阅读论文全文（截断到 max_chars）。支持全部 21 个搜索源 + IEEE/ACM + 智慧芽。
         - 后端直接可读: arxiv, biorxiv, medrxiv, iacr, semantic, doaj, base,
           zenodo, hal, openaire, citeseerx（ieee/acm 需配 key）
         - pubmed/crossref/dblp 后端仅返回元数据提示，会自动降级用 pdf_url 提取
         - pmc, core, europepmc, openalex, google_scholar, ssrn, unpaywall:
           请同时传 pdf_url，将自动下载提取全文
+        - zhihuiya（智慧芽）: 元数据级 read（literature_bibliography 取 abstract+著录），
+          全文请用 doi 走 download_paper_to_knowledge 的 OA fallback 链
         :param source: search 结果的 source 字段
         :param paper_id: search 结果的 paper_id 字段
         :param pdf_url: search 结果的 pdf_url 字段（强烈建议总是提供，作 fallback）
