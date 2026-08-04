@@ -416,3 +416,34 @@ def test_patsnap_map_patent_missing_fields():
     assert out["patent_number"] == "X1"
     assert out["title"] == "" and out["assignees"] == ""
     assert out["application_date"] == "" and out["cited_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_search_patents_returns_mapped():
+    t = Tools()
+    t.valves = Tools.Valves(zhihuiya_apikey="k")
+    resp = {"status": "success",
+            "data": {"total_hits": 100, "returned_count": 1, "docs": [
+                {"patent_number": "US1", "title": "T", "legal_status": "active",
+                 "application_date": 20200101, "assignees": ["A"], "cited_count": 2}]}}
+
+    async def fake_call(tool_name, args, key, timeout=30, url=None):
+        assert tool_name == "patsnap_search"
+        assert args["source"] == "patent"
+        assert args["search_strategy"] == ["semantic"]
+        assert url == Tools._PATSNAP_MCP_URL
+        return resp
+
+    t._zhihuiya_call = fake_call
+    out = json.loads(await t.search_patents("CRISPR", limit=5, __user__=_user()))
+    assert out["total_hits"] == 100
+    assert out["patents"][0]["patent_number"] == "US1"
+    assert out["patents"][0]["assignees"] == "A"
+
+
+@pytest.mark.asyncio
+async def test_search_patents_disabled_no_key():
+    t = Tools()
+    t.valves = Tools.Valves()  # 无 key
+    out = json.loads(await t.search_patents("x", __user__=_user()))
+    assert "error" in out

@@ -523,6 +523,63 @@ class Tools:
             indent=2,
         )
 
+    async def search_patents(
+        self,
+        query: str,
+        limit: int = 10,
+        sort: str = "relevance",
+        filters: dict = None,
+        __user__={},
+    ) -> str:
+        """
+        检索专利（智慧芽 patsnap，语义检索）。返回 patent_number/title/ipc/legal_status/
+        application_date/publication_date/cited_count/assignees/inventors/jurisdiction/url。
+        - 需在 Valves 配 zhihuiya_apikey（管理员或个人）才启用，否则返回错误 JSON
+        - 读专利全文用 read_patent(patent_number)
+        :param query: 自然语言技术问题/概念（如 'CRISPR gene editing'）
+        :param limit: 返回数量（1-100，默认10）
+        :param sort: 排序，默认 relevance；专利可选 publication/application/granted/
+            expired/priority/cited_count，前缀 '-' 降序（如 '-publication' 最新优先）
+        :param filters: 结构化筛选（申请人/IPC/日期/受理局等，可选）
+        """
+        zh_enabled, zh_key = self._zhihuiya_enabled_key(__user__)
+        if not zh_enabled:
+            return json.dumps(
+                {"error": "智慧芽源未启用（未配 apikey 或已关闭）"}, ensure_ascii=False
+            )
+        try:
+            limit = max(1, min(int(limit), 100))
+        except (TypeError, ValueError):
+            limit = 10
+        args = {
+            "semantic_query": query,
+            "search_strategy": ["semantic"],
+            "source": "patent",
+            "limit": limit,
+            "sort": sort or "relevance",
+        }
+        if filters:
+            args["filters"] = filters
+        try:
+            resp = await self._zhihuiya_call(
+                "patsnap_search", args, zh_key, url=self._PATSNAP_MCP_URL
+            )
+        except Exception as e:
+            return json.dumps({"error": f"专利检索失败: {e}"}, ensure_ascii=False)
+        data = (resp or {}).get("data") or {}
+        docs = data.get("docs") or []
+        patents = [self._patsnap_map_patent(d) for d in docs]
+        return json.dumps(
+            {
+                "query": query,
+                "total_hits": data.get("total_hits", len(patents)),
+                "returned_count": data.get("returned_count", len(patents)),
+                "patents": patents,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+
     async def read_paper(
         self,
         source: str,
