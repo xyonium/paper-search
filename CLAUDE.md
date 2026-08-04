@@ -13,10 +13,13 @@ This repository integrates multi-source academic paper searching, reading, and d
         │
         └── OpenWebUI Python Tool (Bridge & Interceptor Layer)
                  │
-                 ├── search_papers()  ──► POST http://mcp:8000/papers/search_papers
-                 │                        (Aggregates 16 active academic platforms)
+                 ├── search_papers()  ──┬─► POST http://mcp:8000/papers/search_papers
+                 │                      │    (Aggregates 16 active academic platforms)
+                 │                      └─► zhihuiya MCP 直连 (streamable-http, apikey 启用)
+                 │                           search_literature + literature_bibliography
                  │
-                 ├── read_paper()     ──► Backend Tool (_READ_TOOLS) ──► PDF Direct Fallback
+                 ├── read_paper()     ──► Backend Tool (_READ_TOOLS) / zhihuiya bibliography
+                 │                        ──► PDF Direct Fallback
                  │
                  └── download_paper_to_knowledge()
                           │
@@ -104,6 +107,12 @@ Default selection in UserValves:
 | **Google Scholar** | ✅ | ❌ | ❌ | May return 403 without proxy |
 | **IACR** | ✅ | `read_iacr_paper` | ✅ | Cryptography ePrints |
 | **OpenAIRE / DOAJ / HAL / dblp** | ✅ | Varies / Fallback | Record-dependent | Domain repositories |
+
+### Optional Premium Source (apikey-gated, **direct** — not via mcpo)
+
+| Platform | Search | Read Tool | Native Download | Notes |
+|---|---|---|---|---|
+| **zhihuiya (智慧芽)** | ✅ `search_literature` | ⚠️ `literature_bibliography` (abstract+著录) | ❌ | 科学文献 MCP，tool.py 经 `streamablehttp_client` 直连。需 `Valves/UserValves.zhihuiya_apikey` 非空且 `zhihuiya_enabled` 才启用；search=search_literature+批量 literature_bibliography(补 abstract)；全文靠 doi 走 OA fallback 链 |
 
 ### Excluded / Disabled Sources
 - **CiteSeerX**: API Endpoint permanently dead (redirects to archive.org 404).

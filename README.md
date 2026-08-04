@@ -1,15 +1,21 @@
-# OpenWebUI Academic Paper Search & Knowledge Base Integration
+# 📚 OpenWebUI Academic Paper Search & Knowledge Base Integration
 
-Multi-source academic paper search, full-text reading, and automatic PDF ingestion into **OpenWebUI Knowledge Base** (RAG) powered by `mcpo` and `paper-search-mcp`.
+> **One prompt → 17 academic databases → full text → your RAG Knowledge Base.**
+> Multi-source academic paper search, full-text reading, and automatic PDF ingestion into **OpenWebUI Knowledge Base** (RAG) — powered by `mcpo` + `paper-search-mcp`, now with direct **zhihuiya (智慧芽)** scientific-literature integration.
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
+[![OpenWebUI](https://img.shields.io/badge/OpenWebUI-Tool-blue)](https://github.com/open-webui/open-webui)
+[![MCP](https://img.shields.io/badge/MCP-mcpo-green)](https://github.com/open-webui/mcpo)
 
 ---
 
 ## 🌟 Features
 
-- 🔍 **Multi-Source Concurrent Search**: Aggregate search results across **16+ verified active academic platforms** with automatic de-duplication.
-- 📖 **Full-Text Reading**: Instant full-text extraction for supported Open Access platforms and direct fallback to PDF parsing.
-- 📥 **Automated Knowledge Base Ingestion**: Download papers and automatically upload & index them into **OpenWebUI Knowledge Base** for RAG-based citation and retrieval.
-- 🔄 **Built-in OA Fallback Chain**: Sequential resolution path: Source-native download ➔ Open Access Repositories (OpenAIRE / CORE / Europe PMC / PMC) ➔ Unpaywall ➔ (Optional) Sci-Hub mirror.
+- 🔍 **Multi-Source Concurrent Search**: Aggregate & de-duplicate results across **16+ open academic platforms** (arXiv, PubMed, Semantic Scholar, OpenAlex, CORE…) — plus **zhihuiya (智慧芽)**, a premium scientific-literature MCP source enabled by apikey.
+- 📖 **Full-Text Reading**: Instant full-text for Open Access platforms, automatic PDF-parsing fallback, and metadata-level reads (abstract + bibliographic record) for index-only sources.
+- 📥 **Automated Knowledge Base Ingestion**: Download papers and auto-upload & index them into **OpenWebUI Knowledge Base** for RAG citation and retrieval.
+- 🔄 **Built-in OA Fallback Chain**: Source-native download ➔ Open Access Repositories (OpenAIRE / CORE / Europe PMC / PMC) ➔ Unpaywall ➔ (Optional) Sci-Hub mirror.
+- 🔑 **Optional zhihuiya Source**: Connects **directly** via streamable-http MCP (not through mcpo), enabled per-admin or per-user apikey — disabled entirely when no key is set.
 
 ---
 
@@ -20,10 +26,13 @@ Multi-source academic paper search, full-text reading, and automatic PDF ingesti
         │
         ├── OpenWebUI Native Python Tool (Bridge & Interceptor Layer)
                  │
-                 ├── search_papers()  ──► POST http://mcp:8000/papers/search_papers
-                 │                        (Aggregates 16+ active academic platforms)
+                 ├── search_papers()  ──┬─► POST http://mcp:8000/papers/search_papers
+                 │                      │    (16+ open platforms via paper-search-mcp)
+                 │                      └─► zhihuiya MCP (direct, streamable-http, apikey)
+                 │                           search_literature + literature_bibliography
                  │
-                 ├── read_paper()     ──► Backend Tool (_READ_TOOLS) ──► PDF Direct Fallback
+                 ├── read_paper()     ──► Backend Tool (_READ_TOOLS) / zhihuiya bibliography
+                 │                        ──► PDF Direct Fallback
                  │
                  └── download_paper_to_knowledge()
                           │
@@ -59,6 +68,12 @@ Multi-source academic paper search, full-text reading, and automatic PDF ingesti
 | **Google Scholar** | ✅ | ❌ | ❌ | May return 403 without proxy |
 | **IACR** | ✅ | `read_iacr_paper` | ✅ | Cryptography ePrints |
 | **OpenAIRE / DOAJ / HAL / dblp** | ✅ | Varies / Fallback | Record-dependent | Domain repositories |
+
+### Optional Premium Source (apikey-gated, direct connection)
+
+| Platform | Search | Read Tool | Native Download | Notes |
+|---|---|---|---|---|
+| **zhihuiya (智慧芽)** | ✅ `search_literature` | ⚠️ metadata via `literature_bibliography` | ❌ | Scientific-literature MCP. Connects **directly** (streamable-http), **not** via mcpo. Enabled only when an apikey is configured; search = `search_literature` + batched `literature_bibliography` (for abstracts); full text via DOI → OA fallback chain |
 
 ---
 
@@ -121,6 +136,15 @@ Configure your `config.json` file for `mcpo`:
    - `allow_scihub`: Set to `True` / `False` for Sci-Hub fallback.
    - `scihub_url`: Custom Sci-Hub mirror URL (e.g. `https://sci-hub.ee`).
 
+### 4. (Optional) Enable the zhihuiya (智慧芽) Source
+
+zhihuiya is a premium scientific-literature source that connects **directly** via streamable-http MCP — it does **not** go through mcpo, so no `config.json` change is needed.
+
+- **Admin (company) key** — set `Valves.zhihuiya_apikey` in the Tool's admin Valves. Applies to all users by default.
+- **Per-user key / toggle** — users can set their own `UserValves.zhihuiya_apikey` (overrides the admin key) or flip `UserValves.zhihuiya_enabled` off.
+
+The source is **enabled only when a non-empty apikey exists** (admin or user) **and** `zhihuiya_enabled` is on. With no key configured, the source issues no requests at all. Then add `zhihuiya` to `UserValves.default_sources` (or pass `sources="...,zhihuiya"` in a query) to include it in aggregated searches.
+
 ---
 
 ## 🛠 Usage in OpenWebUI
@@ -142,9 +166,10 @@ Once installed, OpenWebUI models can call the following tools:
 
 Special thanks to the open-source projects that make this integration possible:
 
-- **[paper-search-mcp](https://github.com/vllm-project/paper-search-mcp)**: The underlying Model Context Protocol (MCP) server providing multi-platform academic search and paper retrieval capabilities.
+- **[paper-search-mcp](https://github.com/openags/paper-search-mcp)**: The underlying Model Context Protocol (MCP) server providing multi-platform academic search and paper retrieval capabilities.
 - **[mcpo](https://github.com/open-webui/mcpo)**: The OpenAPI-to-MCP bridge by OpenWebUI for exposing MCP servers over HTTP.
 - **[OpenWebUI](https://github.com/open-webui/open-webui)**: The open-source AI user interface and RAG ecosystem.
+- **[zhihuiya (智慧芽)](https://www.zhihuiya.com/)**: Premium scientific-literature data, connected via its streamable-http MCP endpoint.
 
 ---
 
