@@ -109,6 +109,8 @@ class Tools:
         # ↓ 可选付费源（配 key 后工具存在，未配时调用会 404，被异常处理兜住）
         "ieee": "read_ieee_paper",
         "acm": "read_acm_paper",
+        # ↓ 智慧芽：直连元数据级 read（literature_bibliography），非后端工具
+        "zhihuiya": "zhihuiya_bibliography",
     }
 
     # 后端"不支持"提示的特征串（命中则视为无内容，降级 pdf_url fallback）
@@ -496,6 +498,34 @@ class Tools:
         src = (source or "").strip().lower()
         backend_tool = self._READ_TOOLS.get(src)
         backend_err = ""
+
+        if src == "zhihuiya":
+            zh_enabled, zh_key = self._zhihuiya_enabled_key(__user__)
+            if not zh_enabled:
+                return json.dumps(
+                    {"error": "智慧芽源未启用（未配 apikey 或已关闭）"},
+                    ensure_ascii=False,
+                )
+            if paper_id:
+                try:
+                    bib = await self._zhihuiya_call(
+                        "literature_bibliography", {"paper_id": paper_id}, zh_key
+                    )
+                    data = (bib or {}).get("data") or []
+                    entry = data[0] if data else {}
+                    abstract = self._zhihuiya_text_list(entry.get("abstract"))
+                    if abstract:
+                        header = self._zhihuiya_text_list(entry.get("title"))
+                        pub = entry.get("publication") or ""
+                        year = str(entry.get("publication_year") or "")
+                        meta = " | ".join(x for x in [pub, year] if x)
+                        return (
+                            f"{header}\n{meta}\n\n{abstract}"
+                            "\n\n[智慧芽元数据级 read；全文请用 doi 走 download_paper_to_knowledge 的 OA fallback 链]"
+                        )[:max_chars]
+                    backend_err = "智慧芽无可用 abstract"
+                except Exception as e:
+                    backend_err = f"智慧芽读取失败: {e}"
 
         if backend_tool and paper_id:
             try:

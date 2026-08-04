@@ -247,3 +247,32 @@ async def test_search_papers_zhihuiya_not_called_when_disabled():
     out = json.loads(await t.search_papers("q", sources="zhihuiya", __user__=_user()))
     assert called == []
     assert "zhihuiya" not in out["source_results"]
+
+
+@pytest.mark.asyncio
+async def test_read_paper_zhihuiya_returns_abstract():
+    t = Tools()
+    t.valves = Tools.Valves(zhihuiya_apikey="k")
+    bib = {"success": True, "data": [{
+        "paper_id": "p1",
+        "title": [{"lang": "EN", "text": "T"}],
+        "abstract": [{"lang": "EN", "text": "Full abstract text."}],
+        "publication": "Nature", "publication_year": "2021",
+    }]}
+
+    async def fake_call(tool_name, args, key, timeout=30):
+        assert tool_name == "literature_bibliography"
+        return bib
+
+    t._zhihuiya_call = fake_call
+    out = await t.read_paper(source="zhihuiya", paper_id="p1", __user__=_user())
+    assert "Full abstract text." in out
+
+
+@pytest.mark.asyncio
+async def test_read_paper_zhihuiya_no_key_returns_hint():
+    t = Tools()
+    t.valves = Tools.Valves()  # 无 key
+    out = json.loads(await t.read_paper(source="zhihuiya", paper_id="p1",
+                                        __user__=_user()))
+    assert "error" in out
