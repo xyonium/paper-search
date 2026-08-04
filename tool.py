@@ -568,7 +568,10 @@ class Tools:
                 "patsnap_search", args, zh_key, url=self._PATSNAP_MCP_URL
             )
         except Exception as e:
-            return json.dumps({"error": f"专利检索失败: {e}"}, ensure_ascii=False)
+            return json.dumps(
+                {"error": f"专利检索失败: {self._redact_zhihuiya_key(e)}"},
+                ensure_ascii=False,
+            )
         data = (resp or {}).get("data") or {}
         docs = data.get("docs") or []
         patents = [self._patsnap_map_patent(d) for d in docs]
@@ -622,9 +625,13 @@ class Tools:
                 url=self._PATSNAP_MCP_URL,
             )
         except Exception as e:
-            return json.dumps({"error": f"专利获取失败: {e}"}, ensure_ascii=False)
+            return json.dumps(
+                {"error": f"专利获取失败: {self._redact_zhihuiya_key(e)}"},
+                ensure_ascii=False,
+            )
         results = (resp or {}).get("results") or []
-        md = results[0].get("markdown", "") if results else ""
+        first = results[0] if results and isinstance(results[0], dict) else {}
+        md = first.get("markdown", "") or ""
         if not md:
             return json.dumps(
                 {"error": f"未获取到专利 {patent_number} 的内容"}, ensure_ascii=False
