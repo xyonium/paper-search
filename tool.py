@@ -551,7 +551,7 @@ class Tools:
                         )[:max_chars]
                     backend_err = "智慧芽无可用 abstract"
                 except Exception as e:
-                    backend_err = f"智慧芽读取失败: {e}"
+                    backend_err = f"智慧芽读取失败: {self._redact_zhihuiya_key(e)}"
 
         if backend_tool and paper_id and src != "zhihuiya":
             try:
