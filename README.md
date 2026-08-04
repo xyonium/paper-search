@@ -16,6 +16,7 @@
 - 📥 **Automated Knowledge Base Ingestion**: Download papers and auto-upload & index them into **OpenWebUI Knowledge Base** for RAG citation and retrieval.
 - 🔄 **Built-in OA Fallback Chain**: Source-native download ➔ Open Access Repositories (OpenAIRE / CORE / Europe PMC / PMC) ➔ Unpaywall ➔ (Optional) Sci-Hub mirror.
 - 🔑 **Optional zhihuiya Source**: Connects **directly** via streamable-http MCP (not through mcpo), enabled per-admin or per-user apikey — disabled entirely when no key is set.
+- 🏛 **Patent Search & Full-Text (patsnap)**: First-ever patent source — semantic patent search (`search_patents`) plus full claims + description + legal status as Markdown (`read_patent`). Shares the same zhihuiya apikey, also direct-connected.
 
 ---
 
@@ -33,6 +34,10 @@
                  │
                  ├── read_paper()     ──► Backend Tool (_READ_TOOLS) / zhihuiya bibliography
                  │                        ──► PDF Direct Fallback
+                 │
+                 ├── search_patents() ──► patsnap MCP (direct, streamable-http, apikey)
+                 │                         patsnap_search (source=patent, semantic)
+                 ├── read_patent()    ──► patsnap_fetch → claims+description+legal (Markdown)
                  │
                  └── download_paper_to_knowledge()
                           │
@@ -74,6 +79,7 @@
 | Platform | Search | Read Tool | Native Download | Notes |
 |---|---|---|---|---|
 | **zhihuiya (智慧芽)** | ✅ `search_literature` | ⚠️ metadata via `literature_bibliography` | ❌ | Scientific-literature MCP. Connects **directly** (streamable-http), **not** via mcpo. Enabled only when an apikey is configured; search = `search_literature` + batched `literature_bibliography` (for abstracts); full text via DOI → OA fallback chain |
+| **patsnap (智慧芽专利)** | ✅ `patsnap_search` | ✅ full text via `patsnap_fetch` | ❌ | **Patent** MCP (same company, same apikey). Dedicated tools `search_patents` / `read_patent` (independent of `search_papers`). `read_patent` returns **claims + description + legal status** as Markdown (default `module=['basic','legal']`) |
 
 ---
 
@@ -145,6 +151,10 @@ zhihuiya is a premium scientific-literature source that connects **directly** vi
 
 The source is **enabled only when a non-empty apikey exists** (admin or user) **and** `zhihuiya_enabled` is on. With no key configured, the source issues no requests at all. Then add `zhihuiya` to `UserValves.default_sources` (or pass `sources="...,zhihuiya"` in a query) to include it in aggregated searches.
 
+### 5. (Optional) Patent Tools — Same Key
+
+The **patsnap patent tools** (`search_patents` / `read_patent`) use the **same** `zhihuiya_apikey` and the **same** `zhihuiya_enabled` toggle — no extra configuration. Once the key is set, patent search & full-text reading work immediately. They are independent of `search_papers` (patents are not merged into the literature aggregation).
+
 ---
 
 ## 🛠 Usage in OpenWebUI
@@ -159,6 +169,12 @@ Once installed, OpenWebUI models can call the following tools:
 
 3. **`download_paper_to_knowledge(title, source, paper_id, doi, pdf_url)`**  
    Downloads the paper via direct URL or OA fallback chain, uploads it to OpenWebUI, and links it directly into your RAG Knowledge Base.
+
+4. **`search_patents(query, limit, sort, filters)`**  *(requires zhihuiya_apikey)*  
+   Semantic patent search — returns patent_number / title / IPC / legal_status / dates / assignees / cited_count.
+
+5. **`read_patent(patent_number, max_chars)`**  *(requires zhihuiya_apikey)*  
+   Reads a patent's full text as Markdown — bibliographic data, **claims**, **description**, and legal status.
 
 ---
 
