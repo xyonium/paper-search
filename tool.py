@@ -580,6 +580,54 @@ class Tools:
             indent=2,
         )
 
+    async def read_patent(
+        self,
+        patent_number: str,
+        max_chars: int = 25000,
+        __user__={},
+    ) -> str:
+        """
+        阅读专利全文（智慧芽 patsnap_fetch，markdown：著录项+权利要求+说明书+法律状态）。
+        - 需在 Valves 配 zhihuiya_apikey 才启用
+        - 用 search_patents 先拿到 patent_number（公开号，如 US11530424B1）
+        :param patent_number: 专利公开号（pn）
+        :param max_chars: 最大返回字符数（默认25000，专利文档很大会截断）
+        """
+        zh_enabled, zh_key = self._zhihuiya_enabled_key(__user__)
+        if not zh_enabled:
+            return json.dumps(
+                {"error": "智慧芽源未启用（未配 apikey 或已关闭）"}, ensure_ascii=False
+            )
+        if not (patent_number or "").strip():
+            return json.dumps(
+                {"error": "需提供 patent_number（专利公开号）"}, ensure_ascii=False
+            )
+        try:
+            max_chars = int(max_chars)
+        except (TypeError, ValueError):
+            max_chars = 25000
+        try:
+            resp = await self._zhihuiya_call(
+                "patsnap_fetch",
+                {
+                    "keys": [patent_number.strip()],
+                    "key_type": "pn",
+                    "module": ["basic", "legal"],
+                },
+                zh_key,
+                timeout=60,
+                url=self._PATSNAP_MCP_URL,
+            )
+        except Exception as e:
+            return json.dumps({"error": f"专利获取失败: {e}"}, ensure_ascii=False)
+        results = (resp or {}).get("results") or []
+        md = results[0].get("markdown", "") if results else ""
+        if not md:
+            return json.dumps(
+                {"error": f"未获取到专利 {patent_number} 的内容"}, ensure_ascii=False
+            )
+        return md[:max_chars] + ("\n\n[…专利文档截断…]" if len(md) > max_chars else "")
+
     async def read_paper(
         self,
         source: str,

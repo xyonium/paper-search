@@ -447,3 +447,35 @@ async def test_search_patents_disabled_no_key():
     t.valves = Tools.Valves()  # 无 key
     out = json.loads(await t.search_patents("x", __user__=_user()))
     assert "error" in out
+
+
+@pytest.mark.asyncio
+async def test_read_patent_returns_markdown_truncated():
+    t = Tools()
+    t.valves = Tools.Valves(zhihuiya_apikey="k")
+    big_md = "# Patent Details\n" + ("x" * 30000)
+    resp = {"total": 1, "success_count": 1,
+            "results": [{"key": "US1", "markdown": big_md}]}
+    seen = {}
+
+    async def fake_call(tool_name, args, key, timeout=30, url=None):
+        seen.update(args)
+        assert tool_name == "patsnap_fetch"
+        assert url == Tools._PATSNAP_MCP_URL
+        return resp
+
+    t._zhihuiya_call = fake_call
+    out = await t.read_patent("US1", max_chars=1000, __user__=_user())
+    assert seen["keys"] == ["US1"]
+    assert seen["key_type"] == "pn"
+    assert seen["module"] == ["basic", "legal"]
+    assert out.startswith("# Patent Details")
+    assert len(out) <= 1100 and "截断" in out
+
+
+@pytest.mark.asyncio
+async def test_read_patent_disabled_no_key():
+    t = Tools()
+    t.valves = Tools.Valves()  # 无 key
+    out = json.loads(await t.read_patent("US1", __user__=_user()))
+    assert "error" in out
