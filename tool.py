@@ -139,6 +139,7 @@ class Tools:
     # ---------- 内部 ----------
     # ---------- 智慧芽 zhihuiya ----------
     _ZHIHUIYA_MCP_URL = "https://connect.zhihuiya.com/eba075/mcp?apikey={key}"
+    _PATSNAP_MCP_URL = "https://connect.zhihuiya.com/2b0355/logic-mcp?apikey={key}"
 
     def _zhihuiya_enabled_key(self, __user__=None) -> tuple:
         uv = __user__.get("valves") if __user__ else None
@@ -148,9 +149,11 @@ class Tools:
         enabled = bool(getattr(uv, "zhihuiya_enabled", True)) and bool(key)
         return enabled, key
 
-    async def _zhihuiya_call(self, tool_name: str, args: dict, key: str, timeout: int = 30) -> dict:
-        """直连智慧芽 MCP 调用单个工具，返回解析后的 dict。失败抛 RuntimeError。"""
-        url = self._ZHIHUIYA_MCP_URL.format(key=key)
+    async def _zhihuiya_call(self, tool_name: str, args: dict, key: str,
+                             timeout: int = 30, url: str = None) -> dict:
+        """直连智慧芽 MCP 调用单个工具，返回解析后的 dict。失败抛 RuntimeError。
+        url 为 None 时用文献源 _ZHIHUIYA_MCP_URL，否则用传入的端点（如 patsnap）。"""
+        url = (url or self._ZHIHUIYA_MCP_URL).format(key=key)
 
         async def _run():
             async with streamablehttp_client(url) as (read, write, _):

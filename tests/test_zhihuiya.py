@@ -355,3 +355,35 @@ async def test_zhihuiya_search_degrades_when_bibliography_fails():
     assert papers[0]["paper_id"] == "p1"
     assert papers[0]["title"] == "T1"
     assert papers[0]["abstract"] == ""
+
+
+@pytest.mark.asyncio
+async def test_zhihuiya_call_uses_custom_url():
+    t = Tools()
+    payload = {"status": "success", "data": {"docs": []}}
+    result = MagicMock()
+    result.isError = False
+    result.content = [_text_content(payload)]
+    session = _fake_session(result)
+    captured = {}
+
+    def fake_client(url):
+        captured["url"] = url
+        cm = MagicMock()
+        cm.__aenter__ = AsyncMock(return_value=("r", "w", None))
+        cm.__aexit__ = AsyncMock(return_value=False)
+        return cm
+
+    with patch.object(tool_mod, "streamablehttp_client", side_effect=fake_client), \
+         patch.object(tool_mod, "ClientSession") as m_sess:
+        m_sess.return_value.__aenter__ = AsyncMock(return_value=session)
+        m_sess.return_value.__aexit__ = AsyncMock(return_value=False)
+        await t._zhihuiya_call("patsnap_search", {"source": "patent"}, "KEY9",
+                               url=Tools._PATSNAP_MCP_URL)
+
+    assert captured["url"] == "https://connect.zhihuiya.com/2b0355/logic-mcp?apikey=KEY9"
+
+
+def test_patsnap_url_constant_distinct_from_zhihuiya():
+    assert "2b0355/logic-mcp" in Tools._PATSNAP_MCP_URL
+    assert "eba075" in Tools._ZHIHUIYA_MCP_URL
