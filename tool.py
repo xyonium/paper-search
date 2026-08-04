@@ -162,13 +162,17 @@ class Tools:
         except asyncio.TimeoutError:
             raise RuntimeError(f"智慧芽 {tool_name} 调用超时 ({timeout}s)")
         except Exception as e:
-            raise RuntimeError(f"智慧芽 {tool_name} 连接失败: {e}")
+            raise RuntimeError(
+                f"智慧芽 {tool_name} 连接失败: {self._redact_zhihuiya_key(e)}"
+            )
 
         if getattr(result, "isError", False):
             msg = ""
             for c in getattr(result, "content", []) or []:
                 msg = getattr(c, "text", "") or msg
-            raise RuntimeError(f"智慧芽 {tool_name} 返回错误: {msg[:300]}")
+            raise RuntimeError(
+                f"智慧芽 {tool_name} 返回错误: {self._redact_zhihuiya_key(msg)[:300]}"
+            )
 
         for c in getattr(result, "content", []) or []:
             text = getattr(c, "text", None)
@@ -179,6 +183,12 @@ class Tools:
             except (json.JSONDecodeError, TypeError):
                 return {"raw": text}
         return {}
+
+    @staticmethod
+    def _redact_zhihuiya_key(text: str) -> str:
+        """错误信息脱敏：避免 httpx 把带 apikey 的 URL 拼进异常导致凭据泄露。"""
+        import re
+        return re.sub(r"apikey=[^&\s]+", "apikey=***", str(text))
 
     @staticmethod
     def _zhihuiya_text_list(field) -> str:
@@ -235,9 +245,13 @@ class Tools:
         ids = [r.get("paper_id") for r in results if r.get("paper_id")]
         bib_by_id = {}
         if ids:
-            bib_resp = await self._zhihuiya_call(
-                "literature_bibliography", {"paper_id": ",".join(ids[:100])}, key
-            )
+            # 富化失败不丢弃搜索结果：降级为空 abstract，继续返回 title/author/doi
+            try:
+                bib_resp = await self._zhihuiya_call(
+                    "literature_bibliography", {"paper_id": ",".join(ids[:100])}, key
+                )
+            except Exception:
+                bib_resp = {}
             for b in (bib_resp or {}).get("data") or []:
                 if isinstance(b, dict) and b.get("paper_id"):
                     bib_by_id[b["paper_id"]] = b
@@ -439,9 +453,21 @@ class Tools:
             backend_result = await _backend()
 
         if isinstance(backend_result, Exception):
-            return json.dumps({"error": f"后端 search_papers 调用失败: {backend_result}"}, ensure_ascii=False)
+            if want_zh and isinstance(zh_result, list) and zh_result:
+                # 后端失败但 zhihuiya 成功：保留 zhihuiya 结果，后端错误进 errors
+                result = {
+                    "papers": [],
+                    "source_results": {},
+                    "errors": {"backend": str(backend_result)},
+                }
+            else:
+                return json.dumps(
+                    {"error": f"后端 search_papers 调用失败: {backend_result}"},
+                    ensure_ascii=False,
+                )
+        else:
+            result = backend_result
 
-        result = backend_result
         if not isinstance(result, dict):
             return json.dumps({"error": "backend 返回异常", "raw": str(result)[:500]}, ensure_ascii=False)
 

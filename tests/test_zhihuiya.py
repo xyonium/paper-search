@@ -294,3 +294,64 @@ async def test_read_paper_zhihuiya_noabstract_keeps_specific_error():
     out = json.loads(await t.read_paper(source="zhihuiya", paper_id="p1",
                                         __user__=_user()))
     assert "智慧芽无可用 abstract" in out.get("error", "")
+
+
+@pytest.mark.asyncio
+async def test_zhihuiya_call_redacts_apikey_in_error():
+    t = Tools()
+    with patch.object(tool_mod, "streamablehttp_client") as m_client:
+        m_client.side_effect = RuntimeError(
+            "httpx.ConnectError: https://connect.zhihuiya.com/eba075/mcp?apikey=secret123"
+        )
+        with pytest.raises(RuntimeError) as exc:
+            await t._zhihuiya_call("search_literature", {"text": "x"}, "secret123")
+    msg = str(exc.value)
+    assert "apikey=***" in msg
+    assert "secret123" not in msg
+
+
+@pytest.mark.asyncio
+async def test_search_papers_keeps_zhihuiya_when_backend_fails():
+    t = Tools()
+    t.valves = Tools.Valves(zhihuiya_apikey="k")
+
+    def boom_mcp(*a, **k):
+        raise RuntimeError("后端 search_papers 挂了")
+
+    async def fake_zh_search(query, limit, key):
+        return [{"title": "Z", "authors": "z", "published_date": "2021",
+                 "abstract": "zz", "paper_id": "zp", "doi": "10.1/z",
+                 "source": "zhihuiya", "pdf_url": "", "citations": 0, "url": ""}]
+
+    t._mcp_call = boom_mcp
+    t._zhihuiya_search = fake_zh_search
+
+    out = json.loads(await t.search_papers("q", sources="arxiv,zhihuiya",
+                                           __user__=_user()))
+    assert "backend" in out["errors"]
+    assert out["source_results"]["zhihuiya"] == 1
+    assert {p["source"] for p in out["papers"]} == {"zhihuiya"}
+
+
+@pytest.mark.asyncio
+async def test_zhihuiya_search_degrades_when_bibliography_fails():
+    t = Tools()
+    search_resp = {
+        "success": True,
+        "data": {"results": [
+            {"paper_id": "p1", "doi": "10.1/a", "title": ["T1"], "author": ["A"]},
+        ]},
+    }
+
+    async def fake_call(tool_name, args, key, timeout=30):
+        if tool_name == "search_literature":
+            return search_resp
+        raise RuntimeError("literature_bibliography 富化失败")
+
+    t._zhihuiya_call = fake_call
+    papers = await t._zhihuiya_search("CRISPR", 2, "key")
+
+    assert len(papers) == 1
+    assert papers[0]["paper_id"] == "p1"
+    assert papers[0]["title"] == "T1"
+    assert papers[0]["abstract"] == ""
