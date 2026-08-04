@@ -22,10 +22,13 @@ version: 2.2.0
 license: MIT
 """
 
+import asyncio
 import json
 import os
 import anyio
 import requests
+from mcp import ClientSession
+from mcp.client.streamable_http import streamablehttp_client
 from pydantic import BaseModel, Field
 
 
@@ -141,6 +144,39 @@ class Tools:
         key = user_key or admin_key
         enabled = bool(getattr(uv, "zhihuiya_enabled", True)) and bool(key)
         return enabled, key
+
+    async def _zhihuiya_call(self, tool_name: str, args: dict, key: str, timeout: int = 30) -> dict:
+        """直连智慧芽 MCP 调用单个工具，返回解析后的 dict。失败抛 RuntimeError。"""
+        url = self._ZHIHUIYA_MCP_URL.format(key=key)
+
+        async def _run():
+            async with streamablehttp_client(url) as (read, write, _):
+                async with ClientSession(read, write) as session:
+                    await session.initialize()
+                    return await session.call_tool(tool_name, args)
+
+        try:
+            result = await asyncio.wait_for(_run(), timeout=timeout)
+        except asyncio.TimeoutError:
+            raise RuntimeError(f"智慧芽 {tool_name} 调用超时 ({timeout}s)")
+        except Exception as e:
+            raise RuntimeError(f"智慧芽 {tool_name} 连接失败: {e}")
+
+        if getattr(result, "isError", False):
+            msg = ""
+            for c in getattr(result, "content", []) or []:
+                msg = getattr(c, "text", "") or msg
+            raise RuntimeError(f"智慧芽 {tool_name} 返回错误: {msg[:300]}")
+
+        for c in getattr(result, "content", []) or []:
+            text = getattr(c, "text", None)
+            if not text:
+                continue
+            try:
+                return json.loads(text)
+            except (json.JSONDecodeError, TypeError):
+                return {"raw": text}
+        return {}
 
     def _mcp_call(self, tool: str, args: dict, timeout: int = 180):
         headers = {}
