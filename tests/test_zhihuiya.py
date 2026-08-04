@@ -186,3 +186,64 @@ async def test_zhihuiya_search_skips_bibliography_when_no_ids():
     t._zhihuiya_call = fake_call
     papers = await t._zhihuiya_search("nothing", 5, "key")
     assert papers == []
+
+
+@pytest.mark.asyncio
+async def test_search_papers_merges_zhihuiya_branch():
+    t = Tools()
+    t.valves = Tools.Valves(zhihuiya_apikey="k")
+
+    backend = {"papers": [{"title": "X", "authors": "a", "published_date": "2020",
+                            "source": "arxiv", "paper_id": "1", "doi": "",
+                            "citations": 3, "pdf_url": "", "url": "", "abstract": "aa"}],
+               "source_results": {"arxiv": 1}, "errors": {}}
+
+    async def fake_zh_search(query, limit, key):
+        return [{"title": "Z", "authors": "z", "published_date": "2021",
+                 "abstract": "zz", "paper_id": "zp", "doi": "10.1/z",
+                 "source": "zhihuiya", "pdf_url": "", "citations": 0, "url": ""}]
+
+    t._mcp_call = lambda *a, **k: backend
+    t._zhihuiya_search = fake_zh_search
+
+    out = json.loads(await t.search_papers("q", sources="arxiv,zhihuiya",
+                                           __user__=_user()))
+    assert out["source_results"]["zhihuiya"] == 1
+    sources = {p["source"] for p in out["papers"]}
+    assert "zhihuiya" in sources and "arxiv" in sources
+
+
+@pytest.mark.asyncio
+async def test_search_papers_zhihuiya_failure_isolated():
+    t = Tools()
+    t.valves = Tools.Valves(zhihuiya_apikey="k")
+    backend = {"papers": [], "source_results": {"arxiv": 0}, "errors": {}}
+
+    async def boom(query, limit, key):
+        raise RuntimeError("智慧芽连接失败: 401")
+
+    t._mcp_call = lambda *a, **k: backend
+    t._zhihuiya_search = boom
+
+    out = json.loads(await t.search_papers("q", sources="arxiv,zhihuiya",
+                                           __user__=_user()))
+    assert "zhihuiya" in out["errors"]
+    assert out["source_results"]["zhihuiya"] == 0
+
+
+@pytest.mark.asyncio
+async def test_search_papers_zhihuiya_not_called_when_disabled():
+    t = Tools()
+    t.valves = Tools.Valves()  # 无 key
+    called = []
+
+    async def fake_zh_search(query, limit, key):
+        called.append(1)
+        return []
+
+    t._mcp_call = lambda *a, **k: {"papers": [], "source_results": {}, "errors": {}}
+    t._zhihuiya_search = fake_zh_search
+
+    out = json.loads(await t.search_papers("q", sources="zhihuiya", __user__=_user()))
+    assert called == []
+    assert "zhihuiya" not in out["source_results"]

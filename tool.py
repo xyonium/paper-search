@@ -406,8 +406,14 @@ class Tools:
             or (uv.default_sources if uv else None)
             or "arxiv,semantic,openalex,pubmed,pmc,core,europepmc"
         )
-        try:
-            result = await anyio.to_thread.run_sync(
+
+        zh_enabled, zh_key = self._zhihuiya_enabled_key(__user__)
+        want_zh = zh_enabled and (
+            "zhihuiya" in {s.strip().lower() for s in src.split(",")} or src.strip().lower() == "all"
+        )
+
+        async def _backend():
+            return await anyio.to_thread.run_sync(
                 self._mcp_call,
                 "search_papers",
                 {
@@ -416,18 +422,46 @@ class Tools:
                     "sources": src,
                 },
             )
-        except Exception as e:
-            return json.dumps({"error": f"后端 search_papers 调用失败: {e}"}, ensure_ascii=False)
 
+        async def _zh():
+            return await self._zhihuiya_search(query, max_results_per_source, zh_key)
+
+        backend_result, zh_result = None, None
+        zh_error = None
+        if want_zh:
+            results = await asyncio.gather(_backend(), _zh(), return_exceptions=True)
+            backend_result, zh_result = results[0], results[1]
+            if isinstance(zh_result, Exception):
+                zh_error, zh_result = zh_result, None
+        else:
+            backend_result = await _backend()
+
+        if isinstance(backend_result, Exception):
+            return json.dumps({"error": f"后端 search_papers 调用失败: {backend_result}"}, ensure_ascii=False)
+
+        result = backend_result
         if not isinstance(result, dict):
             return json.dumps({"error": "backend 返回异常", "raw": str(result)[:500]}, ensure_ascii=False)
+
         papers = [self._trim_paper(p) for p in result.get("papers", [])]
+        source_results = dict(result.get("source_results", {}))
+        errors = dict(result.get("errors", {}))
+
+        if want_zh:
+            if zh_error is not None:
+                source_results["zhihuiya"] = 0
+                errors["zhihuiya"] = str(zh_error)
+            else:
+                zh_papers = [self._trim_paper(p) for p in (zh_result or [])]
+                papers.extend(zh_papers)
+                source_results["zhihuiya"] = len(zh_papers)
+
         return json.dumps(
             {
                 "query": query,
                 "total": len(papers),
-                "source_results": result.get("source_results", {}),
-                "errors": result.get("errors", {}),
+                "source_results": source_results,
+                "errors": errors,
                 "papers": papers,
             },
             ensure_ascii=False,
