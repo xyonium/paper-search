@@ -21,6 +21,10 @@ This repository integrates multi-source academic paper searching, reading, and d
                  ├── read_paper()     ──► Backend Tool (_READ_TOOLS) / zhihuiya bibliography
                  │                        ──► PDF Direct Fallback
                  │
+                 ├── search_patents() ──► patsnap MCP 直连 (streamable-http, 同 zhihuiya key)
+                 │                         patsnap_search (source=patent, 语义检索)
+                 ├── read_patent()    ──► patsnap_fetch → 权利要求+说明书+法律状态 (Markdown)
+                 │
                  └── download_paper_to_knowledge()
                           │
                           ├─► [Path 1] Direct pdf_url download (fastest)
@@ -113,6 +117,7 @@ Default selection in UserValves:
 | Platform | Search | Read Tool | Native Download | Notes |
 |---|---|---|---|---|
 | **zhihuiya (智慧芽)** | ✅ `search_literature` | ⚠️ `literature_bibliography` (abstract+著录) | ❌ | 科学文献 MCP，tool.py 经 `streamablehttp_client` 直连。需 `Valves/UserValves.zhihuiya_apikey` 非空且 `zhihuiya_enabled` 才启用；search=search_literature+批量 literature_bibliography(补 abstract)；全文靠 doi 走 OA fallback 链 |
+| **patsnap (智慧芽专利)** | ✅ `patsnap_search` | ✅ `patsnap_fetch` (全文 Markdown) | ❌ | 专利 MCP（同公司同 key）。独立工具 `search_patents`/`read_patent`（不并入 search_papers）。`read_patent` 返回**权利要求+说明书+法律状态**（默认 `module=['basic','legal']`），截断到 max_chars |
 
 ### Excluded / Disabled Sources
 - **CiteSeerX**: API Endpoint permanently dead (redirects to archive.org 404).

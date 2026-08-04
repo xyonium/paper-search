@@ -355,3 +355,127 @@ async def test_zhihuiya_search_degrades_when_bibliography_fails():
     assert papers[0]["paper_id"] == "p1"
     assert papers[0]["title"] == "T1"
     assert papers[0]["abstract"] == ""
+
+
+@pytest.mark.asyncio
+async def test_zhihuiya_call_uses_custom_url():
+    t = Tools()
+    payload = {"status": "success", "data": {"docs": []}}
+    result = MagicMock()
+    result.isError = False
+    result.content = [_text_content(payload)]
+    session = _fake_session(result)
+    captured = {}
+
+    def fake_client(url):
+        captured["url"] = url
+        cm = MagicMock()
+        cm.__aenter__ = AsyncMock(return_value=("r", "w", None))
+        cm.__aexit__ = AsyncMock(return_value=False)
+        return cm
+
+    with patch.object(tool_mod, "streamablehttp_client", side_effect=fake_client), \
+         patch.object(tool_mod, "ClientSession") as m_sess:
+        m_sess.return_value.__aenter__ = AsyncMock(return_value=session)
+        m_sess.return_value.__aexit__ = AsyncMock(return_value=False)
+        await t._zhihuiya_call("patsnap_search", {"source": "patent"}, "KEY9",
+                               url=Tools._PATSNAP_MCP_URL)
+
+    assert captured["url"] == "https://connect.zhihuiya.com/2b0355/logic-mcp?apikey=KEY9"
+
+
+def test_patsnap_url_constant_distinct_from_zhihuiya():
+    assert "2b0355/logic-mcp" in Tools._PATSNAP_MCP_URL
+    assert "eba075" in Tools._ZHIHUIYA_MCP_URL
+
+
+def test_patsnap_map_patent_full():
+    doc = {
+        "patent_number": "US11530424B1", "title": "CRISPR system",
+        "ipc": "C12N15/90", "legal_status": "active",
+        "application_date": 20190930, "publication_date": 20221220,
+        "cited_count": 5, "jurisdiction": "US",
+        "assignees": ["UNIV A", "UNIV B"], "inventors": ["DOE, J."],
+        "url": "https://eureka...", "view_url": "https://analytics...",
+    }
+    out = Tools._patsnap_map_patent(doc)
+    assert out["patent_number"] == "US11530424B1"
+    assert out["title"] == "CRISPR system"
+    assert out["legal_status"] == "active"
+    assert out["application_date"] == "20190930"
+    assert out["publication_date"] == "20221220"
+    assert out["cited_count"] == 5
+    assert out["assignees"] == "UNIV A; UNIV B"
+    assert out["inventors"] == "DOE, J."
+    assert out["jurisdiction"] == "US"
+    assert out["url"] == "https://eureka..."
+
+
+def test_patsnap_map_patent_missing_fields():
+    out = Tools._patsnap_map_patent({"patent_number": "X1"})
+    assert out["patent_number"] == "X1"
+    assert out["title"] == "" and out["assignees"] == ""
+    assert out["application_date"] == "" and out["cited_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_search_patents_returns_mapped():
+    t = Tools()
+    t.valves = Tools.Valves(zhihuiya_apikey="k")
+    resp = {"status": "success",
+            "data": {"total_hits": 100, "returned_count": 1, "docs": [
+                {"patent_number": "US1", "title": "T", "legal_status": "active",
+                 "application_date": 20200101, "assignees": ["A"], "cited_count": 2}]}}
+
+    async def fake_call(tool_name, args, key, timeout=30, url=None):
+        assert tool_name == "patsnap_search"
+        assert args["source"] == "patent"
+        assert args["search_strategy"] == ["semantic"]
+        assert url == Tools._PATSNAP_MCP_URL
+        return resp
+
+    t._zhihuiya_call = fake_call
+    out = json.loads(await t.search_patents("CRISPR", limit=5, __user__=_user()))
+    assert out["total_hits"] == 100
+    assert out["patents"][0]["patent_number"] == "US1"
+    assert out["patents"][0]["assignees"] == "A"
+
+
+@pytest.mark.asyncio
+async def test_search_patents_disabled_no_key():
+    t = Tools()
+    t.valves = Tools.Valves()  # 无 key
+    out = json.loads(await t.search_patents("x", __user__=_user()))
+    assert "error" in out
+
+
+@pytest.mark.asyncio
+async def test_read_patent_returns_markdown_truncated():
+    t = Tools()
+    t.valves = Tools.Valves(zhihuiya_apikey="k")
+    big_md = "# Patent Details\n" + ("x" * 30000)
+    resp = {"total": 1, "success_count": 1,
+            "results": [{"key": "US1", "markdown": big_md}]}
+    seen = {}
+
+    async def fake_call(tool_name, args, key, timeout=30, url=None):
+        seen.update(args)
+        assert tool_name == "patsnap_fetch"
+        assert url == Tools._PATSNAP_MCP_URL
+        return resp
+
+    t._zhihuiya_call = fake_call
+    out = await t.read_patent("US1", max_chars=1000, __user__=_user())
+    assert seen["keys"] == ["US1"]
+    assert seen["key_type"] == "pn"
+    assert seen["module"] == ["basic", "legal"]
+    assert out.startswith("# Patent Details")
+    assert len(out) <= 1100 and "截断" in out
+
+
+@pytest.mark.asyncio
+async def test_read_patent_disabled_no_key():
+    t = Tools()
+    t.valves = Tools.Valves()  # 无 key
+    out = json.loads(await t.read_patent("US1", __user__=_user()))
+    assert "error" in out

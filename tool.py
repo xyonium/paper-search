@@ -12,14 +12,17 @@ description: |
   · 不稳定源（反爬/间歇故障，失败自动降级不影响整体）: google_scholar, ssrn
   · 可选付费源（需在 mcpo env 配 key 才注册）: ieee, acm
   · 智慧芽（需配 apikey 才启用，tool.py 直连不经 mcpo）: zhihuiya
+  · 智慧芽专利（独立工具 search_patents/read_patent，同 key 启用）: patsnap
 
   【工具用法】
   1. search_papers(query)      → 多源并发搜索+去重，返回标题/作者/摘要/引用数/pdf_url
   2. read_paper(source, paper_id, pdf_url) → 读全文（后端工具 + pdf_url 自动 fallback）
   3. download_paper_to_knowledge(...)      → PDF 下载并加入 Knowledge 知识库
+  4. search_patents(query)     → 智慧芽专利语义检索（需配 zhihuiya_apikey）
+  5. read_patent(patent_number) → 读专利全文 markdown（权利要求+说明书+法律状态）
 author: openags-bridge
 requirements: requests, pymupdf, anyio
-version: 2.3.0
+version: 2.4.0
 license: MIT
 """
 
@@ -139,6 +142,7 @@ class Tools:
     # ---------- 内部 ----------
     # ---------- 智慧芽 zhihuiya ----------
     _ZHIHUIYA_MCP_URL = "https://connect.zhihuiya.com/eba075/mcp?apikey={key}"
+    _PATSNAP_MCP_URL = "https://connect.zhihuiya.com/2b0355/logic-mcp?apikey={key}"
 
     def _zhihuiya_enabled_key(self, __user__=None) -> tuple:
         uv = __user__.get("valves") if __user__ else None
@@ -148,9 +152,11 @@ class Tools:
         enabled = bool(getattr(uv, "zhihuiya_enabled", True)) and bool(key)
         return enabled, key
 
-    async def _zhihuiya_call(self, tool_name: str, args: dict, key: str, timeout: int = 30) -> dict:
-        """直连智慧芽 MCP 调用单个工具，返回解析后的 dict。失败抛 RuntimeError。"""
-        url = self._ZHIHUIYA_MCP_URL.format(key=key)
+    async def _zhihuiya_call(self, tool_name: str, args: dict, key: str,
+                             timeout: int = 30, url: str = None) -> dict:
+        """直连智慧芽 MCP 调用单个工具，返回解析后的 dict。失败抛 RuntimeError。
+        url 为 None 时用文献源 _ZHIHUIYA_MCP_URL，否则用传入的端点（如 patsnap）。"""
+        url = (url or self._ZHIHUIYA_MCP_URL).format(key=key)
 
         async def _run():
             async with streamablehttp_client(url) as (read, write, _):
@@ -230,6 +236,28 @@ class Tools:
             "pdf_url": "",
             "citations": 0,
             "url": bib.get("website") or "",
+        }
+
+    @staticmethod
+    def _patsnap_map_patent(doc: dict) -> dict:
+        """patsnap_search 的 data.docs[] 项 -> 统一专利条目。"""
+        def _join(v):
+            if isinstance(v, list):
+                return "; ".join(str(x) for x in v if x)
+            return str(v) if v else ""
+        return {
+            "patent_number": doc.get("patent_number") or "",
+            "title": (doc.get("title") or "").strip(),
+            "ipc": doc.get("ipc") or "",
+            "legal_status": doc.get("legal_status") or "",
+            "application_date": str(doc.get("application_date") or ""),
+            "publication_date": str(doc.get("publication_date") or ""),
+            "cited_count": doc.get("cited_count", 0) or 0,
+            "assignees": _join(doc.get("assignees")),
+            "inventors": _join(doc.get("inventors")),
+            "jurisdiction": doc.get("jurisdiction") or "",
+            "url": doc.get("url") or "",
+            "view_url": doc.get("view_url") or "",
         }
 
     async def _zhihuiya_search(self, query: str, limit: int, key: str) -> list:
@@ -497,6 +525,118 @@ class Tools:
             ensure_ascii=False,
             indent=2,
         )
+
+    async def search_patents(
+        self,
+        query: str,
+        limit: int = 10,
+        sort: str = "relevance",
+        filters: dict = None,
+        __user__={},
+    ) -> str:
+        """
+        检索专利（智慧芽 patsnap，语义检索）。返回 patent_number/title/ipc/legal_status/
+        application_date/publication_date/cited_count/assignees/inventors/jurisdiction/url。
+        - 需在 Valves 配 zhihuiya_apikey（管理员或个人）才启用，否则返回错误 JSON
+        - 读专利全文用 read_patent(patent_number)
+        :param query: 自然语言技术问题/概念（如 'CRISPR gene editing'）
+        :param limit: 返回数量（1-100，默认10）
+        :param sort: 排序，默认 relevance；专利可选 publication/application/granted/
+            expired/priority/cited_count，前缀 '-' 降序（如 '-publication' 最新优先）
+        :param filters: 结构化筛选（申请人/IPC/日期/受理局等，可选）
+        """
+        zh_enabled, zh_key = self._zhihuiya_enabled_key(__user__)
+        if not zh_enabled:
+            return json.dumps(
+                {"error": "智慧芽源未启用（未配 apikey 或已关闭）"}, ensure_ascii=False
+            )
+        try:
+            limit = max(1, min(int(limit), 100))
+        except (TypeError, ValueError):
+            limit = 10
+        args = {
+            "semantic_query": query,
+            "search_strategy": ["semantic"],
+            "source": "patent",
+            "limit": limit,
+            "sort": sort or "relevance",
+        }
+        if filters:
+            args["filters"] = filters
+        try:
+            resp = await self._zhihuiya_call(
+                "patsnap_search", args, zh_key, url=self._PATSNAP_MCP_URL
+            )
+        except Exception as e:
+            return json.dumps(
+                {"error": f"专利检索失败: {self._redact_zhihuiya_key(e)}"},
+                ensure_ascii=False,
+            )
+        data = (resp or {}).get("data") or {}
+        docs = data.get("docs") or []
+        patents = [self._patsnap_map_patent(d) for d in docs]
+        return json.dumps(
+            {
+                "query": query,
+                "total_hits": data.get("total_hits", len(patents)),
+                "returned_count": data.get("returned_count", len(patents)),
+                "patents": patents,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    async def read_patent(
+        self,
+        patent_number: str,
+        max_chars: int = 25000,
+        __user__={},
+    ) -> str:
+        """
+        阅读专利全文（智慧芽 patsnap_fetch，markdown：著录项+权利要求+说明书+法律状态）。
+        - 需在 Valves 配 zhihuiya_apikey 才启用
+        - 用 search_patents 先拿到 patent_number（公开号，如 US11530424B1）
+        :param patent_number: 专利公开号（pn）
+        :param max_chars: 最大返回字符数（默认25000，专利文档很大会截断）
+        """
+        zh_enabled, zh_key = self._zhihuiya_enabled_key(__user__)
+        if not zh_enabled:
+            return json.dumps(
+                {"error": "智慧芽源未启用（未配 apikey 或已关闭）"}, ensure_ascii=False
+            )
+        if not (patent_number or "").strip():
+            return json.dumps(
+                {"error": "需提供 patent_number（专利公开号）"}, ensure_ascii=False
+            )
+        try:
+            max_chars = int(max_chars)
+        except (TypeError, ValueError):
+            max_chars = 25000
+        try:
+            resp = await self._zhihuiya_call(
+                "patsnap_fetch",
+                {
+                    "keys": [patent_number.strip()],
+                    "key_type": "pn",
+                    "module": ["basic", "legal"],
+                },
+                zh_key,
+                timeout=60,
+                url=self._PATSNAP_MCP_URL,
+            )
+        except Exception as e:
+            return json.dumps(
+                {"error": f"专利获取失败: {self._redact_zhihuiya_key(e)}"},
+                ensure_ascii=False,
+            )
+        results = (resp or {}).get("results") or []
+        first = results[0] if results and isinstance(results[0], dict) else {}
+        md = first.get("markdown", "") or ""
+        if not md:
+            return json.dumps(
+                {"error": f"未获取到专利 {patent_number} 的内容"}, ensure_ascii=False
+            )
+        return md[:max_chars] + ("\n\n[…专利文档截断…]" if len(md) > max_chars else "")
 
     async def read_paper(
         self,
