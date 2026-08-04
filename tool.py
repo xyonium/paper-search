@@ -235,6 +235,28 @@ class Tools:
             "url": bib.get("website") or "",
         }
 
+    @staticmethod
+    def _patsnap_map_patent(doc: dict) -> dict:
+        """patsnap_search 的 data.docs[] 项 -> 统一专利条目。"""
+        def _join(v):
+            if isinstance(v, list):
+                return "; ".join(str(x) for x in v if x)
+            return str(v) if v else ""
+        return {
+            "patent_number": doc.get("patent_number") or "",
+            "title": (doc.get("title") or "").strip(),
+            "ipc": doc.get("ipc") or "",
+            "legal_status": doc.get("legal_status") or "",
+            "application_date": str(doc.get("application_date") or ""),
+            "publication_date": str(doc.get("publication_date") or ""),
+            "cited_count": doc.get("cited_count", 0) or 0,
+            "assignees": _join(doc.get("assignees")),
+            "inventors": _join(doc.get("inventors")),
+            "jurisdiction": doc.get("jurisdiction") or "",
+            "url": doc.get("url") or "",
+            "view_url": doc.get("view_url") or "",
+        }
+
     async def _zhihuiya_search(self, query: str, limit: int, key: str) -> list:
         """search_literature + literature_bibliography 两步，返回 map 后的 paper 列表。"""
         search_resp = await self._zhihuiya_call(

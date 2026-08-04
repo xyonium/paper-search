@@ -387,3 +387,32 @@ async def test_zhihuiya_call_uses_custom_url():
 def test_patsnap_url_constant_distinct_from_zhihuiya():
     assert "2b0355/logic-mcp" in Tools._PATSNAP_MCP_URL
     assert "eba075" in Tools._ZHIHUIYA_MCP_URL
+
+
+def test_patsnap_map_patent_full():
+    doc = {
+        "patent_number": "US11530424B1", "title": "CRISPR system",
+        "ipc": "C12N15/90", "legal_status": "active",
+        "application_date": 20190930, "publication_date": 20221220,
+        "cited_count": 5, "jurisdiction": "US",
+        "assignees": ["UNIV A", "UNIV B"], "inventors": ["DOE, J."],
+        "url": "https://eureka...", "view_url": "https://analytics...",
+    }
+    out = Tools._patsnap_map_patent(doc)
+    assert out["patent_number"] == "US11530424B1"
+    assert out["title"] == "CRISPR system"
+    assert out["legal_status"] == "active"
+    assert out["application_date"] == "20190930"
+    assert out["publication_date"] == "20221220"
+    assert out["cited_count"] == 5
+    assert out["assignees"] == "UNIV A; UNIV B"
+    assert out["inventors"] == "DOE, J."
+    assert out["jurisdiction"] == "US"
+    assert out["url"] == "https://eureka..."
+
+
+def test_patsnap_map_patent_missing_fields():
+    out = Tools._patsnap_map_patent({"patent_number": "X1"})
+    assert out["patent_number"] == "X1"
+    assert out["title"] == "" and out["assignees"] == ""
+    assert out["application_date"] == "" and out["cited_count"] == 0
