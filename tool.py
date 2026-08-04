@@ -527,7 +527,7 @@ class Tools:
                 except Exception as e:
                     backend_err = f"智慧芽读取失败: {e}"
 
-        if backend_tool and paper_id:
+        if backend_tool and paper_id and src != "zhihuiya":
             try:
                 text = await anyio.to_thread.run_sync(
                     self._mcp_call, backend_tool, {"paper_id": paper_id}, 300

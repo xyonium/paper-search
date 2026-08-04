@@ -276,3 +276,21 @@ async def test_read_paper_zhihuiya_no_key_returns_hint():
     out = json.loads(await t.read_paper(source="zhihuiya", paper_id="p1",
                                         __user__=_user()))
     assert "error" in out
+
+
+@pytest.mark.asyncio
+async def test_read_paper_zhihuiya_noabstract_keeps_specific_error():
+    t = Tools()
+    t.valves = Tools.Valves(zhihuiya_apikey="k")
+
+    async def fake_call(tool_name, args, key, timeout=30):
+        return {"success": True, "data": [{"paper_id": "p1", "abstract": []}]}
+
+    def boom_mcp(*a, **k):
+        raise AssertionError("mcpo must not be called for zhihuiya")
+
+    t._zhihuiya_call = fake_call
+    t._mcp_call = boom_mcp  # prove no wasted backend call
+    out = json.loads(await t.read_paper(source="zhihuiya", paper_id="p1",
+                                        __user__=_user()))
+    assert "智慧芽无可用 abstract" in out.get("error", "")
