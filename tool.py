@@ -1221,14 +1221,12 @@ class Tools:
         __user__={},
     ) -> str:
         """
-        阅读论文全文（截断到 max_chars）。支持全部 21 个搜索源 + IEEE/ACM + 智慧芽。
-        - 后端直接可读: arxiv, biorxiv, medrxiv, iacr, semantic, doaj,
-          hal, openaire（ieee/acm 需配 key）
+        阅读论文全文（截断到 max_chars）。
+        - 后端直接可读: arxiv, biorxiv, medrxiv, iacr, semantic, doaj, hal, openaire
         - pubmed/crossref 后端仅返回元数据提示，会自动降级用 pdf_url 提取
         - dblp: 元数据库（无全文），自动用 DOI 查 ee 链接走 PDF fallback
-        - zenodo: 有后端 bug（published_date str → isoformat crash），走 pdf_url fallback
-        - base: 反爬（IP blocked），走 pdf_url fallback
-        - citeseerx: 端点已死（archive.org redirect），走 pdf_url fallback
+        - zenodo: 直连搜索（已绕过后端 bug），多数记录有 pdf_url 可直接提取
+        - base/citeseerx: 端点不可达（IP封/已下线），走 pdf_url fallback
         - pmc, core, europepmc, openalex, google_scholar, ssrn, unpaywall:
           请同时传 pdf_url，将自动下载提取全文
         - zhihuiya（智慧芽）: 元数据级 read（literature_bibliography 取 abstract+著录），
