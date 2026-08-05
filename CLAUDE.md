@@ -136,7 +136,8 @@ Default selection in UserValves:
 | **CORE** | ✅ | ⚠️ Fallback to PDF | ✅ (OA) | Global repository aggregator |
 | **Google Scholar** | ✅ | ❌ | ❌ | May return 403 without proxy |
 | **IACR** | ✅ | `read_iacr_paper` | ✅ | Cryptography ePrints |
-| **OpenAIRE / DOAJ / HAL / dblp** | ✅ | Varies / Fallback | Record-dependent | Domain repositories |
+| **OpenAIRE / DOAJ / HAL** | ✅ | Varies / Fallback | Record-dependent | Domain repositories |
+| **dblp** | ✅ (v2.5.3+ 直连) | ⚠️ ee/DOI → OA fallback | Record-dependent | CS 书目库，无全文；read_paper 自动查 ee 链接 → arXiv PDF / Unpaywall OA；付费墙返回错误提示走 download |
 
 ### Optional Premium Source (apikey-gated, **direct** — not via mcpo)
 
