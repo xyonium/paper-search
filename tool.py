@@ -11,7 +11,7 @@ description: |
     openaire, doaj, hal, dblp (CS书目)
   · 学科新论文浏览（非关键词检索，默认不启用，sources+biorxiv_category 显式用）: biorxiv, medrxiv
   · 支持搜索但端点死/反爬/不稳（默认不启用，失败自动降级）: google_scholar, ssrn, base, citeseerx
-  · 支持搜索，已改直连（绕后端 bug）: zenodo
+  · 支持搜索，已改直连（绕后端 bug）: zenodo（可选 zenodo_access_token 提额）
   · 支持搜索但未实现（配 key 也报错，不可用）: ieee, acm
   · 仅 DOI 查询（不支持关键词搜索，用于 download fallback 链查 OA PDF）: unpaywall
   · 智慧芽（需配 apikey 才启用，tool.py 直连不经 mcpo）: zhihuiya
@@ -174,6 +174,10 @@ class Tools:
             default="",
             description="IEEE Xplore API key（管理员级，留空则不启用 ieee 源）",
         )
+        zenodo_access_token: str = Field(
+            default="",
+            description="Zenodo Access Token（管理员级，可选；配了额度更高/可访问受限记录，留空走公共 API）",
+        )
 
     class UserValves(BaseModel):
         default_sources: str = Field(
@@ -203,6 +207,11 @@ class Tools:
         ieee_apikey: str = Field(
             default="",
             description="IEEE Xplore API key（个人级，非空时覆盖管理员 key）",
+            json_schema_extra={"input": {"type": "password"}},
+        )
+        zenodo_access_token: str = Field(
+            default="",
+            description="Zenodo Access Token（个人级，非空时覆盖管理员 token）",
             json_schema_extra={"input": {"type": "password"}},
         )
 
@@ -647,10 +656,25 @@ class Tools:
 
     _ZENODO_SEARCH_URL = "https://zenodo.org/api/records"
 
-    async def _zenodo_search(self, query: str, limit: int) -> list:
+    def _zenodo_token(self, __user__=None) -> str:
+        """返回 Zenodo token。UserValves 优先，否则用 admin Valves。"""
+        uv = __user__.get("valves") if __user__ else None
+        user_tok = (getattr(uv, "zenodo_access_token", "") or "").strip() if uv else ""
+        admin_tok = (self.valves.zenodo_access_token or "").strip()
+        return user_tok or admin_tok
+
+    async def _zenodo_search(self, query: str, limit: int, __user__=None) -> list:
         """直连 Zenodo REST API，绕后端 zenodo.py 的 isoformat bug
         （published_date 传 str 给 Paper，Paper.to_dict() 调 .isoformat() 崩溃）。
-        Zenodo 是开放获取仓储，多数记录有 PDF，无需 key。"""
+        Zenodo 是开放获取仓储，多数记录有 PDF。可选 token 提高额度/访问受限记录。"""
+        token = self._zenodo_token(__user__)
+        headers = {
+            "User-Agent": "paper-search-tool/2.5 (OpenWebUI academic search)",
+            "Accept": "application/json",
+        }
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+
         def _fetch():
             r = requests.get(
                 self._ZENODO_SEARCH_URL,
@@ -660,11 +684,8 @@ class Tools:
                     "type": "publication",
                     "sort": "bestmatch",
                 },
-                headers={
-                    "User-Agent": "paper-search-tool/2.5 (OpenWebUI academic search)",
-                    "Accept": "application/json",
-                },
-                timeout=20,
+                headers=headers,
+                timeout=60,  # Zenodo 公共 API 可能较慢，给足时间
             )
             r.raise_for_status()
             return r.json()
@@ -980,7 +1001,7 @@ class Tools:
             return await self._dblp_search(original, max_results_per_source)
 
         async def _zenodo():
-            return await self._zenodo_search(original, max_results_per_source)
+            return await self._zenodo_search(original, max_results_per_source, __user__)
 
         async def _ieee():
             return await self._ieee_search(original, max_results_per_source, ieee_key)
