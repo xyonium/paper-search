@@ -479,3 +479,41 @@ async def test_read_patent_disabled_no_key():
     t.valves = Tools.Valves()  # 无 key
     out = json.loads(await t.read_patent("US1", __user__=_user()))
     assert "error" in out
+
+
+def test_variants_strip_quotes_and_boolean():
+    v = tool_mod._make_query_variants('"early signal drop" glucose sensor OR biosensor')
+    assert v["original"] == '"early signal drop" glucose sensor OR biosensor'
+    assert '"' not in v["core"] and " OR " not in v["core"]
+    assert "early signal drop" in v["core"] and "glucose" in v["core"]
+
+
+def test_variants_strip_en_noise_words():
+    v = tool_mod._make_query_variants("what are the latest advances in glucose biosensor")
+    core = v["core"].lower()
+    for noise in ("what", "are", "the", "latest", "advances", "in"):
+        assert f" {noise} " not in f" {core} "
+    assert "glucose" in core and "biosensor" in core
+
+
+def test_variants_chinese_noise_and_cjk():
+    v = tool_mod._make_query_variants("最新的葡萄糖传感器怎么样")
+    assert "最新" not in v["core"] and "怎么样" not in v["core"]
+    assert "葡萄糖" in v["core"] and "传感器" in v["core"]
+
+
+def test_variants_no_change_when_clean():
+    v = tool_mod._make_query_variants("electropolymerization glucose sensor")
+    assert v["core"] == "electropolymerization glucose sensor"
+    assert v["original"] == v["core"]
+
+
+def test_variants_all_noise_falls_back_to_original():
+    v = tool_mod._make_query_variants("what are the")
+    assert v["core"]  # 非空
+    assert isinstance(v["core"], str)
+
+
+def test_source_groups():
+    assert tool_mod.LITERAL_SOURCES == frozenset({"zhihuiya", "doaj", "iacr"})
+    assert "hal" in tool_mod.DIRECT_SOURCES and "zhihuiya" in tool_mod.DIRECT_SOURCES

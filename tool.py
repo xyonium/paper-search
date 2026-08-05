@@ -29,11 +29,62 @@ license: MIT
 import asyncio
 import json
 import os
+import re
 import anyio
 import requests
 from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
 from pydantic import BaseModel, Field
+
+
+# ---------- 查询词适配（参考 reach-mcp query_core，确定性，不截断词数） ----------
+_QUERY_NOISE_EN = frozenset({
+    "a", "an", "the", "is", "are", "was", "were", "of", "in", "on", "for",
+    "with", "about", "to", "how", "what", "which", "who", "why", "when",
+    "where", "does", "should", "could", "would",
+    "best", "top", "latest", "new", "news", "recent", "advances", "advance",
+    "review", "reviews", "overview", "progress", "developments", "trends",
+    "using", "based", "via", "their", "its", "his", "her", "we", "you",
+    "study", "studies", "research", "analysis", "investigation",
+})
+_QUERY_NOISE_CN = frozenset({
+    "最新", "研究进展", "进展", "综述", "怎么样", "如何", "什么", "哪些",
+    "哪个", "推荐", "对比", "比较", "最近", "近期", "现状", "应用", "方法",
+})
+_QUERY_NOISE_CN_SORTED = sorted(_QUERY_NOISE_CN, key=len, reverse=True)
+_QUERY_BOOL_RE = re.compile(r"\b(?:OR|AND|NOT)\b")
+_QUERY_CJK_RE = re.compile(r"[一-鿿㐀-䶿]")
+_QUERY_PREFIXES = (
+    "what are the latest", "what are the", "what is the", "what are", "what is",
+    "recent advances in", "latest advances in", "advances in", "progress in",
+    "review of", "research on", "studies on",
+)
+
+LITERAL_SOURCES = frozenset({"zhihuiya", "doaj", "iacr"})
+DIRECT_SOURCES = frozenset({"zhihuiya", "hal", "patsnap"})
+
+
+def _make_query_variants(query: str) -> dict:
+    """生成 original/core 两个查询变体。core 去引号/裸露布尔/中英噪声词，
+    CJK 感知，不截断词数（保语义）；全噪声时回退 original。"""
+    original = (query or "").strip()
+    text = original.lower().rstrip("?!.")
+    if not text:
+        return {"original": original, "core": original}
+    for p in _QUERY_PREFIXES:
+        if text.startswith(p + " "):
+            text = text[len(p):].strip()
+            break
+    text = text.replace('"', " ").replace("'", " ")
+    text = _QUERY_BOOL_RE.sub(" ", text)
+    for phrase in _QUERY_NOISE_CN_SORTED:
+        text = text.replace(phrase, " ")
+    kept = [w for w in text.split() if w and w not in _QUERY_NOISE_EN]
+    core = " ".join(kept).strip()
+    core = re.sub(r"\s+", " ", core)
+    if not core:
+        core = original
+    return {"original": original, "core": core}
 
 
 class Tools:
