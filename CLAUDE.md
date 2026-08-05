@@ -104,9 +104,9 @@ Default selection in UserValves:
 
 | 源类 | 源 | 发送的查询 |
 |---|---|---|
-| **语义/分词** | openalex, semantic, crossref, pmc, europepmc, pubmed, arxiv, openaire, core, dblp, patsnap | `original`（原始完整查询，保语义） |
+| **语义/分词** | openalex, semantic, crossref, pmc, europepmc, pubmed, arxiv, openaire, core, patsnap | `original`（原始完整查询，保语义） |
 | **字面关键词** | zhihuiya, doaj, iacr | `core`（去引号/裸露 OR/AND/NOT/中英噪声词）再 `_distill_core_terms` 截断到 ≤5 个高区分度术语 |
-| **直连**（绕后端） | hal, zhihuiya, patsnap | hal 走 `_hal_search`（绕后端 hal.py 的 isoformat bug）；hal 用 core，zhihuiya 用 distilled |
+| **直连**（绕后端） | hal, zhihuiya, patsnap, dblp | hal 走 `_hal_search`（绕后端 hal.py 的 isoformat bug）；hal 用 core，zhihuiya 用 distilled；dblp 走 `_dblp_search`（v2.5.3+，绕后端 dblp.py 的并发 ConnectionError + 无退避重试 bug）用 original（CS 书目，非 CS 查询 0 结果属正常） |
 
 **字面源截断临界点实测**（真实环境，决定 max_terms=5 的依据）：
 
@@ -120,8 +120,8 @@ Default selection in UserValves:
 （含连字符/数字/括号、全大写缩写、长词），砍泛化词（sensor/coating/film/room temperature 等稀释相关性）。
 
 - `biorxiv/medrxiv` 非关键词检索，返回"该学科近30天新论文"；可用 `biorxiv_category`/`medrxiv_category` 传学科。
-- `dblp` 无 bug，偶发 500 是端点不稳定 + mcpo 并发超时，不在适配层。
-- `all` 模式下后端源用 `_BACKEND_ALL_SOURCES`（排除直连源 hal/zhihuiya/patsnap）；拆分时语义组用 `_SEMANTIC_ALL_SOURCES`（再排除字面组 doaj/iacr）。
+- `dblp` 后端 dblp.py 有 bug（v2.5.3 起改直连 `_dblp_search` 绕过）：并发/快速请求时 dblp 服务器直接断开连接（ConnectionError），后端无重试退避；且后端 dblp.py 无 rate-limit 感知，生产环境 500/ConnectionError 频繁。直连版加 3 次指数退避重试。注意 dblp 是 CS 书目库，仅收录计算机科学文献，非 CS 查询（如生物医学、材料科学）返回 0 属正常，非 bug。
+- `all` 模式下后端源用 `_BACKEND_ALL_SOURCES`（排除直连源 hal/zhihuiya/patsnap/dblp）；拆分时语义组用 `_SEMANTIC_ALL_SOURCES`（再排除字面组 doaj/iacr）。
 - 截断发生时返回 `query_adapted` 字段，列出各字面源实际用的精简查询。
 
 | Platform | Search | Read Tool | Native Download | Notes |

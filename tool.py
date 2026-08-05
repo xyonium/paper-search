@@ -22,7 +22,7 @@ description: |
     → 用原始完整查询
   · 字面源（zhihuiya/doaj/iacr）→ 自动去引号/裸露布尔/噪声词，精简为核心术语
     （长自然语言查询在这些源会 0 命中，精简后恢复）
-  · hal 已改直连（绕后端 bug），自动用 core 变体
+  · hal/dblp 已改直连（绕后端 bug），dblp 用 original（CS 书目，非 CS 查询可能 0 结果）
   · biorxiv/medrxiv 非关键词检索，返回"该学科近30天新论文"；
     可用 biorxiv_category/medrxiv_category 传学科（如 biochemistry）提高相关性
 
@@ -34,7 +34,7 @@ description: |
   5. read_patent(patent_number) → 读专利全文 markdown（权利要求+说明书+法律状态）
 author: openags-bridge
 requirements: requests, pymupdf, anyio
-version: 2.5.2
+version: 2.5.3
 license: MIT
 """
 
@@ -73,11 +73,11 @@ _QUERY_PREFIXES = (
 )
 
 LITERAL_SOURCES = frozenset({"zhihuiya", "doaj", "iacr"})
-DIRECT_SOURCES = frozenset({"zhihuiya", "hal", "patsnap"})
+DIRECT_SOURCES = frozenset({"zhihuiya", "hal", "patsnap", "dblp"})
 # 后端可提供服务的全部源（排除直连源 hal/zhihuiya/patsnap；citeseerx/base/zenodo 等虽在后端但默认不启用）
 _BACKEND_ALL_SOURCES = (
     "arxiv,biorxiv,medrxiv,iacr,semantic,crossref,openalex,pubmed,pmc,core,"
-    "europepmc,dblp,openaire,doaj,google_scholar,ssrn,unpaywall,citeseerx,base,zenodo,ieee,acm"
+    "europepmc,openaire,doaj,google_scholar,ssrn,unpaywall,citeseerx,base,zenodo,ieee,acm"
 )
 # all_mode 拆分时语义组使用的后端源（去掉字面源 doaj/iacr，留给 core 变体）
 _SEMANTIC_ALL_SOURCES = ",".join(
@@ -210,7 +210,6 @@ class Tools:
         "zenodo": "read_zenodo_paper",
         "hal": "read_hal_paper",
         "openaire": "read_openaire_paper",
-        "citeseerx": "read_citeseerx_paper",
         # ↓ 工具存在但设计上只返回"不支持"提示——尝试后检测降级
         "pubmed": "read_pubmed_paper",
         "crossref": "read_crossref_paper",
@@ -469,6 +468,97 @@ class Tools:
             })
         return papers
 
+    _DBLP_SEARCH_URL = "https://dblp.org/search/publ/api"
+
+    async def _dblp_search(self, query: str, limit: int) -> list:
+        """直连 dblp JSON API，绕后端 dblp.py 的并发 ConnectionError + 无退避重试。
+        退避策略：429/5xx/连接错误最多重试3次，间隔 2s/4s/8s。
+        注意：dblp 是 CS 书目库，仅收录计算机科学文献，非 CS 查询返回空属正常。"""
+        max_attempts = 3
+        backoff = [2, 4, 8]
+
+        def _fetch():
+            last_exc = None
+            for attempt in range(max_attempts):
+                try:
+                    r = requests.get(
+                        self._DBLP_SEARCH_URL,
+                        params={
+                            "q": query,
+                            "format": "json",
+                            "h": max(1, min(int(limit), 100)),
+                        },
+                        headers={
+                            "User-Agent": "paper-search-tool/2.5 (OpenWebUI academic search)",
+                            "Accept": "application/json",
+                        },
+                        timeout=30,
+                    )
+                    if r.status_code == 200:
+                        return r.json()
+                    if r.status_code in (429, 500, 502, 503, 504):
+                        raise RuntimeError(f"dblp HTTP {r.status_code}")
+                    r.raise_for_status()
+                except RuntimeError:
+                    raise
+                except Exception as e:
+                    last_exc = e
+                if attempt < max_attempts - 1:
+                    import time
+                    time.sleep(backoff[attempt])
+            raise RuntimeError(f"dblp 检索失败（重试{max_attempts}次）: {last_exc}")
+
+        try:
+            data = await anyio.to_thread.run_sync(_fetch)
+        except Exception as e:
+            raise RuntimeError(f"dblp 检索失败: {e}")
+
+        hits = ((data or {}).get("result") or {}).get("hits") or {}
+        hit_list = hits.get("hit") or []
+        if isinstance(hit_list, dict):
+            hit_list = [hit_list]
+        papers = []
+        for hit in hit_list[:limit]:
+            if not isinstance(hit, dict):
+                continue
+            info = hit.get("info") or {}
+            title = str(info.get("title") or "").strip()
+            if not title:
+                continue
+            authors_raw = info.get("authors") or {}
+            author_list = authors_raw.get("author") if isinstance(authors_raw, dict) else []
+            if isinstance(author_list, dict):
+                author_list = [author_list]
+            authors = []
+            for a in (author_list or []):
+                if isinstance(a, dict):
+                    name = str(a.get("text") or a.get("#text") or a.get("__text") or "").strip()
+                elif isinstance(a, str):
+                    name = a.strip()
+                else:
+                    continue
+                if name:
+                    authors.append(name)
+            year = str(info.get("year") or "")
+            doi = str(info.get("doi") or "")
+            dblp_url = str(info.get("url") or "")
+            paper_id = str(info.get("key") or dblp_url)
+            if not paper_id:
+                paper_id = f"dblp:{abs(hash(title)) & 0xffffffff:08x}"
+            papers.append({
+                "title": title,
+                "authors": "; ".join(authors),
+                "published_date": year,
+                "abstract": "",
+                "paper_id": paper_id,
+                "doi": doi,
+                "source": "dblp",
+                "pdf_url": "",
+                "citations": 0,
+                "url": dblp_url,
+            })
+        return papers
+
     def _mcp_call(self, tool: str, args: dict, timeout: int = 180):
         headers = {}
         if self.valves.mcpo_api_key:
@@ -623,8 +713,9 @@ class Tools:
         :param max_results_per_source: 每源条数（默认5，勿调大）
         :param sources: 留空用默认（'all'）；或逗号分隔子集，可选值:
             arxiv, iacr, pmc, europepmc, semantic, openalex, crossref, pubmed,
-            core, openaire, doaj, hal, dblp, zenodo, google_scholar, ssrn, base,
+            core, openaire, doaj, hal, zenodo, google_scholar, ssrn, base,
             citeseerx, unpaywall（仅DOI查询）, zhihuiya（需配 key）, ieee/acm（骨架未实现）
+            dblp（CS 书目，仅计算机科学文献；非 CS 查询可能 0 结果）
             biorxiv/medrxiv（学科近30天浏览，非关键词检索，需配 biorxiv_category）
         :param biorxiv_category: 可选 bioRxiv 学科分类（如 biochemistry, cell_biology,
             bioinformatics, neuroscience 等，空格转下划线）。biorxiv/medrxiv 非关键词检索，
@@ -647,6 +738,7 @@ class Tools:
         zh_enabled, zh_key = self._zhihuiya_enabled_key(__user__)
         want_zh = zh_enabled and ("zhihuiya" in src_set or all_mode)
         want_hal = "hal" in src_set or all_mode
+        want_dblp = "dblp" in src_set or all_mode
 
         # 直连源不进后端 sources
         backend_set = src_set - DIRECT_SOURCES
@@ -719,6 +811,9 @@ class Tools:
         async def _hal():
             return await self._hal_search(literal_query, max_results_per_source)
 
+        async def _dblp():
+            return await self._dblp_search(original, max_results_per_source)
+
         # 组装并发分支
         branches = {}
         branches["backend"] = _backend_split() if core != original else _backend_all()
@@ -726,6 +821,8 @@ class Tools:
             branches["zhihuiya"] = _zh()
         if want_hal:
             branches["hal"] = _hal()
+        if want_dblp:
+            branches["dblp"] = _dblp()
 
         keys = list(branches)
         results = await asyncio.gather(*branches.values(), return_exceptions=True)
@@ -734,9 +831,10 @@ class Tools:
         backend_result = outcome.get("backend")
         zh_result = outcome.get("zhihuiya")
         hal_result = outcome.get("hal")
+        dblp_result = outcome.get("dblp")
 
         # 后端失败处理：若任一直连源有结果则保留，否则报错
-        direct_ok = [r for r in (zh_result, hal_result) if isinstance(r, list) and r]
+        direct_ok = [r for r in (zh_result, hal_result, dblp_result) if isinstance(r, list) and r]
         if isinstance(backend_result, Exception):
             if direct_ok:
                 result = {"papers": [], "source_results": {},
@@ -771,14 +869,22 @@ class Tools:
                 hp = [self._trim_paper(p) for p in hal_result]
                 papers.extend(hp)
                 source_results["hal"] = len(hp)
+        if want_dblp:
+            if isinstance(dblp_result, Exception):
+                source_results["dblp"] = 0
+                errors["dblp"] = str(dblp_result)
+            elif dblp_result is not None:
+                dp = [self._trim_paper(p) for p in dblp_result]
+                papers.extend(dp)
+                source_results["dblp"] = len(dp)
 
         out = {"query": query, "total": len(papers),
                "source_results": source_results, "errors": errors, "papers": papers}
         # 字面源发生截断时给出提示（LLM/用户可见），避免误以为用了完整查询
         if literal_query != original:
             adapted = {}
-            for s in (LITERAL_SOURCES - DIRECT_SOURCES) | {"zhihuiya", "hal"}:
-                if s in source_results or (s == "zhihuiya" and want_zh) or (s == "hal" and want_hal):
+            for s in (LITERAL_SOURCES - DIRECT_SOURCES) | {"zhihuiya", "hal", "dblp"}:
+                if s in source_results or (s == "zhihuiya" and want_zh) or (s == "hal" and want_hal) or (s == "dblp" and want_dblp):
                     adapted[s] = literal_query
             if adapted:
                 out["query_adapted"] = adapted
