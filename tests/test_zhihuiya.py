@@ -484,8 +484,15 @@ async def test_read_patent_disabled_no_key():
 def test_variants_strip_quotes_and_boolean():
     v = tool_mod._make_query_variants('"early signal drop" glucose sensor OR biosensor')
     assert v["original"] == '"early signal drop" glucose sensor OR biosensor'
-    assert '"' not in v["core"] and " OR " not in v["core"]
-    assert "early signal drop" in v["core"] and "glucose" in v["core"]
+    assert '"' not in v["core"]
+    # 布尔运算符（任意大小写）都被剥离，且不误伤其它词
+    tokens = v["core"].split()
+    assert "or" not in tokens and "and" not in tokens and "not" not in tokens
+    assert "early signal drop" in v["core"] and "glucose" in v["core"] and "biosensor" in v["core"]
+    # 不误伤含 or/and 子串的词
+    v2 = tool_mod._make_query_variants("sensor and standard")
+    assert "sensor" in v2["core"].split() and "standard" in v2["core"].split()
+    assert "and" not in v2["core"].split()
 
 
 def test_variants_strip_en_noise_words():

@@ -52,7 +52,7 @@ _QUERY_NOISE_CN = frozenset({
     "哪个", "推荐", "对比", "比较", "最近", "近期", "现状", "应用", "方法",
 })
 _QUERY_NOISE_CN_SORTED = sorted(_QUERY_NOISE_CN, key=len, reverse=True)
-_QUERY_BOOL_RE = re.compile(r"\b(?:OR|AND|NOT)\b")
+_QUERY_BOOL_RE = re.compile(r"\b(?:OR|AND|NOT)\b", re.IGNORECASE)
 _QUERY_CJK_RE = re.compile(r"[一-鿿㐀-䶿]")
 _QUERY_PREFIXES = (
     "what are the latest", "what are the", "what is the", "what are", "what is",
