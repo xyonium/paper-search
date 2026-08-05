@@ -14,6 +14,15 @@ description: |
   · 智慧芽（需配 apikey 才启用，tool.py 直连不经 mcpo）: zhihuiya
   · 智慧芽专利（独立工具 search_patents/read_patent，同 key 启用）: patsnap
 
+  【查询适配】search_papers 自动按源分发查询变体（不损语义）：
+  · 语义源（openalex/semantic/crossref/pmc/europepmc/pubmed/arxiv/openaire/core/dblp/patsnap）
+    → 用原始完整查询
+  · 字面源（zhihuiya/doaj/iacr）→ 自动去引号/裸露布尔/噪声词，精简为核心术语
+    （长自然语言查询在这些源会 0 命中，精简后恢复）
+  · hal 已改直连（绕后端 bug），自动用 core 变体
+  · biorxiv/medrxiv 非关键词检索，返回"该学科近30天新论文"；
+    可用 biorxiv_category/medrxiv_category 传学科（如 biochemistry）提高相关性
+
   【工具用法】
   1. search_papers(query)      → 多源并发搜索+去重，返回标题/作者/摘要/引用数/pdf_url
   2. read_paper(source, paper_id, pdf_url) → 读全文（后端工具 + pdf_url 自动 fallback）
@@ -22,7 +31,7 @@ description: |
   5. read_patent(patent_number) → 读专利全文 markdown（权利要求+说明书+法律状态）
 author: openags-bridge
 requirements: requests, pymupdf, anyio
-version: 2.4.0
+version: 2.5.0
 license: MIT
 """
 
@@ -569,6 +578,11 @@ class Tools:
             crossref, pubmed, core, openaire, doaj, base, zenodo, hal, citeseerx,
             dblp, unpaywall, google_scholar, ssrn (+ieee, acm 若已配 key)
             zhihuiya（智慧芽，需在 Valves 配 apikey 才启用，直连不经 mcpo）
+        :param biorxiv_category: 可选 bioRxiv 学科分类（如 biochemistry, cell_biology,
+            bioinformatics, neuroscience 等，空格转下划线）。biorxiv/medrxiv 非关键词检索，
+            返回该学科近30天新论文；传学科可提高相关性。
+        :param medrxiv_category: 可选 medRxiv 学科分类（如 cardiovascular_medicine,
+            epidemiology, infectious_diseases 等）。
         """
         uv = __user__.get("valves") if __user__ else None
         src = (
