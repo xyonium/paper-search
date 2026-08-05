@@ -375,18 +375,31 @@ class Tools:
         for d in docs:
             if not isinstance(d, dict):
                 continue
+            hal_id = d.get("halId_s", "")
+            if not hal_id:
+                continue
             year = d.get("publicationDateY_i") or d.get("producedDateY_i") or ""
             pub = str(year) if year else (str(d.get("submittedDate_s", "") or "")[:10])
             title = d.get("title_s") or [""]
+            title = (title[0] if isinstance(title, list) else str(title)).strip()
+            if not title:
+                continue
             authors = d.get("authFullName_s") or []
             abstract = d.get("abstract_s") or [""]
+            abstract = (
+                " ".join(x for x in abstract if x) if isinstance(abstract, list)
+                else str(abstract or "")
+            ).strip()
+            doi = d.get("doiId_s", "")
+            if isinstance(doi, list):
+                doi = doi[0] if doi else ""
             papers.append({
-                "title": title[0] if isinstance(title, list) else str(title),
+                "title": title,
                 "authors": "; ".join(a for a in authors if a),
                 "published_date": pub,
-                "abstract": (abstract[0] if isinstance(abstract, list) else str(abstract)),
-                "paper_id": f"hal:{d.get('halId_s', '')}",
-                "doi": d.get("doiId_s") or "",
+                "abstract": abstract,
+                "paper_id": f"hal:{hal_id}",
+                "doi": doi,
                 "source": "hal",
                 "pdf_url": d.get("fileMain_s") or "",
                 "citations": 0,

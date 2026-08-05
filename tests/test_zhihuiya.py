@@ -613,3 +613,22 @@ async def test_search_papers_passes_biorxiv_category():
     await t.search_papers("glucose", sources="biorxiv",
                           biorxiv_category="biochemistry", __user__=_user())
     assert calls[0].get("biorxiv_category") == "biochemistry"
+
+
+@pytest.mark.asyncio
+async def test_hal_search_skips_empty_title_and_id():
+    t = Tools()
+    hal_resp = {"response": {"docs": [
+        {"halId_s": "", "title_s": ["No Id"]},                       # 空 id → 跳过
+        {"halId_s": "hal-2", "title_s": []},                          # 空 title → 跳过
+        {"halId_s": "hal-3", "title_s": ["Good"], "authFullName_s": ["A"],
+         "abstract_s": ["part1", "part2"], "doiId_s": ["10.1/x", "10.1/y"],
+         "publicationDateY_i": 2022, "fileMain_s": "", "uri_s": ""},
+    ]}}
+    fake = MagicMock(); fake.json.return_value = hal_resp; fake.raise_for_status = MagicMock()
+    with patch.object(tool_mod.requests, "get", return_value=fake):
+        papers = await t._hal_search("q", 5)
+    assert len(papers) == 1
+    assert papers[0]["paper_id"] == "hal:hal-3"
+    assert papers[0]["abstract"] == "part1 part2"   # 多段拼接
+    assert papers[0]["doi"] == "10.1/x"             # list 取首
