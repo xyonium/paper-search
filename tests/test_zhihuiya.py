@@ -524,3 +524,37 @@ def test_variants_all_noise_falls_back_to_original():
 def test_source_groups():
     assert tool_mod.LITERAL_SOURCES == frozenset({"zhihuiya", "doaj", "iacr"})
     assert "hal" in tool_mod.DIRECT_SOURCES and "zhihuiya" in tool_mod.DIRECT_SOURCES
+
+
+@pytest.mark.asyncio
+async def test_hal_search_maps_fields():
+    t = Tools()
+    hal_resp = {"response": {"docs": [{
+        "halId_s": "hal-001", "title_s": ["Glucose Biosensor"],
+        "authFullName_s": ["Doe J.", "Roe K."], "abstract_s": ["An abstract."],
+        "doiId_s": "10.1/hal", "publicationDateY_i": 2021,
+        "fileMain_s": "https://hal/x.pdf", "uri_s": "https://hal/record",
+    }]}}
+    fake = MagicMock()
+    fake.json.return_value = hal_resp
+    fake.raise_for_status = MagicMock()
+
+    with patch.object(tool_mod.requests, "get", return_value=fake) as mget:
+        papers = await t._hal_search("glucose biosensor", 3)
+    assert mget.called
+    p = papers[0]
+    assert p["paper_id"] == "hal:hal-001"
+    assert p["title"] == "Glucose Biosensor"
+    assert p["authors"] == "Doe J.; Roe K."
+    assert p["published_date"] == "2021"
+    assert p["doi"] == "10.1/hal"
+    assert p["pdf_url"] == "https://hal/x.pdf"
+    assert p["source"] == "hal"
+
+
+@pytest.mark.asyncio
+async def test_hal_search_error_raises():
+    t = Tools()
+    with patch.object(tool_mod.requests, "get", side_effect=Exception("conn fail")):
+        with pytest.raises(RuntimeError):
+            await t._hal_search("x", 3)

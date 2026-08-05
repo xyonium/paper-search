@@ -341,6 +341,59 @@ class Tools:
             for r in results
         ]
 
+    _HAL_SEARCH_URL = "https://api.archives-ouvertes.fr/search/"
+    _HAL_FIELDS = ("halId_s,title_s,authFullName_s,abstract_s,doiId_s,"
+                   "publicationDateY_i,producedDateY_i,submittedDate_s,"
+                   "fileMain_s,uri_s,docType_s")
+
+    async def _hal_search(self, query: str, limit: int) -> list:
+        """直连 HAL API（Solr JSON，无需 key）检索，返回 _trim_paper 兼容 dict 列表。
+        绕过第三方后端 hal.py 的 isoformat bug。anyio 线程池包装，不阻塞事件循环。"""
+        def _fetch():
+            r = requests.get(
+                self._HAL_SEARCH_URL,
+                params={
+                    "q": query,
+                    "fl": self._HAL_FIELDS,
+                    "rows": max(1, min(int(limit), 100)),
+                    "wt": "json",
+                    "sort": "score desc",
+                },
+                headers={"User-Agent": "paper-search-mcp/1.0", "Accept": "application/json"},
+                timeout=20,
+            )
+            r.raise_for_status()
+            return r.json()
+
+        try:
+            data = await anyio.to_thread.run_sync(_fetch)
+        except Exception as e:
+            raise RuntimeError(f"HAL 检索失败: {e}")
+
+        docs = ((data or {}).get("response") or {}).get("docs") or []
+        papers = []
+        for d in docs:
+            if not isinstance(d, dict):
+                continue
+            year = d.get("publicationDateY_i") or d.get("producedDateY_i") or ""
+            pub = str(year) if year else (str(d.get("submittedDate_s", "") or "")[:10])
+            title = d.get("title_s") or [""]
+            authors = d.get("authFullName_s") or []
+            abstract = d.get("abstract_s") or [""]
+            papers.append({
+                "title": title[0] if isinstance(title, list) else str(title),
+                "authors": "; ".join(a for a in authors if a),
+                "published_date": pub,
+                "abstract": (abstract[0] if isinstance(abstract, list) else str(abstract)),
+                "paper_id": f"hal:{d.get('halId_s', '')}",
+                "doi": d.get("doiId_s") or "",
+                "source": "hal",
+                "pdf_url": d.get("fileMain_s") or "",
+                "citations": 0,
+                "url": d.get("uri_s") or "",
+            })
+        return papers
+
     def _mcp_call(self, tool: str, args: dict, timeout: int = 180):
         headers = {}
         if self.valves.mcpo_api_key:
