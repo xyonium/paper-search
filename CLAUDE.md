@@ -100,17 +100,29 @@ Default selection in UserValves:
 
 ### Query Adaptation（查询特性，v2.5.0+）
 
-`search_papers` 按源自动分发查询变体（`_make_query_variants`，确定性、不截断词数）：
+`search_papers` 按源自动分发查询变体（`_make_query_variants`，确定性；v2.5.2 起字面源再经 `_distill_core_terms` 截断）：
 
 | 源类 | 源 | 发送的查询 |
 |---|---|---|
 | **语义/分词** | openalex, semantic, crossref, pmc, europepmc, pubmed, arxiv, openaire, core, dblp, patsnap | `original`（原始完整查询，保语义） |
-| **字面关键词** | zhihuiya, doaj, iacr | `core`（去引号/裸露 OR/AND/NOT/中英噪声词；长自然语言在这些源会 0，精简恢复） |
-| **直连**（绕后端） | hal, zhihuiya, patsnap | hal 走 `_hal_search`（绕后端 hal.py 的 isoformat bug），用 core 变体 |
+| **字面关键词** | zhihuiya, doaj, iacr | `core`（去引号/裸露 OR/AND/NOT/中英噪声词）再 `_distill_core_terms` 截断到 ≤5 个高区分度术语 |
+| **直连**（绕后端） | hal, zhihuiya, patsnap | hal 走 `_hal_search`（绕后端 hal.py 的 isoformat bug）；hal 用 core，zhihuiya 用 distilled |
+
+**字面源截断临界点实测**（真实环境，决定 max_terms=5 的依据）：
+
+| 源 | 11 词 | 6 词 | 5 词 | 3 词 | 临界 |
+|---|---|---|---|---|---|
+| zhihuiya | 0 | 恢复 | ✅ | ✅ | ≤6 词 |
+| doaj | 0 | **0** | ✅ | ✅ | **必须 ≤5 词** |
+| iacr | 0 | 恢复 | ✅ | ✅ | ≤6 词 |
+
+→ 三者统一截到 **5 词**（doaj 是硬需求，其余更保守不亏）。截断按术语区分度：保留专业/罕见词
+（含连字符/数字/括号、全大写缩写、长词），砍泛化词（sensor/coating/film/room temperature 等稀释相关性）。
 
 - `biorxiv/medrxiv` 非关键词检索，返回"该学科近30天新论文"；可用 `biorxiv_category`/`medrxiv_category` 传学科。
 - `dblp` 无 bug，偶发 500 是端点不稳定 + mcpo 并发超时，不在适配层。
 - `all` 模式下后端源用 `_BACKEND_ALL_SOURCES`（排除直连源 hal/zhihuiya/patsnap）；拆分时语义组用 `_SEMANTIC_ALL_SOURCES`（再排除字面组 doaj/iacr）。
+- 截断发生时返回 `query_adapted` 字段，列出各字面源实际用的精简查询。
 
 | Platform | Search | Read Tool | Native Download | Notes |
 |---|---|---|---|---|
