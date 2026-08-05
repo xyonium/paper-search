@@ -213,7 +213,6 @@ class Tools:
         # ↓ 工具存在但设计上只返回"不支持"提示——尝试后检测降级
         "pubmed": "read_pubmed_paper",
         "crossref": "read_crossref_paper",
-        "dblp": "read_dblp_paper",
         # ↓ 后端无 read 工具
         "pmc": None,
         "core": None,
@@ -222,6 +221,7 @@ class Tools:
         "google_scholar": None,
         "ssrn": None,
         "unpaywall": None,
+        "dblp": None,  # 元数据库，无全文；走 DOI → OA fallback
         # ↓ 可选付费源（配 key 后工具存在，未配时调用会 404，被异常处理兜住）
         "ieee": "read_ieee_paper",
         "acm": "read_acm_paper",
@@ -469,6 +469,7 @@ class Tools:
         return papers
 
     _DBLP_SEARCH_URL = "https://dblp.org/search/publ/api"
+    _UNPAYWALL_API = "https://api.unpaywall.org/v2"
 
     async def _dblp_search(self, query: str, limit: int) -> list:
         """直连 dblp JSON API，绕后端 dblp.py 的并发 ConnectionError + 无退避重试。
@@ -553,7 +554,7 @@ class Tools:
                 "paper_id": paper_id,
                 "doi": doi,
                 "source": "dblp",
-                "pdf_url": "",
+                "pdf_url": str(info.get("ee") or ""),
                 "citations": 0,
                 "url": dblp_url,
             })
@@ -1014,7 +1015,8 @@ class Tools:
         阅读论文全文（截断到 max_chars）。支持全部 21 个搜索源 + IEEE/ACM + 智慧芽。
         - 后端直接可读: arxiv, biorxiv, medrxiv, iacr, semantic, doaj, base,
           zenodo, hal, openaire, citeseerx（ieee/acm 需配 key）
-        - pubmed/crossref/dblp 后端仅返回元数据提示，会自动降级用 pdf_url 提取
+        - pubmed/crossref 后端仅返回元数据提示，会自动降级用 pdf_url 提取
+        - dblp: 元数据库（无全文），自动用 DOI 查 ee 链接走 PDF fallback
         - pmc, core, europepmc, openalex, google_scholar, ssrn, unpaywall:
           请同时传 pdf_url，将自动下载提取全文
         - zhihuiya（智慧芽）: 元数据级 read（literature_bibliography 取 abstract+著录），
@@ -1078,6 +1080,43 @@ class Tools:
         elif src not in self._READ_TOOLS:
             backend_err = f"未知源 '{src}'"
 
+        if src == "dblp" and not pdf_url and paper_id:
+            # dblp 是元数据库，无全文；尝试用 dblp record XML 查 ee/DOI → Unpaywall OA PDF
+            dblp_key = paper_id.lstrip("dblp:")
+            try:
+                def _fetch_dblp_ee():
+                    r = requests.get(
+                        f"https://dblp.org/rec/{dblp_key}.xml",
+                        headers={"Accept": "application/xml"},
+                        timeout=15,
+                    )
+                    if r.status_code != 200:
+                        return ""
+                    import xml.etree.ElementTree as ET
+                    root = ET.fromstring(r.text)
+                    ee = root.find(".//ee")
+                    return ee.text.strip() if ee is not None and ee.text else ""
+
+                ee_url = await anyio.to_thread.run_sync(_fetch_dblp_ee)
+                if ee_url:
+                    # arXiv 托管的论文：直接从 arXiv ID 构建 PDF 链接
+                    if "arxiv.org/abs/" in ee_url:
+                        arxiv_id = ee_url.split("arxiv.org/abs/")[-1]
+                        pdf_url = f"https://arxiv.org/pdf/{arxiv_id}"
+                    elif "doi.org/10.48550/arXiv." in ee_url:
+                        # dblp 对 arXiv 论文的 DOI 格式
+                        arxiv_id = ee_url.split("arXiv.")[-1]
+                        pdf_url = f"https://arxiv.org/pdf/{arxiv_id}"
+                    elif "doi.org/" in ee_url:
+                        doi = ee_url.split("doi.org/")[-1]
+                        oa_url = await self._resolve_oa_pdf(doi)
+                        if oa_url:
+                            pdf_url = oa_url
+                    elif ee_url.lower().endswith(".pdf"):
+                        pdf_url = ee_url
+            except Exception:
+                pass  # 静默降级到下面的通用 pdf_url / 错误提示
+
         if pdf_url:
             try:
                 def _fetch_pdf():
@@ -1114,6 +1153,26 @@ class Tools:
             },
             ensure_ascii=False,
         )
+
+    async def _resolve_oa_pdf(self, doi: str) -> str:
+        """用 Unpaywall API 按 DOI 查开放获取 PDF 直链。查不到返回空字符串。"""
+        email = self.valves.__dict__.get("unpaywall_email") or "paper-search@openwebui.local"
+        try:
+            def _fetch():
+                r = requests.get(
+                    f"{self._UNPAYWALL_API}/{doi}",
+                    params={"email": email},
+                    headers={"Accept": "application/json"},
+                    timeout=20,
+                )
+                if r.status_code == 200:
+                    return r.json()
+                return {}
+            data = await anyio.to_thread.run_sync(_fetch)
+            best = data.get("best_oa_location") or {}
+            return str(best.get("url_for_pdf") or best.get("url") or "")
+        except Exception:
+            return ""
 
     async def download_paper_to_knowledge(
         self,
