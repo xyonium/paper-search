@@ -73,11 +73,11 @@ _QUERY_PREFIXES = (
 )
 
 LITERAL_SOURCES = frozenset({"zhihuiya", "doaj", "iacr"})
-DIRECT_SOURCES = frozenset({"zhihuiya", "hal", "patsnap", "dblp", "zenodo"})
+DIRECT_SOURCES = frozenset({"zhihuiya", "hal", "patsnap", "dblp", "zenodo", "ieee"})
 # 后端可提供服务的全部源（排除直连源 hal/zhihuiya/patsnap；citeseerx/base/zenodo 等虽在后端但默认不启用）
 _BACKEND_ALL_SOURCES = (
     "arxiv,biorxiv,medrxiv,iacr,semantic,crossref,openalex,pubmed,pmc,core,"
-    "europepmc,openaire,doaj,google_scholar,ssrn,unpaywall,citeseerx,base,ieee,acm"
+    "europepmc,openaire,doaj,google_scholar,ssrn,unpaywall,citeseerx,base,acm"
 )
 # all_mode 拆分时语义组使用的后端源（去掉字面源 doaj/iacr，留给 core 变体）
 _SEMANTIC_ALL_SOURCES = ",".join(
@@ -170,6 +170,10 @@ class Tools:
             default="",
             description="智慧芽(zhihuiya)科学文献 API key（管理员/公司级，留空则不启用该源）",
         )
+        ieee_apikey: str = Field(
+            default="",
+            description="IEEE Xplore API key（管理员级，留空则不启用 ieee 源）",
+        )
 
     class UserValves(BaseModel):
         default_sources: str = Field(
@@ -195,6 +199,11 @@ class Tools:
         zhihuiya_enabled: bool = Field(
             default=True,
             description="是否启用智慧芽文献源（需 admin 或个人已配 key）",
+        )
+        ieee_apikey: str = Field(
+            default="",
+            description="IEEE Xplore API key（个人级，非空时覆盖管理员 key）",
+            json_schema_extra={"input": {"type": "password"}},
         )
 
     # 覆盖全部 21 个源 + 可选 IEEE/ACM（配 key 后动态注册）
@@ -224,7 +233,7 @@ class Tools:
         "base": None,    # 反爬（IP blocked），走 pdf_url fallback
         "citeseerx": None,  # 端点已死（archive.org redirect），走 pdf_url fallback
         # ↓ 可选付费源（配 key 后工具存在，未配时调用会 404，被异常处理兜住）
-        "ieee": "read_ieee_paper",
+        "ieee": None,  # 直连搜索（metadata 级）；read 走 pdf_url fallback（OA 可下）
         "acm": "read_acm_paper",
         # ↓ 智慧芽：直连元数据级 read（literature_bibliography），非后端工具
         "zhihuiya": "zhihuiya_bibliography",
@@ -561,6 +570,81 @@ class Tools:
             })
         return papers
 
+    _IEEE_SEARCH_URL = "https://ieeexploreapi.ieee.org/api/v1/search/articles"
+
+    def _ieee_enabled_key(self, __user__=None) -> tuple:
+        """返回 (enabled, key)。UserValves key 优先，否则用 admin Valves key。"""
+        uv = __user__.get("valves") if __user__ else None
+        user_key = (getattr(uv, "ieee_apikey", "") or "").strip() if uv else ""
+        admin_key = (self.valves.ieee_apikey or "").strip()
+        key = user_key or admin_key
+        return (bool(key), key)
+
+    async def _ieee_search(self, query: str, limit: int, key: str) -> list:
+        """直连 IEEE Xplore REST API（需 apikey）。返回 metadata 级结果（abstract+著录），
+        pdf_url 为 ieeexplore stamp 页（需机构访问才能下载 PDF）。
+        绕后端 ieee.py 骨架（raise NotImplementedError，无实际 API 调用）。"""
+        def _fetch():
+            r = requests.get(
+                self._IEEE_SEARCH_URL,
+                params={
+                    "apikey": key,
+                    "querytext": query,
+                    "max_records": max(1, min(int(limit), 200)),
+                    "format": "json",
+                    "sort_order": "desc",
+                    "sort_field": "relevance",
+                },
+                headers={"Accept": "application/json"},
+                timeout=30,
+            )
+            r.raise_for_status()
+            return r.json()
+
+        try:
+            data = await anyio.to_thread.run_sync(_fetch)
+        except Exception as e:
+            # 错误信息可能包含 apikey，需脱敏
+            err_msg = str(e)
+            if "apikey=" in err_msg:
+                err_msg = re.sub(r"apikey=[^&\s]+", "apikey=***", err_msg)
+            raise RuntimeError(f"IEEE 检索失败: {err_msg}")
+
+        articles = (data or {}).get("articles") or []
+        papers = []
+        for a in articles[:limit]:
+            if not isinstance(a, dict):
+                continue
+            title = str(a.get("title") or "").strip()
+            if not title:
+                continue
+            authors_raw = (a.get("authors") or {}).get("authors") or []
+            authors = [
+                str(au.get("full_name") or "").strip()
+                for au in authors_raw if isinstance(au, dict) and au.get("full_name")
+            ]
+            pub_year = str(a.get("publication_year") or "")
+            doi = str(a.get("doi") or "")
+            article_number = str(a.get("article_number") or "")
+            pdf_url = str(a.get("pdf_url") or "")
+            abstract = str(a.get("abstract") or "").strip()
+            access_type = str(a.get("access_type") or "")
+            # OA 论文可直接下载，LOCKED 需机构访问
+            is_oa = access_type.upper() == "OPEN_ACCESS" or "open" in access_type.lower()
+            papers.append({
+                "title": title,
+                "authors": "; ".join(authors),
+                "published_date": pub_year,
+                "abstract": abstract,
+                "paper_id": f"ieee:{article_number}",
+                "doi": doi,
+                "source": "ieee",
+                "pdf_url": pdf_url if is_oa else "",
+                "citations": int(a.get("citing_paper_count") or 0),
+                "url": str(a.get("html_url") or a.get("abstract_url") or ""),
+            })
+        return papers
+
     _ZENODO_SEARCH_URL = "https://zenodo.org/api/records"
 
     async def _zenodo_search(self, query: str, limit: int) -> list:
@@ -790,7 +874,8 @@ class Tools:
         :param sources: 留空用默认（'all'）；或逗号分隔子集，可选值:
             arxiv, iacr, pmc, europepmc, semantic, openalex, crossref, pubmed,
             core, openaire, doaj, hal, google_scholar, ssrn,
-            citeseerx, unpaywall（仅DOI查询）, zhihuiya（需配 key）, ieee/acm（骨架未实现）
+            citeseerx, unpaywall（仅DOI查询）, zhihuiya（需配 key）,
+            ieee（需配 ieee_apikey，metadata 级，OA 可下载 PDF）
             dblp（CS 书目，仅计算机科学文献；非 CS 查询可能 0 结果）
             zenodo（OA 仓储，已改直连；多数记录有 PDF）
             base（反爬，可能失败）, biorxiv/medrxiv（学科近30天浏览，非关键词检索，需配 biorxiv_category）
@@ -817,6 +902,8 @@ class Tools:
         want_hal = "hal" in src_set or all_mode
         want_dblp = "dblp" in src_set or all_mode
         want_zenodo = "zenodo" in src_set or all_mode
+        ieee_enabled, ieee_key = self._ieee_enabled_key(__user__)
+        want_ieee = ieee_enabled and ("ieee" in src_set or all_mode)
 
         # 直连源不进后端 sources
         backend_set = src_set - DIRECT_SOURCES
@@ -895,6 +982,9 @@ class Tools:
         async def _zenodo():
             return await self._zenodo_search(original, max_results_per_source)
 
+        async def _ieee():
+            return await self._ieee_search(original, max_results_per_source, ieee_key)
+
         # 组装并发分支
         branches = {}
         branches["backend"] = _backend_split() if core != original else _backend_all()
@@ -906,6 +996,8 @@ class Tools:
             branches["dblp"] = _dblp()
         if want_zenodo:
             branches["zenodo"] = _zenodo()
+        if want_ieee:
+            branches["ieee"] = _ieee()
 
         keys = list(branches)
         results = await asyncio.gather(*branches.values(), return_exceptions=True)
@@ -916,9 +1008,10 @@ class Tools:
         hal_result = outcome.get("hal")
         dblp_result = outcome.get("dblp")
         zenodo_result = outcome.get("zenodo")
+        ieee_result = outcome.get("ieee")
 
         # 后端失败处理：若任一直连源有结果则保留，否则报错
-        direct_ok = [r for r in (zh_result, hal_result, dblp_result, zenodo_result) if isinstance(r, list) and r]
+        direct_ok = [r for r in (zh_result, hal_result, dblp_result, zenodo_result, ieee_result) if isinstance(r, list) and r]
         if isinstance(backend_result, Exception):
             if direct_ok:
                 result = {"papers": [], "source_results": {},
@@ -969,6 +1062,14 @@ class Tools:
                 zp2 = [self._trim_paper(p) for p in zenodo_result]
                 papers.extend(zp2)
                 source_results["zenodo"] = len(zp2)
+        if want_ieee:
+            if isinstance(ieee_result, Exception):
+                source_results["ieee"] = 0
+                errors["ieee"] = str(ieee_result)
+            elif ieee_result is not None:
+                ip = [self._trim_paper(p) for p in ieee_result]
+                papers.extend(ip)
+                source_results["ieee"] = len(ip)
 
         out = {"query": query, "total": len(papers),
                "source_results": source_results, "errors": errors, "papers": papers}

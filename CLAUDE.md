@@ -122,6 +122,7 @@ Default selection in UserValves:
 - `biorxiv/medrxiv` 非关键词检索，返回"该学科近30天新论文"；可用 `biorxiv_category`/`medrxiv_category` 传学科。
 - `dblp` 后端 dblp.py 有 bug（v2.5.3 起改直连 `_dblp_search` 绕过）：并发/快速请求时 dblp 服务器直接断开连接（ConnectionError），后端无重试退避；且后端 dblp.py 无 rate-limit 感知，生产环境 500/ConnectionError 频繁。直连版加 3 次指数退避重试。注意 dblp 是 CS 书目库，仅收录计算机科学文献，非 CS 查询（如生物医学、材料科学）返回 0 属正常，非 bug。
 - `zenodo` 后端 zenodo.py 有 bug（v2.5.3 起改直连 `_zenodo_search` 绕过）：published_date 传 str 给 Paper 对象，Paper.to_dict() 调 `.isoformat()` 崩溃。直连版正确解析日期字符串。Zenodo 是 OA 仓储，多数记录有 PDF。
+- `ieee` 后端 ieee.py 是骨架（v2.5.3 起改直连 `_ieee_search` 绕过）：`raise NotImplementedError` 占位，但 IEEE Xplore 有公开 REST API（`ieeexploreapi.ieee.org`），需配 `ieee_apikey`（Valves 管理员级或 UserValves 个人级）。返回 metadata 级（abstract+著录），OA 论文有 pdf_url 可直接下载，LOCKED 论文需机构访问。
 - `all` 模式下后端源用 `_BACKEND_ALL_SOURCES`（排除直连源 hal/zhihuiya/patsnap/dblp/zenodo）；拆分时语义组用 `_SEMANTIC_ALL_SOURCES`（再排除字面组 doaj/iacr）。
 - 截断发生时返回 `query_adapted` 字段，列出各字面源实际用的精简查询。
 
@@ -140,6 +141,7 @@ Default selection in UserValves:
 | **OpenAIRE / DOAJ / HAL** | ✅ | Varies / Fallback | Record-dependent | Domain repositories |
 | **dblp** | ✅ (v2.5.3+ 直连) | ⚠️ ee/DOI → OA fallback | Record-dependent | CS 书目库，无全文；read_paper 自动查 ee 链接 → arXiv PDF / Unpaywall OA；付费墙返回错误提示走 download |
 | **Zenodo** | ✅ (v2.5.3+ 直连) | ⚠️ pdf_url fallback | ✅ (多数 OA) | OA 仓储，多数记录有 PDF；read 走 pdf_url 直接提取 |
+| **IEEE** | ✅ (v2.5.3+ 直连，需 key) | ⚠️ pdf_url fallback (OA) | ⚠️ (OA only) | IEEE Xplore REST API，metadata 级（abstract+著录）；OA 论文有 pdf_url，LOCKED 需机构访问 |
 
 ### Optional Premium Source (apikey-gated, **direct** — not via mcpo)
 
@@ -158,7 +160,8 @@ Default selection in UserValves:
 | **BASE** | ✅ | 反爬 | 支持搜索，但 IP 被封（403 Access denied）；OAI-PMH 端点不稳 |
 | **CiteSeerX** | ✅（代码有） | 端点已死 | 支持搜索，但 API 重定向 archive.org 404，无法修复 |
 | **Zenodo** | ✅（Elasticsearch） | ✅ 已直连修复 | 后端 `zenodo.py` isoformat bug（published_date str 传给 Paper）→ v2.5.3 起改直连 `_zenodo_search`，多数记录有 OA PDF |
-| **IEEE / ACM** | ⚠️ 骨架 | 未实现 | `search is not yet implemented`（有 key 也报错），tool.py 层无法绕过（无公开 API） |
+| **IEEE** | ✅（REST API） | ✅ 已直连修复 | 后端 `ieee.py` 是骨架（`raise NotImplementedError`），但 IEEE Xplore 有公开 REST API → v2.5.3 起改直连 `_ieee_search`，需配 `ieee_apikey`（Valves/UserValves），metadata 级（abstract+著录），OA 论文有 pdf_url |
+| **ACM** | ⚠️ 骨架 | 未实现 | `search is not yet implemented`，无公开 REST API，需 ACM 会员，tool.py 层无法绕过 |
 | **Unpaywall** | ❌ | 仅 DOI 查询 | **不支持关键词搜索**；用于 download fallback 链按 DOI 查 OA PDF |
 
 ---
