@@ -12,7 +12,8 @@ description: |
   · 学科新论文浏览（非关键词检索，默认不启用，sources+biorxiv_category 显式用）: biorxiv, medrxiv
   · 支持搜索但端点死/反爬/不稳（默认不启用，失败自动降级）: google_scholar, ssrn, base, citeseerx
   · 支持搜索，已改直连（绕后端 bug）: zenodo（可选 zenodo_access_token 提额）
-  · 支持搜索但未实现（配 key 也报错，不可用）: ieee, acm
+  · 支持搜索但未实现（配 key 也报错，不可用）: acm
+  · IEEE Xplore（需配 ieee_apikey，直连 REST API，metadata 级）: ieee
   · 仅 DOI 查询（不支持关键词搜索，用于 download fallback 链查 OA PDF）: unpaywall
   · 智慧芽（需配 apikey 才启用，tool.py 直连不经 mcpo）: zhihuiya
   · 智慧芽专利（独立工具 search_patents/read_patent，同 key 启用）: patsnap
