@@ -177,8 +177,8 @@ class Tools:
 
     class UserValves(BaseModel):
         default_sources: str = Field(
-            default="arxiv,pubmed,iacr,semantic,crossref,openalex,pmc,core,europepmc,dblp,openaire,doaj,hal",
-            description="默认搜索源：'all'=全部21源（慢，30s+）；或逗号分隔子集。默认未包含的源：google_scholar,citeseerx,ssrn,base,ieee,zenodo,unpaywall；zhihuiya 需管理员或用户配 apikey；biorxiv/medrxiv 为学科近30天浏览（非关键词检索），需 sources+biorxiv_category 显式调用",
+            default="arxiv,pubmed,iacr,semantic,crossref,openalex,pmc,core,europepmc,dblp,openaire,doaj,hal,zenodo",
+            description="默认搜索源：'all'=全部21源（慢，30s+）；或逗号分隔子集。默认未包含的源：google_scholar,citeseerx,ssrn,base,acm,unpaywall；zhihuiya 需配 zhihuiya_apikey，ieee 需配 ieee_apikey（有 key 自动启用，无 key 自动跳过）；biorxiv/medrxiv 为学科近30天浏览（非关键词检索），需 sources+biorxiv_category 显式调用",
         )
         knowledge_id: str = Field(
             default="", description="下载 PDF 自动加入的 Knowledge 集合 ID"

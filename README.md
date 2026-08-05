@@ -1,7 +1,7 @@
 # 📚 OpenWebUI Academic Paper Search & Knowledge Base Integration
 
-> **One prompt → 17 academic databases → full text → your RAG Knowledge Base.**
-> Multi-source academic paper search, full-text reading, and automatic PDF ingestion into **OpenWebUI Knowledge Base** (RAG) — powered by `mcpo` + `paper-search-mcp`, now with direct **zhihuiya (智慧芽)** scientific-literature integration.
+> **One prompt → 18+ academic databases → full text → your RAG Knowledge Base.**
+> Multi-source academic paper search, full-text reading, and automatic PDF ingestion into **OpenWebUI Knowledge Base** (RAG) — powered by `mcpo` + `paper-search-mcp`, with direct **zhihuiya (智慧芽)** literature/patent and **IEEE Xplore** integration.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 [![OpenWebUI](https://img.shields.io/badge/OpenWebUI-Tool-blue)](https://github.com/open-webui/open-webui)
@@ -15,10 +15,12 @@
 - 📖 **Full-Text Reading**: Instant full-text for Open Access platforms, automatic PDF-parsing fallback, and metadata-level reads (abstract + bibliographic record) for index-only sources.
 - 📥 **Automated Knowledge Base Ingestion**: Download papers and auto-upload & index them into **OpenWebUI Knowledge Base** for RAG citation and retrieval.
 - 🔄 **Built-in OA Fallback Chain**: Source-native download ➔ Open Access Repositories (OpenAIRE / CORE / Europe PMC / PMC) ➔ Unpaywall ➔ (Optional) Sci-Hub mirror.
-- 🔑 **Optional zhihuiya Source**: Connects **directly** via streamable-http MCP (not through mcpo), enabled per-admin or per-user apikey — disabled entirely when no key is set.
+- 🔑 **Key-gated sources (auto-on/off)**: zhihuiya literature + patents and IEEE Xplore are enabled **automatically when their apikey is set** and skipped silently when not — no source list changes needed.
 - 🏛 **Patent Search & Full-Text (patsnap)**: First-ever patent source — semantic patent search (`search_patents`) plus full claims + description + legal status as Markdown (`read_patent`). Shares the same zhihuiya apikey, also direct-connected.
-- 🎯 **Smart Query Adaptation**: Automatically adapts your query per source — semantic sources (OpenAlex, Semantic Scholar, PubMed…) get the full natural-language query, while literal keyword sources (zhihuiya, DOAJ, IACR) get a cleaned core-keyword variant (quotes/boolean/noise stripped). Recovers hits that would otherwise return zero, without losing semantics.
+- 🔬 **IEEE Xplore**: Direct REST API search (bypasses backend skeleton). Metadata-level results with abstract + citation count; OA papers include pdf_url.
+- 🎯 **Smart Query Adaptation**: Automatically adapts your query per source — semantic sources (OpenAlex, Semantic Scholar, PubMed…) get the full natural-language query, while literal keyword sources (zhihuiya, DOAJ, IACR) get a cleaned core-keyword variant (quotes/boolean/noise stripped, then distilled to ≤5 high-specificity terms). Recovers hits that would otherwise return zero, without losing semantics.
 - 🇫🇷 **HAL via Direct Connect**: HAL is queried directly (bypassing a backend date-parsing bug) so it reliably returns results.
+- 🗄 **dblp & Zenodo via Direct Connect**: dblp (CS bibliography) and Zenodo (OA repository) are queried directly, bypassing backend bugs (concurrency ConnectionError, isoformat crash). Zenodo records often include direct PDF links.
 
 ---
 
@@ -60,7 +62,7 @@
 ## 📊 Supported Data Sources
 
 ### Verified Active Sources
-`default_sources = "arxiv,pubmed,iacr,semantic,crossref,openalex,pmc,core,europepmc,dblp,openaire,doaj,hal"`
+`default_sources = "arxiv,pubmed,iacr,semantic,crossref,openalex,pmc,core,europepmc,dblp,openaire,doaj,hal,zenodo"`
 
 | Platform | Search | Read Tool | Native Download | Notes |
 |---|---|---|---|---|
@@ -73,7 +75,17 @@
 | **CORE** | ✅ | ⚠️ Fallback to PDF | ✅ (OA) | Global repository aggregator |
 | **IACR** | ✅ | `read_iacr_paper` | ✅ | Cryptography ePrints |
 | **HAL** | ✅ (direct) | ⚠️ Fallback to PDF | ✅ (OA) | Direct-connected (bypasses a backend date bug) |
-| **OpenAIRE / DOAJ / dblp** | ✅ | Varies / Fallback | Record-dependent | Domain repositories |
+| **OpenAIRE / DOAJ** | ✅ | Varies / Fallback | Record-dependent | Domain repositories |
+| **dblp** | ✅ (direct) | ⚠️ ee/DOI → OA fallback | Record-dependent | CS bibliography (CS papers only); direct-connected (bypasses backend concurrency bug) |
+| **Zenodo** | ✅ (direct) | ⚠️ pdf_url fallback | ✅ (mostly OA) | OA repository; direct-connected (bypasses backend isoformat bug); most records have PDFs |
+
+### Key-gated Sources (auto-enabled when key is set, auto-skipped when not)
+
+| Platform | Search | Read Tool | Notes |
+|---|---|---|---|
+| **zhihuiya (智慧芽)** | ✅ `search_literature` | ⚠️ metadata via `literature_bibliography` | Scientific-literature MCP, direct streamable-http. Enabled when `zhihuiya_apikey` (admin or user) is non-empty; skipped silently when no key |
+| **patsnap (智慧芽专利)** | ✅ `patsnap_search` | ✅ full text via `patsnap_fetch` | Patent MCP (same key as zhihuiya). `read_patent` returns **claims + description + legal status** as Markdown |
+| **IEEE Xplore** | ✅ REST API | ⚠️ pdf_url (OA only) | Direct REST API. Enabled when `ieee_apikey` is non-empty; skipped silently when no key. Metadata-level (abstract+bibliographic); OA papers have pdf_url |
 
 ### Sources NOT in default (grouped by keyword-search capability)
 
@@ -82,18 +94,10 @@
 | **bioRxiv / medRxiv** | ❌ (subject-category browse) | Return latest ~30 days in a subject, **not** keyword search — would inject irrelevant results. Use explicitly via `sources="biorxiv"` + `biorxiv_category` |
 | **Google Scholar** | ✅ | Anti-bot 403 without proxy |
 | **SSRN** | ✅ | Cloudflare 403 |
-| **BASE** | ✅ | OAI-PMH timeout / SSL EOF |
+| **BASE** | ✅ | IP blocked (403 Access denied) |
 | **CiteSeerX** | ✅ (code) | Endpoint dead (redirects to archive.org 404) |
-| **Zenodo** | ✅ | `isoformat` bug in backend |
-| **IEEE / ACM** | ⚠️ skeleton | `search is not yet implemented` |
+| **ACM** | ⚠️ skeleton | `search is not yet implemented`, no public REST API |
 | **Unpaywall** | ❌ | **DOI lookup only** — used in the download fallback chain to find OA PDFs, not a search source |
-
-### Optional Premium Source (apikey-gated, direct connection)
-
-| Platform | Search | Read Tool | Native Download | Notes |
-|---|---|---|---|---|
-| **zhihuiya (智慧芽)** | ✅ `search_literature` | ⚠️ metadata via `literature_bibliography` | ❌ | Scientific-literature MCP. Connects **directly** (streamable-http), **not** via mcpo. Enabled only when an apikey is configured; search = `search_literature` + batched `literature_bibliography` (for abstracts); full text via DOI → OA fallback chain |
-| **patsnap (智慧芽专利)** | ✅ `patsnap_search` | ✅ full text via `patsnap_fetch` | ❌ | **Patent** MCP (same company, same apikey). Dedicated tools `search_patents` / `read_patent` (independent of `search_papers`). `read_patent` returns **claims + description + legal status** as Markdown (default `module=['basic','legal']`) |
 
 ---
 
@@ -103,9 +107,9 @@ Different sources have very different query tolerances. `search_papers` automati
 
 | Source class | Sources | Query sent |
 |---|---|---|
-| **Semantic / tokenizing** | openalex, semantic, crossref, pmc, europepmc, pubmed, arxiv, openaire, core, dblp, patsnap | Your **original** full natural-language query (semantics preserved) |
-| **Literal keyword** | zhihuiya, doaj, iacr | A **cleaned core-keyword** variant — quotes, bare `OR/AND/NOT`, and filler words stripped (e.g. `"what are the latest advances in X"` → `X`), because these return **zero** on verbose queries |
-| **Direct (bypasses backend)** | hal, zhihuiya, patsnap | hal queried directly (backend date bug bypassed); uses core variant |
+| **Semantic / tokenizing** | openalex, semantic, crossref, pmc, europepmc, pubmed, arxiv, openaire, core, patsnap | Your **original** full natural-language query (semantics preserved) |
+| **Literal keyword** | zhihuiya, doaj, iacr | A **cleaned core-keyword** variant — quotes, bare `OR/AND/NOT`, and filler words stripped, then distilled to ≤5 high-specificity terms |
+| **Direct (bypasses backend)** | hal, zhihuiya, patsnap, dblp, zenodo, ieee | hal uses core; zhihuiya uses distilled; dblp/zenodo/ieee use original |
 
 > `bioRxiv` / `medRxiv` are **not keyword search** — they return the latest ~30 days of papers in a subject category, so they're **excluded from `default_sources`** (a keyword query would inject irrelevant results). To browse a subject's new papers, call explicitly: `sources="biorxiv"` + `biorxiv_category="biochemistry"` (or `medrxiv_category="cardiovascular_medicine"`).
 
@@ -170,18 +174,18 @@ Configure your `config.json` file for `mcpo`:
    - `allow_scihub`: Set to `True` / `False` for Sci-Hub fallback.
    - `scihub_url`: Custom Sci-Hub mirror URL (e.g. `https://sci-hub.ee`).
 
-### 4. (Optional) Enable the zhihuiya (智慧芽) Source
+### 4. (Optional) Enable Key-gated Sources
 
-zhihuiya is a premium scientific-literature source that connects **directly** via streamable-http MCP — it does **not** go through mcpo, so no `config.json` change is needed.
+Key-gated sources are **enabled automatically when their key is set** and **skipped silently when not** — no need to add them to `default_sources`.
 
-- **Admin (company) key** — set `Valves.zhihuiya_apikey` in the Tool's admin Valves. Applies to all users by default.
-- **Per-user key / toggle** — users can set their own `UserValves.zhihuiya_apikey` (overrides the admin key) or flip `UserValves.zhihuiya_enabled` off.
+**zhihuiya (智慧芽) + patsnap:**
+- Set `Valves.zhihuiya_apikey` (admin, company-wide) or `UserValves.zhihuiya_apikey` (per-user, overrides admin)
+- Enables both `zhihuiya` (literature) in `search_papers` and `search_patents`/`read_patent` (patent tools)
 
-The source is **enabled only when a non-empty apikey exists** (admin or user) **and** `zhihuiya_enabled` is on. With no key configured, the source issues no requests at all. Then add `zhihuiya` to `UserValves.default_sources` (or pass `sources="...,zhihuiya"` in a query) to include it in aggregated searches.
-
-### 5. (Optional) Patent Tools — Same Key
-
-The **patsnap patent tools** (`search_patents` / `read_patent`) use the **same** `zhihuiya_apikey` and the **same** `zhihuiya_enabled` toggle — no extra configuration. Once the key is set, patent search & full-text reading work immediately. They are independent of `search_papers` (patents are not merged into the literature aggregation).
+**IEEE Xplore:**
+- Set `Valves.ieee_apikey` (admin) or `UserValves.ieee_apikey` (per-user, overrides admin)
+- Enables `ieee` in `search_papers` when key is present
+- Get a free key at [developer.ieee.org](https://developer.ieee.org/)
 
 ---
 
@@ -190,7 +194,8 @@ The **patsnap patent tools** (`search_patents` / `read_patent`) use the **same**
 Once installed, OpenWebUI models can call the following tools:
 
 1. **`search_papers(query, sources, max_results_per_source)`**  
-   Searches papers concurrently across sources and returns formatted metadata with DOI & PDF links.
+   Searches papers concurrently across sources and returns formatted metadata with DOI & PDF links.  
+   - Key-gated sources (zhihuiya, ieee) are **auto-enabled when their key is set**, auto-skipped otherwise — no need to list them in `sources` or `default_sources`.
 
 2. **`read_paper(source, paper_id, pdf_url)`**  
    Reads the full text of a target paper (with automatic PDF fallback).

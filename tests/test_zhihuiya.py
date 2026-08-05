@@ -696,6 +696,15 @@ def test_default_sources_exclude_biorxiv_medrxiv():
         assert keep in tokens
 
 
+def test_default_sources_include_zenodo_not_ieee():
+    """zenodo 已加入默认源（v2.5.3 直连修复）；ieee 需配 key 不进默认。"""
+    ds = Tools.UserValves().default_sources
+    tokens = {s.strip() for s in ds.split(",")}
+    assert "zenodo" in tokens      # 直连修复后可用，加入默认
+    assert "ieee" not in tokens    # 需配 key，opt-in
+    assert "dblp" in tokens        # 直连修复后仍在默认
+
+
 def test_distill_core_terms_truncates_long_query():
     q = "initiated chemical vapor deposition iCVD conformal polymer film room temperature biosensor coating"
     core = tool_mod._make_query_variants(q)["core"]
