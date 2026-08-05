@@ -34,7 +34,7 @@ description: |
   5. read_patent(patent_number) → 读专利全文 markdown（权利要求+说明书+法律状态）
 author: openags-bridge
 requirements: requests, pymupdf, anyio
-version: 2.5.1
+version: 2.5.2
 license: MIT
 """
 
@@ -106,6 +106,47 @@ def _make_query_variants(query: str) -> dict:
     if not core:
         core = original
     return {"original": original, "core": core}
+
+
+# 泛化词（几乎每篇都有，会稀释字面源相关性，截断时优先砍掉）
+_GENERIC_TERMS = frozenset({
+    "sensor", "sensors", "coating", "coatings", "film", "films", "membrane",
+    "membranes", "thin", "conformal", "room", "temperature", "biomedical",
+    "medical", "process", "processes", "control", "uniformity", "principle",
+    "measurement", "surface", "layer", "device", "devices", "system", "systems",
+    "technique", "techniques", "technology", "application", "applications",
+})
+
+
+def _distill_core_terms(text: str, max_terms: int = 5) -> str:
+    """对字面源（zhihuiya/doaj/iacr）在 core 基础上按术语区分度截断到 max_terms 词。
+    保留专业/罕见词（含连字符/数字/括号、全大写缩写、长词），砍泛化词；保持原顺序。
+    词数 ≤ max_terms 时原样返回。实测临界：>5 词在字面源易 0 命中。"""
+    words = text.split()
+    if len(words) <= max_terms:
+        return text
+
+    def _score(w: str) -> int:
+        wl = w.lower()
+        s = 0
+        if re.search(r"[-()/0-9]", w):
+            s += 3
+        if len(w) > 1 and w.isupper():
+            s += 3
+        if len(w) >= 8:
+            s += 2
+        if wl in _GENERIC_TERMS:
+            s -= 5
+        return s
+
+    ranked = sorted(words, key=lambda w: -_score(w))
+    keep = set(ranked[:max_terms])
+    # 保持原顺序（同一词出现多次只保留首次出现的标记，避免重复计数丢失）
+    seen = []
+    for w in words:
+        if w in keep and w not in seen:
+            seen.append(w)
+    return " ".join(seen)
 
 
 class Tools:
@@ -619,7 +660,8 @@ class Tools:
             if all_mode
             else ((src_set & LITERAL_SOURCES) - DIRECT_SOURCES)
         )
-        literal_query = core if core != original else original
+        # 字面源（doaj/iacr/zhihuiya）长术语查询需进一步按区分度截断到 5 词，否则 0 命中
+        literal_query = _distill_core_terms(core, max_terms=5)
 
         async def _backend_all():
             # core==original 或无需拆分时，一次调用（含全部后端源）
@@ -730,10 +772,17 @@ class Tools:
                 papers.extend(hp)
                 source_results["hal"] = len(hp)
 
-        return json.dumps(
-            {"query": query, "total": len(papers),
-             "source_results": source_results, "errors": errors, "papers": papers},
-            ensure_ascii=False, indent=2)
+        out = {"query": query, "total": len(papers),
+               "source_results": source_results, "errors": errors, "papers": papers}
+        # 字面源发生截断时给出提示（LLM/用户可见），避免误以为用了完整查询
+        if literal_query != original:
+            adapted = {}
+            for s in (LITERAL_SOURCES - DIRECT_SOURCES) | {"zhihuiya", "hal"}:
+                if s in source_results or (s == "zhihuiya" and want_zh) or (s == "hal" and want_hal):
+                    adapted[s] = literal_query
+            if adapted:
+                out["query_adapted"] = adapted
+        return json.dumps(out, ensure_ascii=False, indent=2)
 
     async def search_patents(
         self,

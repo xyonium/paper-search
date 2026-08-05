@@ -694,3 +694,47 @@ def test_default_sources_exclude_biorxiv_medrxiv():
     # 主力检索源仍在
     for keep in ("arxiv", "pubmed", "semantic", "openalex", "hal"):
         assert keep in tokens
+
+
+def test_distill_core_terms_truncates_long_query():
+    q = "initiated chemical vapor deposition iCVD conformal polymer film room temperature biosensor coating"
+    core = tool_mod._make_query_variants(q)["core"]
+    d = tool_mod._distill_core_terms(core, max_terms=5)
+    assert len(d.split()) <= 5
+    # 专业词（长词/缩写）应保留
+    assert "deposition" in d or "icvd" in d or "chemical" in d
+    # 泛化词被砍
+    for g in ("coating", "film", "sensor", "room", "temperature", "conformal"):
+        assert g not in d.split()
+
+
+def test_distill_core_terms_short_query_unchanged():
+    core = "glucose biosensor"
+    assert tool_mod._distill_core_terms(core, max_terms=5) == "glucose biosensor"
+
+
+def test_distill_preserves_order_and_no_dup():
+    core = "plasma polymerization room temperature conformal thin film biomedical coating"
+    d = tool_mod._distill_core_terms(core, max_terms=5)
+    toks = d.split()
+    assert len(toks) == len(set(toks))  # 无重复
+    core_toks = core.split()
+    idx = [core_toks.index(t) for t in toks]
+    assert idx == sorted(idx)  # 原顺序保持
+
+
+@pytest.mark.asyncio
+async def test_search_papers_adds_query_adapted_hint():
+    t = Tools(); t.valves = Tools.Valves()
+    t._mcp_call = lambda tool, args, timeout=180: {"papers": [], "source_results": {}, "errors": {}}
+    async def fake_zh(q, limit, key):
+        return []
+    t._zhihuiya_search = fake_zh
+    t2_valves = _user(apikey="k")
+    t.valves = Tools.Valves(zhihuiya_apikey="k")
+    long_q = "what are the latest advances in initiated chemical vapor deposition iCVD conformal polymer film coating sensor"
+    out = json.loads(await t.search_papers(long_q, sources="zhihuiya,doaj,iacr", __user__=_user()))
+    assert "query_adapted" in out
+    # 字面源的查询应被截断到 ≤5 词
+    for s, qq in out["query_adapted"].items():
+        assert len(qq.split()) <= 5
