@@ -59,22 +59,34 @@
 
 ## 📊 Supported Data Sources
 
-### Verified Active Sources (16 Selected)
-`default_sources = "arxiv,pubmed,biorxiv,medrxiv,google_scholar,iacr,semantic,crossref,openalex,pmc,core,europepmc,dblp,openaire,doaj,hal"`
+### Verified Active Sources
+`default_sources = "arxiv,pubmed,iacr,semantic,crossref,openalex,pmc,core,europepmc,dblp,openaire,doaj,hal"`
 
 | Platform | Search | Read Tool | Native Download | Notes |
 |---|---|---|---|---|
 | **arXiv** | ✅ | `read_arxiv_paper` | ✅ | Open PDF, fast & reliable |
 | **PubMed** | ✅ | ⚠️ metadata only | ❌ | Requires `NCBI_API_KEY` for rate limits |
-| **bioRxiv / medRxiv** | ✅ | `read_biorxiv/medrxiv_paper` | ✅ | Open preprints (DOI based) |
 | **Semantic Scholar** | ✅ | `read_semantic_paper` | ✅ (OA) | Supports `SEMANTIC_SCHOLAR_API_KEY` |
 | **Crossref** | ✅ | ⚠️ metadata only | ❌ | Citation & DOI backbone |
 | **OpenAlex** | ✅ | ⚠️ metadata only | ❌ | Open metadata backbone |
 | **PMC / Europe PMC** | ✅ | ⚠️ Fallback to PDF | ✅ (OA) | High-quality biomedical full-text |
 | **CORE** | ✅ | ⚠️ Fallback to PDF | ✅ (OA) | Global repository aggregator |
-| **Google Scholar** | ✅ | ❌ | ❌ | May return 403 without proxy |
 | **IACR** | ✅ | `read_iacr_paper` | ✅ | Cryptography ePrints |
-| **OpenAIRE / DOAJ / HAL / dblp** | ✅ | Varies / Fallback | Record-dependent | Domain repositories |
+| **HAL** | ✅ (direct) | ⚠️ Fallback to PDF | ✅ (OA) | Direct-connected (bypasses a backend date bug) |
+| **OpenAIRE / DOAJ / dblp** | ✅ | Varies / Fallback | Record-dependent | Domain repositories |
+
+### Sources NOT in default (grouped by keyword-search capability)
+
+| Source | Keyword search | Why not default |
+|---|---|---|
+| **bioRxiv / medRxiv** | ❌ (subject-category browse) | Return latest ~30 days in a subject, **not** keyword search — would inject irrelevant results. Use explicitly via `sources="biorxiv"` + `biorxiv_category` |
+| **Google Scholar** | ✅ | Anti-bot 403 without proxy |
+| **SSRN** | ✅ | Cloudflare 403 |
+| **BASE** | ✅ | OAI-PMH timeout / SSL EOF |
+| **CiteSeerX** | ✅ (code) | Endpoint dead (redirects to archive.org 404) |
+| **Zenodo** | ✅ | `isoformat` bug in backend |
+| **IEEE / ACM** | ⚠️ skeleton | `search is not yet implemented` |
+| **Unpaywall** | ❌ | **DOI lookup only** — used in the download fallback chain to find OA PDFs, not a search source |
 
 ### Optional Premium Source (apikey-gated, direct connection)
 
@@ -95,7 +107,7 @@ Different sources have very different query tolerances. `search_papers` automati
 | **Literal keyword** | zhihuiya, doaj, iacr | A **cleaned core-keyword** variant — quotes, bare `OR/AND/NOT`, and filler words stripped (e.g. `"what are the latest advances in X"` → `X`), because these return **zero** on verbose queries |
 | **Direct (bypasses backend)** | hal, zhihuiya, patsnap | hal queried directly (backend date bug bypassed); uses core variant |
 
-> `bioRxiv` / `medRxiv` are **not keyword search** — they return the latest ~30 days of papers in a subject category. Pass `biorxiv_category` / `medrxiv_category` (e.g. `biochemistry`, `cardiovascular_medicine`) to focus them.
+> `bioRxiv` / `medRxiv` are **not keyword search** — they return the latest ~30 days of papers in a subject category, so they're **excluded from `default_sources`** (a keyword query would inject irrelevant results). To browse a subject's new papers, call explicitly: `sources="biorxiv"` + `biorxiv_category="biochemistry"` (or `medrxiv_category="cardiovascular_medicine"`).
 
 ---
 

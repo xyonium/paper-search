@@ -684,3 +684,13 @@ async def test_direct_only_sources_skip_backend():
     t._hal_search = fake_hal
     await t.search_papers("glucose biosensor", sources="hal", __user__=_user())
     assert calls == []  # 只请直连源 → 不调后端
+
+
+def test_default_sources_exclude_biorxiv_medrxiv():
+    """biorxiv/medrxiv 已移出默认源（学科近30天浏览，非关键词检索，避免误导）。"""
+    ds = Tools.UserValves().default_sources
+    tokens = {s.strip() for s in ds.split(",")}
+    assert "biorxiv" not in tokens and "medrxiv" not in tokens
+    # 主力检索源仍在
+    for keep in ("arxiv", "pubmed", "semantic", "openalex", "hal"):
+        assert keep in tokens

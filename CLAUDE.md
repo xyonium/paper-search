@@ -94,9 +94,9 @@ Maps server name `"papers"` to `http://mcp:8000/papers`:
 
 ## Data Sources Matrix
 
-### Verified Active Sources (16 Selected)
+### Verified Active Sources
 Default selection in UserValves:
-`default_sources = "arxiv,pubmed,biorxiv,medrxiv,google_scholar,iacr,semantic,crossref,openalex,pmc,core,europepmc,dblp,openaire,doaj,hal"`
+`default_sources = "arxiv,pubmed,iacr,semantic,crossref,openalex,pmc,core,europepmc,dblp,openaire,doaj,hal"`
 
 ### Query Adaptation（查询特性，v2.5.0+）
 
@@ -133,13 +133,18 @@ Default selection in UserValves:
 | **zhihuiya (智慧芽)** | ✅ `search_literature` | ⚠️ `literature_bibliography` (abstract+著录) | ❌ | 科学文献 MCP，tool.py 经 `streamablehttp_client` 直连。需 `Valves/UserValves.zhihuiya_apikey` 非空且 `zhihuiya_enabled` 才启用；search=search_literature+批量 literature_bibliography(补 abstract)；全文靠 doi 走 OA fallback 链 |
 | **patsnap (智慧芽专利)** | ✅ `patsnap_search` | ✅ `patsnap_fetch` (全文 Markdown) | ❌ | 专利 MCP（同公司同 key）。独立工具 `search_patents`/`read_patent`（不并入 search_papers）。`read_patent` 返回**权利要求+说明书+法律状态**（默认 `module=['basic','legal']`），截断到 max_chars |
 
-### Excluded / Disabled Sources
-- **CiteSeerX**: API Endpoint permanently dead (redirects to archive.org 404).
-- **SSRN**: Cloudflare 403 anti-bot challenge active.
-- **BASE**: OAI-PMH endpoint times out / SSL EOF errors.
-- **Zenodo**: Bug in `zenodo.py` (`'str' object has no attribute 'isoformat'`).
-- **IEEE Xplore / ACM**: Connectors are un-implemented skeletons (`search is not yet implemented`).
-- **Unpaywall**: DOI lookup only (keywords search unsupported).
+### 非默认源（按"是否支持关键词搜索"区分）
+
+| 源 | 关键词搜索 | 状态 | 说明 |
+|---|---|---|---|
+| **bioRxiv / medRxiv** | ❌（学科分类过滤） | 移出默认 | **学科近30天新论文浏览**，非关键词检索；显式 `sources="biorxiv"` + `biorxiv_category` 使用。默认启用会返回无关结果误导 |
+| **Google Scholar** | ✅ | 反爬 | 支持搜索，但无 proxy 易 403 |
+| **SSRN** | ✅ | 反爬 | 支持搜索，Cloudflare 403 |
+| **BASE** | ✅ | 端点不稳 | 支持搜索，OAI-PMH 超时/SSL EOF |
+| **CiteSeerX** | ✅（代码有） | 端点已死 | 支持搜索，但 API 重定向 archive.org 404 |
+| **Zenodo** | ✅（Elasticsearch） | 有 bug | 支持搜索，但 `zenodo.py` isoformat bug |
+| **IEEE / ACM** | ⚠️ 骨架 | 未实现 | `search is not yet implemented`，配 key 也报错 |
+| **Unpaywall** | ❌ | 仅 DOI 查询 | **不支持关键词搜索**；用于 download fallback 链按 DOI 查 OA PDF |
 
 ---
 

@@ -6,11 +6,14 @@ description: |
   内置 OA fallback 下载链（源站 → OpenAIRE/CORE/EuropePMC/PMC → Unpaywall → 可选 Sci-Hub）。
 
   【搜索源清单】（search_papers 的 sources 参数可用值，'all' 为全部）：
-  · 预印本/开放获取（可搜可读全文）: arxiv, biorxiv, medrxiv, iacr, pmc, europepmc
+  · 预印本/开放获取（可搜可读全文）: arxiv, iacr, pmc, europepmc
   · 综合索引: semantic (Semantic Scholar), openalex, crossref, pubmed, core,
-    openaire, doaj, base, zenodo, hal, citeseerx, dblp (CS书目), unpaywall (仅DOI查询)
-  · 不稳定源（反爬/间歇故障，失败自动降级不影响整体）: google_scholar, ssrn
-  · 可选付费源（需在 mcpo env 配 key 才注册）: ieee, acm
+    openaire, doaj, hal, dblp (CS书目)
+  · 学科新论文浏览（非关键词检索，默认不启用，sources+biorxiv_category 显式用）: biorxiv, medrxiv
+  · 支持搜索但端点死/反爬/不稳（默认不启用，失败自动降级）: google_scholar, ssrn, base, citeseerx
+  · 支持搜索但有 bug（默认不启用）: zenodo
+  · 支持搜索但未实现（配 key 也报错，不可用）: ieee, acm
+  · 仅 DOI 查询（不支持关键词搜索，用于 download fallback 链查 OA PDF）: unpaywall
   · 智慧芽（需配 apikey 才启用，tool.py 直连不经 mcpo）: zhihuiya
   · 智慧芽专利（独立工具 search_patents/read_patent，同 key 启用）: patsnap
 
@@ -31,7 +34,7 @@ description: |
   5. read_patent(patent_number) → 读专利全文 markdown（权利要求+说明书+法律状态）
 author: openags-bridge
 requirements: requests, pymupdf, anyio
-version: 2.5.0
+version: 2.5.1
 license: MIT
 """
 
@@ -129,8 +132,8 @@ class Tools:
 
     class UserValves(BaseModel):
         default_sources: str = Field(
-            default="arxiv,pubmed,biorxiv,medrxiv,iacr,semantic,crossref,openalex,pmc,core,europepmc,dblp,openaire,doaj,hal",
-            description="默认搜索源：'all'=全部21源（慢，30s+）；或逗号分隔子集如 google_scholar,citeseerx,ssrn,base,ieee,zenodo,unpaywall；zhihuiya 需配 apikey 后才会被纳入（可在此加入）",
+            default="arxiv,pubmed,iacr,semantic,crossref,openalex,pmc,core,europepmc,dblp,openaire,doaj,hal",
+            description="默认搜索源：'all'=全部21源（慢，30s+）；或逗号分隔子集。默认未包含的源：google_scholar,citeseerx,ssrn,base,ieee,zenodo,unpaywall；zhihuiya 需管理员或用户配 apikey；biorxiv/medrxiv 为学科近30天浏览（非关键词检索），需 sources+biorxiv_category 显式调用",
         )
         knowledge_id: str = Field(
             default="", description="下载 PDF 自动加入的 Knowledge 集合 ID"
@@ -578,10 +581,10 @@ class Tools:
         :param query: 学术检索词，越具体越好（如 'CRISPR base editing off-target'）
         :param max_results_per_source: 每源条数（默认5，勿调大）
         :param sources: 留空用默认（'all'）；或逗号分隔子集，可选值:
-            arxiv, biorxiv, medrxiv, iacr, pmc, europepmc, semantic, openalex,
-            crossref, pubmed, core, openaire, doaj, base, zenodo, hal, citeseerx,
-            dblp, unpaywall, google_scholar, ssrn (+ieee, acm 若已配 key)
-            zhihuiya（智慧芽，需在 Valves 配 apikey 才启用，直连不经 mcpo）
+            arxiv, iacr, pmc, europepmc, semantic, openalex, crossref, pubmed,
+            core, openaire, doaj, hal, dblp, zenodo, google_scholar, ssrn, base,
+            citeseerx, unpaywall（仅DOI查询）, zhihuiya（需配 key）, ieee/acm（骨架未实现）
+            biorxiv/medrxiv（学科近30天浏览，非关键词检索，需配 biorxiv_category）
         :param biorxiv_category: 可选 bioRxiv 学科分类（如 biochemistry, cell_biology,
             bioinformatics, neuroscience 等，空格转下划线）。biorxiv/medrxiv 非关键词检索，
             返回该学科近30天新论文；传学科可提高相关性。
