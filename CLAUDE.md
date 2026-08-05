@@ -106,7 +106,7 @@ Default selection in UserValves:
 |---|---|---|
 | **语义/分词** | openalex, semantic, crossref, pmc, europepmc, pubmed, arxiv, openaire, core, patsnap | `original`（原始完整查询，保语义） |
 | **字面关键词** | zhihuiya, doaj, iacr | `core`（去引号/裸露 OR/AND/NOT/中英噪声词）再 `_distill_core_terms` 截断到 ≤5 个高区分度术语 |
-| **直连**（绕后端） | hal, zhihuiya, patsnap, dblp | hal 走 `_hal_search`（绕后端 hal.py 的 isoformat bug）；hal 用 core，zhihuiya 用 distilled；dblp 走 `_dblp_search`（v2.5.3+，绕后端 dblp.py 的并发 ConnectionError + 无退避重试 bug）用 original（CS 书目，非 CS 查询 0 结果属正常） |
+| **直连**（绕后端） | hal, zhihuiya, patsnap, dblp, zenodo | hal 走 `_hal_search`（绕后端 hal.py 的 isoformat bug）；hal 用 core，zhihuiya 用 distilled；dblp 走 `_dblp_search`（v2.5.3+，绕后端 dblp.py 的并发 ConnectionError + 无退避重试 bug）用 original（CS 书目，非 CS 查询 0 结果属正常）；zenodo 走 `_zenodo_search`（v2.5.3+，绕后端 zenodo.py 的 published_date str→isoformat crash bug）用 original |
 
 **字面源截断临界点实测**（真实环境，决定 max_terms=5 的依据）：
 
@@ -121,7 +121,8 @@ Default selection in UserValves:
 
 - `biorxiv/medrxiv` 非关键词检索，返回"该学科近30天新论文"；可用 `biorxiv_category`/`medrxiv_category` 传学科。
 - `dblp` 后端 dblp.py 有 bug（v2.5.3 起改直连 `_dblp_search` 绕过）：并发/快速请求时 dblp 服务器直接断开连接（ConnectionError），后端无重试退避；且后端 dblp.py 无 rate-limit 感知，生产环境 500/ConnectionError 频繁。直连版加 3 次指数退避重试。注意 dblp 是 CS 书目库，仅收录计算机科学文献，非 CS 查询（如生物医学、材料科学）返回 0 属正常，非 bug。
-- `all` 模式下后端源用 `_BACKEND_ALL_SOURCES`（排除直连源 hal/zhihuiya/patsnap/dblp）；拆分时语义组用 `_SEMANTIC_ALL_SOURCES`（再排除字面组 doaj/iacr）。
+- `zenodo` 后端 zenodo.py 有 bug（v2.5.3 起改直连 `_zenodo_search` 绕过）：published_date 传 str 给 Paper 对象，Paper.to_dict() 调 `.isoformat()` 崩溃。直连版正确解析日期字符串。Zenodo 是 OA 仓储，多数记录有 PDF。
+- `all` 模式下后端源用 `_BACKEND_ALL_SOURCES`（排除直连源 hal/zhihuiya/patsnap/dblp/zenodo）；拆分时语义组用 `_SEMANTIC_ALL_SOURCES`（再排除字面组 doaj/iacr）。
 - 截断发生时返回 `query_adapted` 字段，列出各字面源实际用的精简查询。
 
 | Platform | Search | Read Tool | Native Download | Notes |
@@ -138,6 +139,7 @@ Default selection in UserValves:
 | **IACR** | ✅ | `read_iacr_paper` | ✅ | Cryptography ePrints |
 | **OpenAIRE / DOAJ / HAL** | ✅ | Varies / Fallback | Record-dependent | Domain repositories |
 | **dblp** | ✅ (v2.5.3+ 直连) | ⚠️ ee/DOI → OA fallback | Record-dependent | CS 书目库，无全文；read_paper 自动查 ee 链接 → arXiv PDF / Unpaywall OA；付费墙返回错误提示走 download |
+| **Zenodo** | ✅ (v2.5.3+ 直连) | ⚠️ pdf_url fallback | ✅ (多数 OA) | OA 仓储，多数记录有 PDF；read 走 pdf_url 直接提取 |
 
 ### Optional Premium Source (apikey-gated, **direct** — not via mcpo)
 
@@ -153,10 +155,10 @@ Default selection in UserValves:
 | **bioRxiv / medRxiv** | ❌（学科分类过滤） | 移出默认 | **学科近30天新论文浏览**，非关键词检索；显式 `sources="biorxiv"` + `biorxiv_category` 使用。默认启用会返回无关结果误导 |
 | **Google Scholar** | ✅ | 反爬 | 支持搜索，但无 proxy 易 403 |
 | **SSRN** | ✅ | 反爬 | 支持搜索，Cloudflare 403 |
-| **BASE** | ✅ | 端点不稳 | 支持搜索，OAI-PMH 超时/SSL EOF |
-| **CiteSeerX** | ✅（代码有） | 端点已死 | 支持搜索，但 API 重定向 archive.org 404 |
-| **Zenodo** | ✅（Elasticsearch） | 有 bug | 支持搜索，但 `zenodo.py` isoformat bug |
-| **IEEE / ACM** | ⚠️ 骨架 | 未实现 | `search is not yet implemented`，配 key 也报错 |
+| **BASE** | ✅ | 反爬 | 支持搜索，但 IP 被封（403 Access denied）；OAI-PMH 端点不稳 |
+| **CiteSeerX** | ✅（代码有） | 端点已死 | 支持搜索，但 API 重定向 archive.org 404，无法修复 |
+| **Zenodo** | ✅（Elasticsearch） | ✅ 已直连修复 | 后端 `zenodo.py` isoformat bug（published_date str 传给 Paper）→ v2.5.3 起改直连 `_zenodo_search`，多数记录有 OA PDF |
+| **IEEE / ACM** | ⚠️ 骨架 | 未实现 | `search is not yet implemented`（有 key 也报错），tool.py 层无法绕过（无公开 API） |
 | **Unpaywall** | ❌ | 仅 DOI 查询 | **不支持关键词搜索**；用于 download fallback 链按 DOI 查 OA PDF |
 
 ---

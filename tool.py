@@ -11,7 +11,7 @@ description: |
     openaire, doaj, hal, dblp (CS书目)
   · 学科新论文浏览（非关键词检索，默认不启用，sources+biorxiv_category 显式用）: biorxiv, medrxiv
   · 支持搜索但端点死/反爬/不稳（默认不启用，失败自动降级）: google_scholar, ssrn, base, citeseerx
-  · 支持搜索但有 bug（默认不启用）: zenodo
+  · 支持搜索，已改直连（绕后端 bug）: zenodo
   · 支持搜索但未实现（配 key 也报错，不可用）: ieee, acm
   · 仅 DOI 查询（不支持关键词搜索，用于 download fallback 链查 OA PDF）: unpaywall
   · 智慧芽（需配 apikey 才启用，tool.py 直连不经 mcpo）: zhihuiya
@@ -73,11 +73,11 @@ _QUERY_PREFIXES = (
 )
 
 LITERAL_SOURCES = frozenset({"zhihuiya", "doaj", "iacr"})
-DIRECT_SOURCES = frozenset({"zhihuiya", "hal", "patsnap", "dblp"})
+DIRECT_SOURCES = frozenset({"zhihuiya", "hal", "patsnap", "dblp", "zenodo"})
 # 后端可提供服务的全部源（排除直连源 hal/zhihuiya/patsnap；citeseerx/base/zenodo 等虽在后端但默认不启用）
 _BACKEND_ALL_SOURCES = (
     "arxiv,biorxiv,medrxiv,iacr,semantic,crossref,openalex,pubmed,pmc,core,"
-    "europepmc,openaire,doaj,google_scholar,ssrn,unpaywall,citeseerx,base,zenodo,ieee,acm"
+    "europepmc,openaire,doaj,google_scholar,ssrn,unpaywall,citeseerx,base,ieee,acm"
 )
 # all_mode 拆分时语义组使用的后端源（去掉字面源 doaj/iacr，留给 core 变体）
 _SEMANTIC_ALL_SOURCES = ",".join(
@@ -206,8 +206,6 @@ class Tools:
         "iacr": "read_iacr_paper",
         "semantic": "read_semantic_paper",
         "doaj": "read_doaj_paper",
-        "base": "read_base_paper",
-        "zenodo": "read_zenodo_paper",
         "hal": "read_hal_paper",
         "openaire": "read_openaire_paper",
         # ↓ 工具存在但设计上只返回"不支持"提示——尝试后检测降级
@@ -221,7 +219,10 @@ class Tools:
         "google_scholar": None,
         "ssrn": None,
         "unpaywall": None,
-        "dblp": None,  # 元数据库，无全文；走 DOI → OA fallback
+        "dblp": None,    # 元数据库，无全文；走 DOI → OA fallback
+        "zenodo": None,  # 直连搜索；read 走 pdf_url fallback（多数记录有 OA PDF）
+        "base": None,    # 反爬（IP blocked），走 pdf_url fallback
+        "citeseerx": None,  # 端点已死（archive.org redirect），走 pdf_url fallback
         # ↓ 可选付费源（配 key 后工具存在，未配时调用会 404，被异常处理兜住）
         "ieee": "read_ieee_paper",
         "acm": "read_acm_paper",
@@ -560,6 +561,80 @@ class Tools:
             })
         return papers
 
+    _ZENODO_SEARCH_URL = "https://zenodo.org/api/records"
+
+    async def _zenodo_search(self, query: str, limit: int) -> list:
+        """直连 Zenodo REST API，绕后端 zenodo.py 的 isoformat bug
+        （published_date 传 str 给 Paper，Paper.to_dict() 调 .isoformat() 崩溃）。
+        Zenodo 是开放获取仓储，多数记录有 PDF，无需 key。"""
+        def _fetch():
+            r = requests.get(
+                self._ZENODO_SEARCH_URL,
+                params={
+                    "q": query,
+                    "size": max(1, min(int(limit), 200)),
+                    "type": "publication",
+                    "sort": "bestmatch",
+                },
+                headers={
+                    "User-Agent": "paper-search-tool/2.5 (OpenWebUI academic search)",
+                    "Accept": "application/json",
+                },
+                timeout=20,
+            )
+            r.raise_for_status()
+            return r.json()
+
+        try:
+            data = await anyio.to_thread.run_sync(_fetch)
+        except Exception as e:
+            raise RuntimeError(f"Zenodo 检索失败: {e}")
+
+        hits = ((data or {}).get("hits") or {}).get("hits") or []
+        papers = []
+        for h in hits[:limit]:
+            if not isinstance(h, dict):
+                continue
+            meta = h.get("metadata") or {}
+            title = str(meta.get("title") or "").strip()
+            if not title:
+                continue
+            creators = meta.get("creators") or []
+            authors = []
+            for c in creators:
+                if isinstance(c, dict):
+                    name = c.get("name") or f"{c.get('given_name','')} {c.get('family_name','')}".strip()
+                    if name:
+                        authors.append(name)
+            abstract = str(meta.get("description") or "")
+            # 去 HTML 标签（Zenodo description 常含 HTML）
+            abstract = re.sub(r"<[^>]+>", " ", abstract).strip()
+            abstract = re.sub(r"\s+", " ", abstract)
+            pub_date = str(meta.get("publication_date") or "")[:10]
+            record_id = str(h.get("id") or "")
+            doi = str(h.get("doi") or meta.get("doi") or "")
+            # 从 files 找 PDF
+            pdf_url = ""
+            for f in (h.get("files") or []):
+                if isinstance(f, dict) and str(f.get("key", "")).lower().endswith(".pdf"):
+                    links = f.get("links") or {}
+                    pdf_url = str(links.get("self") or links.get("download") or "")
+                    break
+            record_url = str((h.get("links") or {}).get("html") or f"https://zenodo.org/record/{record_id}")
+            papers.append({
+                "title": title,
+                "authors": "; ".join(authors),
+                "published_date": pub_date,
+                "abstract": abstract,
+                "paper_id": f"zenodo:{record_id}",
+                "doi": doi,
+                "source": "zenodo",
+                "pdf_url": pdf_url,
+                "citations": 0,
+                "url": record_url,
+            })
+        return papers
+
     def _mcp_call(self, tool: str, args: dict, timeout: int = 180):
         headers = {}
         if self.valves.mcpo_api_key:
@@ -714,10 +789,11 @@ class Tools:
         :param max_results_per_source: 每源条数（默认5，勿调大）
         :param sources: 留空用默认（'all'）；或逗号分隔子集，可选值:
             arxiv, iacr, pmc, europepmc, semantic, openalex, crossref, pubmed,
-            core, openaire, doaj, hal, zenodo, google_scholar, ssrn, base,
+            core, openaire, doaj, hal, google_scholar, ssrn,
             citeseerx, unpaywall（仅DOI查询）, zhihuiya（需配 key）, ieee/acm（骨架未实现）
             dblp（CS 书目，仅计算机科学文献；非 CS 查询可能 0 结果）
-            biorxiv/medrxiv（学科近30天浏览，非关键词检索，需配 biorxiv_category）
+            zenodo（OA 仓储，已改直连；多数记录有 PDF）
+            base（反爬，可能失败）, biorxiv/medrxiv（学科近30天浏览，非关键词检索，需配 biorxiv_category）
         :param biorxiv_category: 可选 bioRxiv 学科分类（如 biochemistry, cell_biology,
             bioinformatics, neuroscience 等，空格转下划线）。biorxiv/medrxiv 非关键词检索，
             返回该学科近30天新论文；传学科可提高相关性。
@@ -740,6 +816,7 @@ class Tools:
         want_zh = zh_enabled and ("zhihuiya" in src_set or all_mode)
         want_hal = "hal" in src_set or all_mode
         want_dblp = "dblp" in src_set or all_mode
+        want_zenodo = "zenodo" in src_set or all_mode
 
         # 直连源不进后端 sources
         backend_set = src_set - DIRECT_SOURCES
@@ -815,6 +892,9 @@ class Tools:
         async def _dblp():
             return await self._dblp_search(original, max_results_per_source)
 
+        async def _zenodo():
+            return await self._zenodo_search(original, max_results_per_source)
+
         # 组装并发分支
         branches = {}
         branches["backend"] = _backend_split() if core != original else _backend_all()
@@ -824,6 +904,8 @@ class Tools:
             branches["hal"] = _hal()
         if want_dblp:
             branches["dblp"] = _dblp()
+        if want_zenodo:
+            branches["zenodo"] = _zenodo()
 
         keys = list(branches)
         results = await asyncio.gather(*branches.values(), return_exceptions=True)
@@ -833,9 +915,10 @@ class Tools:
         zh_result = outcome.get("zhihuiya")
         hal_result = outcome.get("hal")
         dblp_result = outcome.get("dblp")
+        zenodo_result = outcome.get("zenodo")
 
         # 后端失败处理：若任一直连源有结果则保留，否则报错
-        direct_ok = [r for r in (zh_result, hal_result, dblp_result) if isinstance(r, list) and r]
+        direct_ok = [r for r in (zh_result, hal_result, dblp_result, zenodo_result) if isinstance(r, list) and r]
         if isinstance(backend_result, Exception):
             if direct_ok:
                 result = {"papers": [], "source_results": {},
@@ -878,14 +961,22 @@ class Tools:
                 dp = [self._trim_paper(p) for p in dblp_result]
                 papers.extend(dp)
                 source_results["dblp"] = len(dp)
+        if want_zenodo:
+            if isinstance(zenodo_result, Exception):
+                source_results["zenodo"] = 0
+                errors["zenodo"] = str(zenodo_result)
+            elif zenodo_result is not None:
+                zp2 = [self._trim_paper(p) for p in zenodo_result]
+                papers.extend(zp2)
+                source_results["zenodo"] = len(zp2)
 
         out = {"query": query, "total": len(papers),
                "source_results": source_results, "errors": errors, "papers": papers}
         # 字面源发生截断时给出提示（LLM/用户可见），避免误以为用了完整查询
         if literal_query != original:
             adapted = {}
-            for s in (LITERAL_SOURCES - DIRECT_SOURCES) | {"zhihuiya", "hal", "dblp"}:
-                if s in source_results or (s == "zhihuiya" and want_zh) or (s == "hal" and want_hal) or (s == "dblp" and want_dblp):
+            for s in (LITERAL_SOURCES - DIRECT_SOURCES) | {"zhihuiya", "hal", "dblp", "zenodo"}:
+                if s in source_results or (s == "zhihuiya" and want_zh) or (s == "hal" and want_hal) or (s == "dblp" and want_dblp) or (s == "zenodo" and want_zenodo):
                     adapted[s] = literal_query
             if adapted:
                 out["query_adapted"] = adapted
@@ -1013,10 +1104,13 @@ class Tools:
     ) -> str:
         """
         阅读论文全文（截断到 max_chars）。支持全部 21 个搜索源 + IEEE/ACM + 智慧芽。
-        - 后端直接可读: arxiv, biorxiv, medrxiv, iacr, semantic, doaj, base,
-          zenodo, hal, openaire, citeseerx（ieee/acm 需配 key）
+        - 后端直接可读: arxiv, biorxiv, medrxiv, iacr, semantic, doaj,
+          hal, openaire（ieee/acm 需配 key）
         - pubmed/crossref 后端仅返回元数据提示，会自动降级用 pdf_url 提取
         - dblp: 元数据库（无全文），自动用 DOI 查 ee 链接走 PDF fallback
+        - zenodo: 有后端 bug（published_date str → isoformat crash），走 pdf_url fallback
+        - base: 反爬（IP blocked），走 pdf_url fallback
+        - citeseerx: 端点已死（archive.org redirect），走 pdf_url fallback
         - pmc, core, europepmc, openalex, google_scholar, ssrn, unpaywall:
           请同时传 pdf_url，将自动下载提取全文
         - zhihuiya（智慧芽）: 元数据级 read（literature_bibliography 取 abstract+著录），
