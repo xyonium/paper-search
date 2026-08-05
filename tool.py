@@ -62,6 +62,11 @@ _QUERY_PREFIXES = (
 
 LITERAL_SOURCES = frozenset({"zhihuiya", "doaj", "iacr"})
 DIRECT_SOURCES = frozenset({"zhihuiya", "hal", "patsnap"})
+# 后端可提供服务的全部源（排除直连源 hal/zhihuiya/patsnap；citeseerx/base/zenodo 等虽在后端但默认不启用）
+_BACKEND_ALL_SOURCES = (
+    "arxiv,biorxiv,medrxiv,iacr,semantic,crossref,openalex,pubmed,pmc,core,"
+    "europepmc,dblp,openaire,doaj,google_scholar,ssrn,unpaywall,citeseerx,base,zenodo,ieee,acm"
+)
 
 
 def _make_query_variants(query: str) -> dict:
@@ -584,7 +589,7 @@ class Tools:
         # 直连源不进后端 sources
         backend_set = src_set - DIRECT_SOURCES
         if all_mode:
-            backend_set = None  # None 表示传 "all" 给后端
+            backend_set = None  # None 表示后端用 _BACKEND_ALL_SOURCES（不含直连源）
 
         # 后端按变体分组：字面组用 core，语义组用 original
         backend_literal = (src_set & LITERAL_SOURCES) - DIRECT_SOURCES
@@ -595,7 +600,7 @@ class Tools:
             args = {
                 "query": original,
                 "max_results_per_source": max_results_per_source,
-                "sources": ("all" if all_mode else ",".join(sorted(backend_set))),
+                "sources": (_BACKEND_ALL_SOURCES if all_mode else ",".join(sorted(backend_set))),
             }
             if biorxiv_category:
                 args["biorxiv_category"] = biorxiv_category
@@ -612,7 +617,7 @@ class Tools:
                 async def _sem():
                     args = {"query": original,
                             "max_results_per_source": max_results_per_source,
-                            "sources": ("all" if all_mode else ",".join(sorted(sem_set)))}
+                            "sources": (_BACKEND_ALL_SOURCES if all_mode else ",".join(sorted(sem_set)))}
                     if biorxiv_category: args["biorxiv_category"] = biorxiv_category
                     if medrxiv_category: args["medrxiv_category"] = medrxiv_category
                     return await anyio.to_thread.run_sync(self._mcp_call, "search_papers", args)

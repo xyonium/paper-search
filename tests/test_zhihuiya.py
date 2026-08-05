@@ -632,3 +632,21 @@ async def test_hal_search_skips_empty_title_and_id():
     assert papers[0]["paper_id"] == "hal:hal-3"
     assert papers[0]["abstract"] == "part1 part2"   # 多段拼接
     assert papers[0]["doi"] == "10.1/x"             # list 取首
+
+
+@pytest.mark.asyncio
+async def test_search_papers_all_mode_excludes_direct_sources():
+    t = Tools()
+    t.valves = Tools.Valves()
+    calls = []
+    t._mcp_call = lambda tool, args, timeout=180: (calls.append(dict(args)), {"papers": [], "source_results": {}, "errors": {}})[1]
+    async def fake_hal(q, limit):
+        return []
+    t._hal_search = fake_hal
+    await t.search_papers("glucose biosensor", sources="all", __user__=_user())
+    # 后端 sources 不得是裸 "all"（后端 "all" 隐含 hal 等直连源），也不得含直连源
+    assert calls, "all_mode 应有后端调用"
+    for c in calls:
+        assert c["sources"] != "all", "后端不得收到裸 all"
+        for direct in ("hal", "zhihuiya", "patsnap"):
+            assert direct not in {s.strip() for s in c["sources"].split(",")}
