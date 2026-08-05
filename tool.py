@@ -1,9 +1,7 @@
 """
 title: Academic Paper Search
 description: |
-  学术论文搜索、全文阅读、PDF 下载入 Knowledge（RAG）。
-  后端: mcpo(config 模式, /papers) 桥接 paper-search-mcp，聚合 21+ 学术源，
-  内置 OA fallback 下载链（源站 → OpenAIRE/CORE/EuropePMC/PMC → Unpaywall → 可选 Sci-Hub）。
+  学术论文搜索、全文阅读、PDF 下载入 Knowledge（RAG）。聚合 21+ 学术源（arXiv/PubMed/Semantic Scholar/OpenAlex/CORE/HAL/dblp/Zenodo 等）+ 智慧芽文献/专利 + IEEE Xplore，内置 OA fallback 下载链。
 
   【搜索源清单】（search_papers 的 sources 参数可用值，'all' 为全部）：
   · 预印本/开放获取（可搜可读全文）: arxiv, iacr, pmc, europepmc
@@ -34,7 +32,7 @@ description: |
   5. read_patent(patent_number) → 读专利全文 markdown（权利要求+说明书+法律状态）
 author: openags-bridge
 requirements: requests, pymupdf, anyio
-version: 2.5.3
+version: 2.5.4
 license: MIT
 """
 
