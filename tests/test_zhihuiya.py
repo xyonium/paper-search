@@ -479,3 +479,208 @@ async def test_read_patent_disabled_no_key():
     t.valves = Tools.Valves()  # 无 key
     out = json.loads(await t.read_patent("US1", __user__=_user()))
     assert "error" in out
+
+
+def test_variants_strip_quotes_and_boolean():
+    v = tool_mod._make_query_variants('"early signal drop" glucose sensor OR biosensor')
+    assert v["original"] == '"early signal drop" glucose sensor OR biosensor'
+    assert '"' not in v["core"]
+    # 布尔运算符（任意大小写）都被剥离，且不误伤其它词
+    tokens = v["core"].split()
+    assert "or" not in tokens and "and" not in tokens and "not" not in tokens
+    assert "early signal drop" in v["core"] and "glucose" in v["core"] and "biosensor" in v["core"]
+    # 不误伤含 or/and 子串的词
+    v2 = tool_mod._make_query_variants("sensor and standard")
+    assert "sensor" in v2["core"].split() and "standard" in v2["core"].split()
+    assert "and" not in v2["core"].split()
+
+
+def test_variants_strip_en_noise_words():
+    v = tool_mod._make_query_variants("what are the latest advances in glucose biosensor")
+    core = v["core"].lower()
+    for noise in ("what", "are", "the", "latest", "advances", "in"):
+        assert f" {noise} " not in f" {core} "
+    assert "glucose" in core and "biosensor" in core
+
+
+def test_variants_chinese_noise_and_cjk():
+    v = tool_mod._make_query_variants("最新的葡萄糖传感器怎么样")
+    assert "最新" not in v["core"] and "怎么样" not in v["core"]
+    assert "葡萄糖" in v["core"] and "传感器" in v["core"]
+
+
+def test_variants_no_change_when_clean():
+    v = tool_mod._make_query_variants("electropolymerization glucose sensor")
+    assert v["core"] == "electropolymerization glucose sensor"
+    assert v["original"] == v["core"]
+
+
+def test_variants_all_noise_falls_back_to_original():
+    v = tool_mod._make_query_variants("what are the")
+    assert v["core"]  # 非空
+    assert isinstance(v["core"], str)
+
+
+def test_source_groups():
+    assert tool_mod.LITERAL_SOURCES == frozenset({"zhihuiya", "doaj", "iacr"})
+    assert "hal" in tool_mod.DIRECT_SOURCES and "zhihuiya" in tool_mod.DIRECT_SOURCES
+
+
+@pytest.mark.asyncio
+async def test_hal_search_maps_fields():
+    t = Tools()
+    hal_resp = {"response": {"docs": [{
+        "halId_s": "hal-001", "title_s": ["Glucose Biosensor"],
+        "authFullName_s": ["Doe J.", "Roe K."], "abstract_s": ["An abstract."],
+        "doiId_s": "10.1/hal", "publicationDateY_i": 2021,
+        "fileMain_s": "https://hal/x.pdf", "uri_s": "https://hal/record",
+    }]}}
+    fake = MagicMock()
+    fake.json.return_value = hal_resp
+    fake.raise_for_status = MagicMock()
+
+    with patch.object(tool_mod.requests, "get", return_value=fake) as mget:
+        papers = await t._hal_search("glucose biosensor", 3)
+    assert mget.called
+    p = papers[0]
+    assert p["paper_id"] == "hal:hal-001"
+    assert p["title"] == "Glucose Biosensor"
+    assert p["authors"] == "Doe J.; Roe K."
+    assert p["published_date"] == "2021"
+    assert p["doi"] == "10.1/hal"
+    assert p["pdf_url"] == "https://hal/x.pdf"
+    assert p["source"] == "hal"
+
+
+@pytest.mark.asyncio
+async def test_hal_search_error_raises():
+    t = Tools()
+    with patch.object(tool_mod.requests, "get", side_effect=Exception("conn fail")):
+        with pytest.raises(RuntimeError):
+            await t._hal_search("x", 3)
+
+
+@pytest.mark.asyncio
+async def test_search_papers_splits_literal_vs_semantic():
+    t = Tools()
+    t.valves = Tools.Valves()
+    backend_calls = []
+
+    def fake_mcp(tool, args, timeout=180):
+        backend_calls.append(dict(args))
+        return {"papers": [], "source_results": {}, "errors": {}}
+
+    async def fake_hal(q, limit):
+        return [{"title": "H", "authors": "", "published_date": "2020",
+                 "abstract": "", "paper_id": "hal:1", "doi": "",
+                 "source": "hal", "pdf_url": "", "citations": 0, "url": ""}]
+
+    t._mcp_call = fake_mcp
+    t._hal_search = fake_hal
+    # doaj(字面) + openalex(语义) + hal(直连) + zhihuiya 未启用
+    out = json.loads(await t.search_papers(
+        '"early signal drop" glucose sensor OR biosensor',
+        sources="doaj,openalex,hal", __user__=_user()))
+    # core!=original → 后端应被调两次：一次 original(语义 openalex)，一次 core(字面 doaj)
+    queries = sorted(c["query"] for c in backend_calls)
+    srcs = sorted(c["sources"] for c in backend_calls)
+    assert len(backend_calls) == 2
+    assert any('"early signal drop"' in c["query"] for c in backend_calls)  # original
+    assert any('OR' not in c["query"] and '"' not in c["query"] for c in backend_calls)  # core
+    # hal 走直连，不进后端 sources
+    assert all("hal" not in c["sources"] for c in backend_calls)
+    assert out["source_results"]["hal"] == 1
+
+
+@pytest.mark.asyncio
+async def test_search_papers_single_call_when_core_equals_original():
+    t = Tools()
+    t.valves = Tools.Valves()
+    calls = []
+    t._mcp_call = lambda tool, args, timeout=180: (calls.append(dict(args)), {"papers": [], "source_results": {}, "errors": {}})[1]
+    await t.search_papers("glucose biosensor", sources="openalex,doaj", __user__=_user())
+    # 无引号/布尔/噪声 → core==original → 只调一次后端
+    assert len(calls) == 1
+    assert calls[0]["query"] == "glucose biosensor"
+
+
+@pytest.mark.asyncio
+async def test_search_papers_passes_biorxiv_category():
+    t = Tools()
+    t.valves = Tools.Valves()
+    calls = []
+    t._mcp_call = lambda tool, args, timeout=180: (calls.append(dict(args)), {"papers": [], "source_results": {}, "errors": {}})[1]
+    await t.search_papers("glucose", sources="biorxiv",
+                          biorxiv_category="biochemistry", __user__=_user())
+    assert calls[0].get("biorxiv_category") == "biochemistry"
+
+
+@pytest.mark.asyncio
+async def test_hal_search_skips_empty_title_and_id():
+    t = Tools()
+    hal_resp = {"response": {"docs": [
+        {"halId_s": "", "title_s": ["No Id"]},                       # 空 id → 跳过
+        {"halId_s": "hal-2", "title_s": []},                          # 空 title → 跳过
+        {"halId_s": "hal-3", "title_s": ["Good"], "authFullName_s": ["A"],
+         "abstract_s": ["part1", "part2"], "doiId_s": ["10.1/x", "10.1/y"],
+         "publicationDateY_i": 2022, "fileMain_s": "", "uri_s": ""},
+    ]}}
+    fake = MagicMock(); fake.json.return_value = hal_resp; fake.raise_for_status = MagicMock()
+    with patch.object(tool_mod.requests, "get", return_value=fake):
+        papers = await t._hal_search("q", 5)
+    assert len(papers) == 1
+    assert papers[0]["paper_id"] == "hal:hal-3"
+    assert papers[0]["abstract"] == "part1 part2"   # 多段拼接
+    assert papers[0]["doi"] == "10.1/x"             # list 取首
+
+
+@pytest.mark.asyncio
+async def test_search_papers_all_mode_excludes_direct_sources():
+    t = Tools()
+    t.valves = Tools.Valves()
+    calls = []
+    t._mcp_call = lambda tool, args, timeout=180: (calls.append(dict(args)), {"papers": [], "source_results": {}, "errors": {}})[1]
+    async def fake_hal(q, limit):
+        return []
+    t._hal_search = fake_hal
+    await t.search_papers("glucose biosensor", sources="all", __user__=_user())
+    # 后端 sources 不得是裸 "all"（后端 "all" 隐含 hal 等直连源），也不得含直连源
+    assert calls, "all_mode 应有后端调用"
+    for c in calls:
+        assert c["sources"] != "all", "后端不得收到裸 all"
+        for direct in ("hal", "zhihuiya", "patsnap"):
+            assert direct not in {s.strip() for s in c["sources"].split(",")}
+
+
+@pytest.mark.asyncio
+async def test_all_mode_split_gives_literal_sources_core():
+    t = Tools(); t.valves = Tools.Valves()
+    calls = []
+    t._mcp_call = lambda tool, args, timeout=180: (calls.append(dict(args)), {"papers": [], "source_results": {}, "errors": {}})[1]
+    async def fake_hal(q, limit): return []
+    t._hal_search = fake_hal
+    # 长自然语言 → core!=original → all_mode 拆分
+    await t.search_papers("what are the latest advances in zero knowledge proof systems",
+                          sources="all", __user__=_user())
+    assert len(calls) == 2
+    by_q = {c["query"]: c["sources"] for c in calls}
+    core_q = [q for q in by_q if "latest" not in q and "what" not in q][0]
+    orig_q = [q for q in by_q if q != core_q][0]
+    # 字面组用 core，且只含 doaj/iacr
+    lit_srcs = set(by_q[core_q].split(","))
+    assert lit_srcs == {"doaj", "iacr"}
+    # 语义组用 original，且不含 doaj/iacr
+    sem_srcs = set(by_q[orig_q].split(","))
+    assert "doaj" not in sem_srcs and "iacr" not in sem_srcs
+    assert "hal" not in sem_srcs  # 直连源不进后端
+
+
+@pytest.mark.asyncio
+async def test_direct_only_sources_skip_backend():
+    t = Tools(); t.valves = Tools.Valves()
+    calls = []
+    t._mcp_call = lambda tool, args, timeout=180: (calls.append(dict(args)), {"papers": [], "source_results": {}, "errors": {}})[1]
+    async def fake_hal(q, limit): return []
+    t._hal_search = fake_hal
+    await t.search_papers("glucose biosensor", sources="hal", __user__=_user())
+    assert calls == []  # 只请直连源 → 不调后端

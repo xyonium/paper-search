@@ -14,6 +14,15 @@ description: |
   · 智慧芽（需配 apikey 才启用，tool.py 直连不经 mcpo）: zhihuiya
   · 智慧芽专利（独立工具 search_patents/read_patent，同 key 启用）: patsnap
 
+  【查询适配】search_papers 自动按源分发查询变体（不损语义）：
+  · 语义源（openalex/semantic/crossref/pmc/europepmc/pubmed/arxiv/openaire/core/dblp/patsnap）
+    → 用原始完整查询
+  · 字面源（zhihuiya/doaj/iacr）→ 自动去引号/裸露布尔/噪声词，精简为核心术语
+    （长自然语言查询在这些源会 0 命中，精简后恢复）
+  · hal 已改直连（绕后端 bug），自动用 core 变体
+  · biorxiv/medrxiv 非关键词检索，返回"该学科近30天新论文"；
+    可用 biorxiv_category/medrxiv_category 传学科（如 biochemistry）提高相关性
+
   【工具用法】
   1. search_papers(query)      → 多源并发搜索+去重，返回标题/作者/摘要/引用数/pdf_url
   2. read_paper(source, paper_id, pdf_url) → 读全文（后端工具 + pdf_url 自动 fallback）
@@ -22,18 +31,78 @@ description: |
   5. read_patent(patent_number) → 读专利全文 markdown（权利要求+说明书+法律状态）
 author: openags-bridge
 requirements: requests, pymupdf, anyio
-version: 2.4.0
+version: 2.5.0
 license: MIT
 """
 
 import asyncio
 import json
 import os
+import re
 import anyio
 import requests
 from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
 from pydantic import BaseModel, Field
+
+
+# ---------- 查询词适配（参考 reach-mcp query_core，确定性，不截断词数） ----------
+_QUERY_NOISE_EN = frozenset({
+    "a", "an", "the", "is", "are", "was", "were", "of", "in", "on", "for",
+    "with", "about", "to", "how", "what", "which", "who", "why", "when",
+    "where", "does", "should", "could", "would",
+    "best", "top", "latest", "new", "news", "recent", "advances", "advance",
+    "review", "reviews", "overview", "progress", "developments", "trends",
+    "using", "based", "via", "their", "its", "his", "her", "we", "you",
+    "study", "studies", "research", "analysis", "investigation",
+})
+_QUERY_NOISE_CN = frozenset({
+    "最新", "研究进展", "进展", "综述", "怎么样", "如何", "什么", "哪些",
+    "哪个", "推荐", "对比", "比较", "最近", "近期", "现状", "应用", "方法",
+})
+_QUERY_NOISE_CN_SORTED = sorted(_QUERY_NOISE_CN, key=len, reverse=True)
+_QUERY_BOOL_RE = re.compile(r"\b(?:OR|AND|NOT)\b", re.IGNORECASE)
+_QUERY_CJK_RE = re.compile(r"[一-鿿㐀-䶿]")
+_QUERY_PREFIXES = (
+    "what are the latest", "what are the", "what is the", "what are", "what is",
+    "recent advances in", "latest advances in", "advances in", "progress in",
+    "review of", "research on", "studies on",
+)
+
+LITERAL_SOURCES = frozenset({"zhihuiya", "doaj", "iacr"})
+DIRECT_SOURCES = frozenset({"zhihuiya", "hal", "patsnap"})
+# 后端可提供服务的全部源（排除直连源 hal/zhihuiya/patsnap；citeseerx/base/zenodo 等虽在后端但默认不启用）
+_BACKEND_ALL_SOURCES = (
+    "arxiv,biorxiv,medrxiv,iacr,semantic,crossref,openalex,pubmed,pmc,core,"
+    "europepmc,dblp,openaire,doaj,google_scholar,ssrn,unpaywall,citeseerx,base,zenodo,ieee,acm"
+)
+# all_mode 拆分时语义组使用的后端源（去掉字面源 doaj/iacr，留给 core 变体）
+_SEMANTIC_ALL_SOURCES = ",".join(
+    s for s in _BACKEND_ALL_SOURCES.split(",") if s not in LITERAL_SOURCES
+)
+
+
+def _make_query_variants(query: str) -> dict:
+    """生成 original/core 两个查询变体。core 去引号/裸露布尔/中英噪声词，
+    CJK 感知，不截断词数（保语义）；全噪声时回退 original。"""
+    original = (query or "").strip()
+    text = original.lower().rstrip("?!.")
+    if not text:
+        return {"original": original, "core": original}
+    for p in _QUERY_PREFIXES:
+        if text.startswith(p + " "):
+            text = text[len(p):].strip()
+            break
+    text = text.replace('"', " ").replace("'", " ")
+    text = _QUERY_BOOL_RE.sub(" ", text)
+    for phrase in _QUERY_NOISE_CN_SORTED:
+        text = text.replace(phrase, " ")
+    kept = [w for w in text.split() if w and w not in _QUERY_NOISE_EN]
+    core = " ".join(kept).strip()
+    core = re.sub(r"\s+", " ", core)
+    if not core:
+        core = original
+    return {"original": original, "core": core}
 
 
 class Tools:
@@ -290,6 +359,72 @@ class Tools:
             for r in results
         ]
 
+    _HAL_SEARCH_URL = "https://api.archives-ouvertes.fr/search/"
+    _HAL_FIELDS = ("halId_s,title_s,authFullName_s,abstract_s,doiId_s,"
+                   "publicationDateY_i,producedDateY_i,submittedDate_s,"
+                   "fileMain_s,uri_s,docType_s")
+
+    async def _hal_search(self, query: str, limit: int) -> list:
+        """直连 HAL API（Solr JSON，无需 key）检索，返回 _trim_paper 兼容 dict 列表。
+        绕过第三方后端 hal.py 的 isoformat bug。anyio 线程池包装，不阻塞事件循环。"""
+        def _fetch():
+            r = requests.get(
+                self._HAL_SEARCH_URL,
+                params={
+                    "q": query,
+                    "fl": self._HAL_FIELDS,
+                    "rows": max(1, min(int(limit), 100)),
+                    "wt": "json",
+                    "sort": "score desc",
+                },
+                headers={"User-Agent": "paper-search-mcp/1.0", "Accept": "application/json"},
+                timeout=20,
+            )
+            r.raise_for_status()
+            return r.json()
+
+        try:
+            data = await anyio.to_thread.run_sync(_fetch)
+        except Exception as e:
+            raise RuntimeError(f"HAL 检索失败: {e}")
+
+        docs = ((data or {}).get("response") or {}).get("docs") or []
+        papers = []
+        for d in docs:
+            if not isinstance(d, dict):
+                continue
+            hal_id = d.get("halId_s", "")
+            if not hal_id:
+                continue
+            year = d.get("publicationDateY_i") or d.get("producedDateY_i") or ""
+            pub = str(year) if year else (str(d.get("submittedDate_s", "") or "")[:10])
+            title = d.get("title_s") or [""]
+            title = (title[0] if isinstance(title, list) else str(title)).strip()
+            if not title:
+                continue
+            authors = d.get("authFullName_s") or []
+            abstract = d.get("abstract_s") or [""]
+            abstract = (
+                " ".join(x for x in abstract if x) if isinstance(abstract, list)
+                else str(abstract or "")
+            ).strip()
+            doi = d.get("doiId_s", "")
+            if isinstance(doi, list):
+                doi = doi[0] if doi else ""
+            papers.append({
+                "title": title,
+                "authors": "; ".join(a for a in authors if a),
+                "published_date": pub,
+                "abstract": abstract,
+                "paper_id": f"hal:{hal_id}",
+                "doi": doi,
+                "source": "hal",
+                "pdf_url": d.get("fileMain_s") or "",
+                "citations": 0,
+                "url": d.get("uri_s") or "",
+            })
+        return papers
+
     def _mcp_call(self, tool: str, args: dict, timeout: int = 180):
         headers = {}
         if self.valves.mcpo_api_key:
@@ -432,6 +567,8 @@ class Tools:
         query: str,
         max_results_per_source: int = 5,
         sources: str = "",
+        biorxiv_category: str = "",
+        medrxiv_category: str = "",
         __user__={},
     ) -> str:
         """
@@ -445,6 +582,11 @@ class Tools:
             crossref, pubmed, core, openaire, doaj, base, zenodo, hal, citeseerx,
             dblp, unpaywall, google_scholar, ssrn (+ieee, acm 若已配 key)
             zhihuiya（智慧芽，需在 Valves 配 apikey 才启用，直连不经 mcpo）
+        :param biorxiv_category: 可选 bioRxiv 学科分类（如 biochemistry, cell_biology,
+            bioinformatics, neuroscience 等，空格转下划线）。biorxiv/medrxiv 非关键词检索，
+            返回该学科近30天新论文；传学科可提高相关性。
+        :param medrxiv_category: 可选 medRxiv 学科分类（如 cardiovascular_medicine,
+            epidemiology, infectious_diseases 等）。
         """
         uv = __user__.get("valves") if __user__ else None
         src = (
@@ -452,49 +594,112 @@ class Tools:
             or (uv.default_sources if uv else None)
             or "arxiv,semantic,openalex,pubmed,pmc,core,europepmc"
         )
+        src_set = {s.strip().lower() for s in src.split(",") if s.strip()}
+        all_mode = src.strip().lower() == "all"
+
+        variants = _make_query_variants(query)
+        original, core = variants["original"], variants["core"]
 
         zh_enabled, zh_key = self._zhihuiya_enabled_key(__user__)
-        want_zh = zh_enabled and (
-            "zhihuiya" in {s.strip().lower() for s in src.split(",")} or src.strip().lower() == "all"
-        )
+        want_zh = zh_enabled and ("zhihuiya" in src_set or all_mode)
+        want_hal = "hal" in src_set or all_mode
 
-        async def _backend():
-            return await anyio.to_thread.run_sync(
-                self._mcp_call,
-                "search_papers",
-                {
-                    "query": query,
-                    "max_results_per_source": max_results_per_source,
-                    "sources": src,
-                },
-            )
+        # 直连源不进后端 sources
+        backend_set = src_set - DIRECT_SOURCES
+        if all_mode:
+            backend_set = None  # None 表示后端用 _BACKEND_ALL_SOURCES（不含直连源）
+
+        # 后端按变体分组：字面组用 core，语义组用 original
+        # all_mode 下字面组固定为 LITERAL_SOURCES - DIRECT_SOURCES = {doaj, iacr}（zhihuiya 直连单独处理）
+        backend_literal = (
+            (LITERAL_SOURCES - DIRECT_SOURCES)
+            if all_mode
+            else ((src_set & LITERAL_SOURCES) - DIRECT_SOURCES)
+        )
+        literal_query = core if core != original else original
+
+        async def _backend_all():
+            # core==original 或无需拆分时，一次调用（含全部后端源）
+            if not all_mode and not backend_set:
+                # 只请了直连源（hal/zhihuiya/patsnap）→ 不调后端
+                return {"papers": [], "source_results": {}, "errors": {}}
+            args = {
+                "query": original,
+                "max_results_per_source": max_results_per_source,
+                "sources": (_BACKEND_ALL_SOURCES if all_mode else ",".join(sorted(backend_set))),
+            }
+            if biorxiv_category:
+                args["biorxiv_category"] = biorxiv_category
+            if medrxiv_category:
+                args["medrxiv_category"] = medrxiv_category
+            return await anyio.to_thread.run_sync(self._mcp_call, "search_papers", args)
+
+        async def _backend_split():
+            # core!=original：语义组 original + 字面组 core 两次并发
+            sem_set = (backend_set - LITERAL_SOURCES) if backend_set is not None else None
+            tasks = []
+            labels = []
+            if sem_set is None or sem_set:
+                async def _sem():
+                    args = {"query": original,
+                            "max_results_per_source": max_results_per_source,
+                            "sources": (_SEMANTIC_ALL_SOURCES if all_mode else ",".join(sorted(sem_set)))}
+                    if biorxiv_category: args["biorxiv_category"] = biorxiv_category
+                    if medrxiv_category: args["medrxiv_category"] = medrxiv_category
+                    return await anyio.to_thread.run_sync(self._mcp_call, "search_papers", args)
+                tasks.append(_sem()); labels.append("sem")
+            if backend_literal:
+                async def _lit():
+                    return await anyio.to_thread.run_sync(
+                        self._mcp_call, "search_papers",
+                        {"query": literal_query,
+                         "max_results_per_source": max_results_per_source,
+                         "sources": ",".join(sorted(backend_literal))})
+                tasks.append(_lit()); labels.append("lit")
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            merged = {"papers": [], "source_results": {}, "errors": {}}
+            for lbl, r in zip(labels, results):
+                if isinstance(r, Exception):
+                    merged["errors"][lbl] = str(r)
+                    continue
+                if isinstance(r, dict):
+                    merged["papers"].extend(r.get("papers", []))
+                    merged["source_results"].update(r.get("source_results", {}))
+                    merged["errors"].update(r.get("errors", {}))
+            return merged
 
         async def _zh():
-            return await self._zhihuiya_search(query, max_results_per_source, zh_key)
+            return await self._zhihuiya_search(literal_query, max_results_per_source, zh_key)
 
-        backend_result, zh_result = None, None
-        zh_error = None
+        async def _hal():
+            return await self._hal_search(literal_query, max_results_per_source)
+
+        # 组装并发分支
+        branches = {}
+        branches["backend"] = _backend_split() if core != original else _backend_all()
         if want_zh:
-            results = await asyncio.gather(_backend(), _zh(), return_exceptions=True)
-            backend_result, zh_result = results[0], results[1]
-            if isinstance(zh_result, Exception):
-                zh_error, zh_result = zh_result, None
-        else:
-            backend_result = await _backend()
+            branches["zhihuiya"] = _zh()
+        if want_hal:
+            branches["hal"] = _hal()
 
+        keys = list(branches)
+        results = await asyncio.gather(*branches.values(), return_exceptions=True)
+        outcome = dict(zip(keys, results))
+
+        backend_result = outcome.get("backend")
+        zh_result = outcome.get("zhihuiya")
+        hal_result = outcome.get("hal")
+
+        # 后端失败处理：若任一直连源有结果则保留，否则报错
+        direct_ok = [r for r in (zh_result, hal_result) if isinstance(r, list) and r]
         if isinstance(backend_result, Exception):
-            if want_zh and isinstance(zh_result, list) and zh_result:
-                # 后端失败但 zhihuiya 成功：保留 zhihuiya 结果，后端错误进 errors
-                result = {
-                    "papers": [],
-                    "source_results": {},
-                    "errors": {"backend": str(backend_result)},
-                }
+            if direct_ok:
+                result = {"papers": [], "source_results": {},
+                          "errors": {"backend": str(backend_result)}}
             else:
                 return json.dumps(
                     {"error": f"后端 search_papers 调用失败: {backend_result}"},
-                    ensure_ascii=False,
-                )
+                    ensure_ascii=False)
         else:
             result = backend_result
 
@@ -502,29 +707,30 @@ class Tools:
             return json.dumps({"error": "backend 返回异常", "raw": str(result)[:500]}, ensure_ascii=False)
 
         papers = [self._trim_paper(p) for p in result.get("papers", [])]
-        source_results = dict(result.get("source_results", {}))
-        errors = dict(result.get("errors", {}))
+        source_results = dict(result.get("source_results") or {})
+        errors = dict(result.get("errors") or {})
 
         if want_zh:
-            if zh_error is not None:
+            if isinstance(zh_result, Exception):
                 source_results["zhihuiya"] = 0
-                errors["zhihuiya"] = str(zh_error)
-            else:
-                zh_papers = [self._trim_paper(p) for p in (zh_result or [])]
-                papers.extend(zh_papers)
-                source_results["zhihuiya"] = len(zh_papers)
+                errors["zhihuiya"] = str(zh_result)
+            elif zh_result is not None:
+                zp = [self._trim_paper(p) for p in zh_result]
+                papers.extend(zp)
+                source_results["zhihuiya"] = len(zp)
+        if want_hal:
+            if isinstance(hal_result, Exception):
+                source_results["hal"] = 0
+                errors["hal"] = str(hal_result)
+            elif hal_result is not None:
+                hp = [self._trim_paper(p) for p in hal_result]
+                papers.extend(hp)
+                source_results["hal"] = len(hp)
 
         return json.dumps(
-            {
-                "query": query,
-                "total": len(papers),
-                "source_results": source_results,
-                "errors": errors,
-                "papers": papers,
-            },
-            ensure_ascii=False,
-            indent=2,
-        )
+            {"query": query, "total": len(papers),
+             "source_results": source_results, "errors": errors, "papers": papers},
+            ensure_ascii=False, indent=2)
 
     async def search_patents(
         self,

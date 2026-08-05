@@ -98,6 +98,20 @@ Maps server name `"papers"` to `http://mcp:8000/papers`:
 Default selection in UserValves:
 `default_sources = "arxiv,pubmed,biorxiv,medrxiv,google_scholar,iacr,semantic,crossref,openalex,pmc,core,europepmc,dblp,openaire,doaj,hal"`
 
+### Query Adaptation（查询特性，v2.5.0+）
+
+`search_papers` 按源自动分发查询变体（`_make_query_variants`，确定性、不截断词数）：
+
+| 源类 | 源 | 发送的查询 |
+|---|---|---|
+| **语义/分词** | openalex, semantic, crossref, pmc, europepmc, pubmed, arxiv, openaire, core, dblp, patsnap | `original`（原始完整查询，保语义） |
+| **字面关键词** | zhihuiya, doaj, iacr | `core`（去引号/裸露 OR/AND/NOT/中英噪声词；长自然语言在这些源会 0，精简恢复） |
+| **直连**（绕后端） | hal, zhihuiya, patsnap | hal 走 `_hal_search`（绕后端 hal.py 的 isoformat bug），用 core 变体 |
+
+- `biorxiv/medrxiv` 非关键词检索，返回"该学科近30天新论文"；可用 `biorxiv_category`/`medrxiv_category` 传学科。
+- `dblp` 无 bug，偶发 500 是端点不稳定 + mcpo 并发超时，不在适配层。
+- `all` 模式下后端源用 `_BACKEND_ALL_SOURCES`（排除直连源 hal/zhihuiya/patsnap）；拆分时语义组用 `_SEMANTIC_ALL_SOURCES`（再排除字面组 doaj/iacr）。
+
 | Platform | Search | Read Tool | Native Download | Notes |
 |---|---|---|---|---|
 | **arXiv** | ✅ | `read_arxiv_paper` | ✅ | Open PDF, fast & reliable |

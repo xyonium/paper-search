@@ -17,6 +17,8 @@
 - 🔄 **Built-in OA Fallback Chain**: Source-native download ➔ Open Access Repositories (OpenAIRE / CORE / Europe PMC / PMC) ➔ Unpaywall ➔ (Optional) Sci-Hub mirror.
 - 🔑 **Optional zhihuiya Source**: Connects **directly** via streamable-http MCP (not through mcpo), enabled per-admin or per-user apikey — disabled entirely when no key is set.
 - 🏛 **Patent Search & Full-Text (patsnap)**: First-ever patent source — semantic patent search (`search_patents`) plus full claims + description + legal status as Markdown (`read_patent`). Shares the same zhihuiya apikey, also direct-connected.
+- 🎯 **Smart Query Adaptation**: Automatically adapts your query per source — semantic sources (OpenAlex, Semantic Scholar, PubMed…) get the full natural-language query, while literal keyword sources (zhihuiya, DOAJ, IACR) get a cleaned core-keyword variant (quotes/boolean/noise stripped). Recovers hits that would otherwise return zero, without losing semantics.
+- 🇫🇷 **HAL via Direct Connect**: HAL is queried directly (bypassing a backend date-parsing bug) so it reliably returns results.
 
 ---
 
@@ -80,6 +82,20 @@
 |---|---|---|---|---|
 | **zhihuiya (智慧芽)** | ✅ `search_literature` | ⚠️ metadata via `literature_bibliography` | ❌ | Scientific-literature MCP. Connects **directly** (streamable-http), **not** via mcpo. Enabled only when an apikey is configured; search = `search_literature` + batched `literature_bibliography` (for abstracts); full text via DOI → OA fallback chain |
 | **patsnap (智慧芽专利)** | ✅ `patsnap_search` | ✅ full text via `patsnap_fetch` | ❌ | **Patent** MCP (same company, same apikey). Dedicated tools `search_patents` / `read_patent` (independent of `search_papers`). `read_patent` returns **claims + description + legal status** as Markdown (default `module=['basic','legal']`) |
+
+---
+
+## 🎯 Query Adaptation (per-source)
+
+Different sources have very different query tolerances. `search_papers` automatically picks the right query shape per source — no configuration needed:
+
+| Source class | Sources | Query sent |
+|---|---|---|
+| **Semantic / tokenizing** | openalex, semantic, crossref, pmc, europepmc, pubmed, arxiv, openaire, core, dblp, patsnap | Your **original** full natural-language query (semantics preserved) |
+| **Literal keyword** | zhihuiya, doaj, iacr | A **cleaned core-keyword** variant — quotes, bare `OR/AND/NOT`, and filler words stripped (e.g. `"what are the latest advances in X"` → `X`), because these return **zero** on verbose queries |
+| **Direct (bypasses backend)** | hal, zhihuiya, patsnap | hal queried directly (backend date bug bypassed); uses core variant |
+
+> `bioRxiv` / `medRxiv` are **not keyword search** — they return the latest ~30 days of papers in a subject category. Pass `biorxiv_category` / `medrxiv_category` (e.g. `biochemistry`, `cardiovascular_medicine`) to focus them.
 
 ---
 
