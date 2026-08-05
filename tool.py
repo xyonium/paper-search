@@ -8,22 +8,21 @@ description: |
   【搜索源清单】（search_papers 的 sources 参数可用值，'all' 为全部）：
   · 预印本/开放获取（可搜可读全文）: arxiv, iacr, pmc, europepmc
   · 综合索引: semantic (Semantic Scholar), openalex, crossref, pubmed, core,
-    openaire, doaj, hal, dblp (CS书目)
+    openaire, doaj, hal, dblp (CS书目), zenodo (OA仓储，可选 zenodo_access_token 提额)
   · 学科新论文浏览（非关键词检索，默认不启用，sources+biorxiv_category 显式用）: biorxiv, medrxiv
   · 支持搜索但端点死/反爬/不稳（默认不启用，失败自动降级）: google_scholar, ssrn, base, citeseerx
-  · 支持搜索，已改直连（绕后端 bug）: zenodo（可选 zenodo_access_token 提额）
   · 支持搜索但未实现（配 key 也报错，不可用）: acm
-  · IEEE Xplore（需配 ieee_apikey，直连 REST API，metadata 级）: ieee
   · 仅 DOI 查询（不支持关键词搜索，用于 download fallback 链查 OA PDF）: unpaywall
-  · 智慧芽（需配 apikey 才启用，tool.py 直连不经 mcpo）: zhihuiya
+  · 智慧芽（需配 zhihuiya_apikey，有 key 自动启用）: zhihuiya
+  · IEEE Xplore（需配 ieee_apikey，有 key 自动启用，直连 REST API）: ieee
   · 智慧芽专利（独立工具 search_patents/read_patent，同 key 启用）: patsnap
 
   【查询适配】search_papers 自动按源分发查询变体（不损语义）：
-  · 语义源（openalex/semantic/crossref/pmc/europepmc/pubmed/arxiv/openaire/core/dblp/patsnap）
+  · 语义源（openalex/semantic/crossref/pmc/europepmc/pubmed/arxiv/openaire/core/patsnap）
     → 用原始完整查询
   · 字面源（zhihuiya/doaj/iacr）→ 自动去引号/裸露布尔/噪声词，精简为核心术语
     （长自然语言查询在这些源会 0 命中，精简后恢复）
-  · hal/dblp 已改直连（绕后端 bug），dblp 用 original（CS 书目，非 CS 查询可能 0 结果）
+  · hal/dblp/zenodo 已改直连（绕后端 bug），均用 original 查询
   · biorxiv/medrxiv 非关键词检索，返回"该学科近30天新论文"；
     可用 biorxiv_category/medrxiv_category 传学科（如 biochemistry）提高相关性
 
@@ -183,7 +182,7 @@ class Tools:
     class UserValves(BaseModel):
         default_sources: str = Field(
             default="arxiv,pubmed,iacr,semantic,crossref,openalex,pmc,core,europepmc,dblp,openaire,doaj,hal,zenodo",
-            description="默认搜索源：'all'=全部21源（慢，30s+）；或逗号分隔子集。默认未包含的源：google_scholar,citeseerx,ssrn,base,acm,unpaywall；zhihuiya 需配 zhihuiya_apikey，ieee 需配 ieee_apikey（有 key 自动启用，无 key 自动跳过）；biorxiv/medrxiv 为学科近30天浏览（非关键词检索），需 sources+biorxiv_category 显式调用",
+            description="默认搜索源：'all'=全部21源（慢，30s+）；或逗号分隔子集。默认未包含的源：google_scholar,citeseerx,ssrn,base,acm,unpaywall；zhihuiya 需配 zhihuiya_apikey，ieee 需配 ieee_apikey；biorxiv/medrxiv 为学科近30天浏览（非关键词检索），需 sources+biorxiv_category 显式调用",
         )
         knowledge_id: str = Field(
             default="", description="下载 PDF 自动加入的 Knowledge 集合 ID"
@@ -893,14 +892,13 @@ class Tools:
         - 单源失败不影响整体（见返回的 errors 字段）
         :param query: 学术检索词，越具体越好（如 'CRISPR base editing off-target'）
         :param max_results_per_source: 每源条数（默认5，勿调大）
-        :param sources: 留空用默认（'all'）；或逗号分隔子集，可选值:
+        :param sources: 留空用默认；或逗号分隔子集，可选值:
             arxiv, iacr, pmc, europepmc, semantic, openalex, crossref, pubmed,
-            core, openaire, doaj, hal, google_scholar, ssrn,
-            citeseerx, unpaywall（仅DOI查询）, zhihuiya（需配 key）,
-            ieee（需配 ieee_apikey，metadata 级，OA 可下载 PDF）
-            dblp（CS 书目，仅计算机科学文献；非 CS 查询可能 0 结果）
-            zenodo（OA 仓储，已改直连；多数记录有 PDF）
-            base（反爬，可能失败）, biorxiv/medrxiv（学科近30天浏览，非关键词检索，需配 biorxiv_category）
+            core, openaire, doaj, hal, zenodo, dblp（CS书目，非CS查询可能0结果）,
+            zhihuiya（需配 zhihuiya_apikey）, ieee（需配 ieee_apikey）,
+            google_scholar, ssrn, base, citeseerx（端点死/反爬，可能失败）,
+            unpaywall（仅DOI查询，不支持关键词）, acm（骨架未实现）,
+            biorxiv/medrxiv（学科近30天浏览，非关键词检索，需配 biorxiv_category）
         :param biorxiv_category: 可选 bioRxiv 学科分类（如 biochemistry, cell_biology,
             bioinformatics, neuroscience 等，空格转下划线）。biorxiv/medrxiv 非关键词检索，
             返回该学科近30天新论文；传学科可提高相关性。
