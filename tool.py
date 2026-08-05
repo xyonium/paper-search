@@ -536,6 +536,8 @@ class Tools:
         query: str,
         max_results_per_source: int = 5,
         sources: str = "",
+        biorxiv_category: str = "",
+        medrxiv_category: str = "",
         __user__={},
     ) -> str:
         """
@@ -556,49 +558,104 @@ class Tools:
             or (uv.default_sources if uv else None)
             or "arxiv,semantic,openalex,pubmed,pmc,core,europepmc"
         )
+        src_set = {s.strip().lower() for s in src.split(",") if s.strip()}
+        all_mode = src.strip().lower() == "all"
+
+        variants = _make_query_variants(query)
+        original, core = variants["original"], variants["core"]
 
         zh_enabled, zh_key = self._zhihuiya_enabled_key(__user__)
-        want_zh = zh_enabled and (
-            "zhihuiya" in {s.strip().lower() for s in src.split(",")} or src.strip().lower() == "all"
-        )
+        want_zh = zh_enabled and ("zhihuiya" in src_set or all_mode)
+        want_hal = "hal" in src_set or all_mode
 
-        async def _backend():
-            return await anyio.to_thread.run_sync(
-                self._mcp_call,
-                "search_papers",
-                {
-                    "query": query,
-                    "max_results_per_source": max_results_per_source,
-                    "sources": src,
-                },
-            )
+        # 直连源不进后端 sources
+        backend_set = src_set - DIRECT_SOURCES
+        if all_mode:
+            backend_set = None  # None 表示传 "all" 给后端
+
+        # 后端按变体分组：字面组用 core，语义组用 original
+        backend_literal = (src_set & LITERAL_SOURCES) - DIRECT_SOURCES
+        literal_query = core if core != original else original
+
+        async def _backend_all():
+            # core==original 或无需拆分时，一次调用（含全部后端源）
+            args = {
+                "query": original,
+                "max_results_per_source": max_results_per_source,
+                "sources": ("all" if all_mode else ",".join(sorted(backend_set))),
+            }
+            if biorxiv_category:
+                args["biorxiv_category"] = biorxiv_category
+            if medrxiv_category:
+                args["medrxiv_category"] = medrxiv_category
+            return await anyio.to_thread.run_sync(self._mcp_call, "search_papers", args)
+
+        async def _backend_split():
+            # core!=original：语义组 original + 字面组 core 两次并发
+            sem_set = (backend_set - LITERAL_SOURCES) if backend_set is not None else None
+            tasks = []
+            labels = []
+            if sem_set is None or sem_set:
+                async def _sem():
+                    args = {"query": original,
+                            "max_results_per_source": max_results_per_source,
+                            "sources": ("all" if all_mode else ",".join(sorted(sem_set)))}
+                    if biorxiv_category: args["biorxiv_category"] = biorxiv_category
+                    if medrxiv_category: args["medrxiv_category"] = medrxiv_category
+                    return await anyio.to_thread.run_sync(self._mcp_call, "search_papers", args)
+                tasks.append(_sem()); labels.append("sem")
+            if backend_literal:
+                async def _lit():
+                    return await anyio.to_thread.run_sync(
+                        self._mcp_call, "search_papers",
+                        {"query": literal_query,
+                         "max_results_per_source": max_results_per_source,
+                         "sources": ",".join(sorted(backend_literal))})
+                tasks.append(_lit()); labels.append("lit")
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            merged = {"papers": [], "source_results": {}, "errors": {}}
+            for lbl, r in zip(labels, results):
+                if isinstance(r, Exception):
+                    merged["errors"][lbl] = str(r)
+                    continue
+                if isinstance(r, dict):
+                    merged["papers"].extend(r.get("papers", []))
+                    merged["source_results"].update(r.get("source_results", {}))
+                    merged["errors"].update(r.get("errors", {}))
+            return merged
 
         async def _zh():
-            return await self._zhihuiya_search(query, max_results_per_source, zh_key)
+            return await self._zhihuiya_search(literal_query, max_results_per_source, zh_key)
 
-        backend_result, zh_result = None, None
-        zh_error = None
+        async def _hal():
+            return await self._hal_search(literal_query, max_results_per_source)
+
+        # 组装并发分支
+        branches = {}
+        branches["backend"] = _backend_split() if core != original else _backend_all()
         if want_zh:
-            results = await asyncio.gather(_backend(), _zh(), return_exceptions=True)
-            backend_result, zh_result = results[0], results[1]
-            if isinstance(zh_result, Exception):
-                zh_error, zh_result = zh_result, None
-        else:
-            backend_result = await _backend()
+            branches["zhihuiya"] = _zh()
+        if want_hal:
+            branches["hal"] = _hal()
 
+        keys = list(branches)
+        results = await asyncio.gather(*branches.values(), return_exceptions=True)
+        outcome = dict(zip(keys, results))
+
+        backend_result = outcome.get("backend")
+        zh_result = outcome.get("zhihuiya")
+        hal_result = outcome.get("hal")
+
+        # 后端失败处理：若任一直连源有结果则保留，否则报错
+        direct_ok = [r for r in (zh_result, hal_result) if isinstance(r, list) and r]
         if isinstance(backend_result, Exception):
-            if want_zh and isinstance(zh_result, list) and zh_result:
-                # 后端失败但 zhihuiya 成功：保留 zhihuiya 结果，后端错误进 errors
-                result = {
-                    "papers": [],
-                    "source_results": {},
-                    "errors": {"backend": str(backend_result)},
-                }
+            if direct_ok:
+                result = {"papers": [], "source_results": {},
+                          "errors": {"backend": str(backend_result)}}
             else:
                 return json.dumps(
                     {"error": f"后端 search_papers 调用失败: {backend_result}"},
-                    ensure_ascii=False,
-                )
+                    ensure_ascii=False)
         else:
             result = backend_result
 
@@ -606,29 +663,30 @@ class Tools:
             return json.dumps({"error": "backend 返回异常", "raw": str(result)[:500]}, ensure_ascii=False)
 
         papers = [self._trim_paper(p) for p in result.get("papers", [])]
-        source_results = dict(result.get("source_results", {}))
-        errors = dict(result.get("errors", {}))
+        source_results = dict(result.get("source_results") or {})
+        errors = dict(result.get("errors") or {})
 
         if want_zh:
-            if zh_error is not None:
+            if isinstance(zh_result, Exception):
                 source_results["zhihuiya"] = 0
-                errors["zhihuiya"] = str(zh_error)
-            else:
-                zh_papers = [self._trim_paper(p) for p in (zh_result or [])]
-                papers.extend(zh_papers)
-                source_results["zhihuiya"] = len(zh_papers)
+                errors["zhihuiya"] = str(zh_result)
+            elif zh_result is not None:
+                zp = [self._trim_paper(p) for p in zh_result]
+                papers.extend(zp)
+                source_results["zhihuiya"] = len(zp)
+        if want_hal:
+            if isinstance(hal_result, Exception):
+                source_results["hal"] = 0
+                errors["hal"] = str(hal_result)
+            elif hal_result is not None:
+                hp = [self._trim_paper(p) for p in hal_result]
+                papers.extend(hp)
+                source_results["hal"] = len(hp)
 
         return json.dumps(
-            {
-                "query": query,
-                "total": len(papers),
-                "source_results": source_results,
-                "errors": errors,
-                "papers": papers,
-            },
-            ensure_ascii=False,
-            indent=2,
-        )
+            {"query": query, "total": len(papers),
+             "source_results": source_results, "errors": errors, "papers": papers},
+            ensure_ascii=False, indent=2)
 
     async def search_patents(
         self,

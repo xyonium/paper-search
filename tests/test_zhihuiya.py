@@ -558,3 +558,58 @@ async def test_hal_search_error_raises():
     with patch.object(tool_mod.requests, "get", side_effect=Exception("conn fail")):
         with pytest.raises(RuntimeError):
             await t._hal_search("x", 3)
+
+
+@pytest.mark.asyncio
+async def test_search_papers_splits_literal_vs_semantic():
+    t = Tools()
+    t.valves = Tools.Valves()
+    backend_calls = []
+
+    def fake_mcp(tool, args, timeout=180):
+        backend_calls.append(dict(args))
+        return {"papers": [], "source_results": {}, "errors": {}}
+
+    async def fake_hal(q, limit):
+        return [{"title": "H", "authors": "", "published_date": "2020",
+                 "abstract": "", "paper_id": "hal:1", "doi": "",
+                 "source": "hal", "pdf_url": "", "citations": 0, "url": ""}]
+
+    t._mcp_call = fake_mcp
+    t._hal_search = fake_hal
+    # doaj(字面) + openalex(语义) + hal(直连) + zhihuiya 未启用
+    out = json.loads(await t.search_papers(
+        '"early signal drop" glucose sensor OR biosensor',
+        sources="doaj,openalex,hal", __user__=_user()))
+    # core!=original → 后端应被调两次：一次 original(语义 openalex)，一次 core(字面 doaj)
+    queries = sorted(c["query"] for c in backend_calls)
+    srcs = sorted(c["sources"] for c in backend_calls)
+    assert len(backend_calls) == 2
+    assert any('"early signal drop"' in c["query"] for c in backend_calls)  # original
+    assert any('OR' not in c["query"] and '"' not in c["query"] for c in backend_calls)  # core
+    # hal 走直连，不进后端 sources
+    assert all("hal" not in c["sources"] for c in backend_calls)
+    assert out["source_results"]["hal"] == 1
+
+
+@pytest.mark.asyncio
+async def test_search_papers_single_call_when_core_equals_original():
+    t = Tools()
+    t.valves = Tools.Valves()
+    calls = []
+    t._mcp_call = lambda tool, args, timeout=180: (calls.append(dict(args)), {"papers": [], "source_results": {}, "errors": {}})[1]
+    await t.search_papers("glucose biosensor", sources="openalex,doaj", __user__=_user())
+    # 无引号/布尔/噪声 → core==original → 只调一次后端
+    assert len(calls) == 1
+    assert calls[0]["query"] == "glucose biosensor"
+
+
+@pytest.mark.asyncio
+async def test_search_papers_passes_biorxiv_category():
+    t = Tools()
+    t.valves = Tools.Valves()
+    calls = []
+    t._mcp_call = lambda tool, args, timeout=180: (calls.append(dict(args)), {"papers": [], "source_results": {}, "errors": {}})[1]
+    await t.search_papers("glucose", sources="biorxiv",
+                          biorxiv_category="biochemistry", __user__=_user())
+    assert calls[0].get("biorxiv_category") == "biochemistry"
