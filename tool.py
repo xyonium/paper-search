@@ -1,7 +1,7 @@
 """
 title: Academic Paper Search
 description: |
-  学术论文搜索、全文阅读、PDF 下载入 Knowledge（RAG）。聚合 21+ 学术源（arXiv/PubMed/Semantic Scholar/OpenAlex/CORE/HAL/dblp/Zenodo 等）+ 智慧芽文献/专利 + IEEE Xplore，内置 OA fallback 下载链。
+  学术论文搜索、全文阅读、PDF 下载入 Knowledge（RAG）。智慧芽文献/专利 + IEEE Xplore（有 key 自动启用）+ arXiv/PubMed/Semantic Scholar/OpenAlex/CORE/HAL/dblp/Zenodo/IACR/DOAJ/OpenAIRE/Europe PMC/Crossref/PMC，内置 OA fallback 下载链。
 
   【搜索源清单】（search_papers 的 sources 参数可用值，'all' 为全部）：
   · 预印本/开放获取（可搜可读全文）: arxiv, iacr, pmc, europepmc
