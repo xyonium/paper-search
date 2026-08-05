@@ -650,3 +650,37 @@ async def test_search_papers_all_mode_excludes_direct_sources():
         assert c["sources"] != "all", "后端不得收到裸 all"
         for direct in ("hal", "zhihuiya", "patsnap"):
             assert direct not in {s.strip() for s in c["sources"].split(",")}
+
+
+@pytest.mark.asyncio
+async def test_all_mode_split_gives_literal_sources_core():
+    t = Tools(); t.valves = Tools.Valves()
+    calls = []
+    t._mcp_call = lambda tool, args, timeout=180: (calls.append(dict(args)), {"papers": [], "source_results": {}, "errors": {}})[1]
+    async def fake_hal(q, limit): return []
+    t._hal_search = fake_hal
+    # 长自然语言 → core!=original → all_mode 拆分
+    await t.search_papers("what are the latest advances in zero knowledge proof systems",
+                          sources="all", __user__=_user())
+    assert len(calls) == 2
+    by_q = {c["query"]: c["sources"] for c in calls}
+    core_q = [q for q in by_q if "latest" not in q and "what" not in q][0]
+    orig_q = [q for q in by_q if q != core_q][0]
+    # 字面组用 core，且只含 doaj/iacr
+    lit_srcs = set(by_q[core_q].split(","))
+    assert lit_srcs == {"doaj", "iacr"}
+    # 语义组用 original，且不含 doaj/iacr
+    sem_srcs = set(by_q[orig_q].split(","))
+    assert "doaj" not in sem_srcs and "iacr" not in sem_srcs
+    assert "hal" not in sem_srcs  # 直连源不进后端
+
+
+@pytest.mark.asyncio
+async def test_direct_only_sources_skip_backend():
+    t = Tools(); t.valves = Tools.Valves()
+    calls = []
+    t._mcp_call = lambda tool, args, timeout=180: (calls.append(dict(args)), {"papers": [], "source_results": {}, "errors": {}})[1]
+    async def fake_hal(q, limit): return []
+    t._hal_search = fake_hal
+    await t.search_papers("glucose biosensor", sources="hal", __user__=_user())
+    assert calls == []  # 只请直连源 → 不调后端

@@ -76,6 +76,10 @@ _BACKEND_ALL_SOURCES = (
     "arxiv,biorxiv,medrxiv,iacr,semantic,crossref,openalex,pubmed,pmc,core,"
     "europepmc,dblp,openaire,doaj,google_scholar,ssrn,unpaywall,citeseerx,base,zenodo,ieee,acm"
 )
+# all_mode 拆分时语义组使用的后端源（去掉字面源 doaj/iacr，留给 core 变体）
+_SEMANTIC_ALL_SOURCES = ",".join(
+    s for s in _BACKEND_ALL_SOURCES.split(",") if s not in LITERAL_SOURCES
+)
 
 
 def _make_query_variants(query: str) -> dict:
@@ -606,11 +610,19 @@ class Tools:
             backend_set = None  # None 表示后端用 _BACKEND_ALL_SOURCES（不含直连源）
 
         # 后端按变体分组：字面组用 core，语义组用 original
-        backend_literal = (src_set & LITERAL_SOURCES) - DIRECT_SOURCES
+        # all_mode 下字面组固定为 LITERAL_SOURCES - DIRECT_SOURCES = {doaj, iacr}（zhihuiya 直连单独处理）
+        backend_literal = (
+            (LITERAL_SOURCES - DIRECT_SOURCES)
+            if all_mode
+            else ((src_set & LITERAL_SOURCES) - DIRECT_SOURCES)
+        )
         literal_query = core if core != original else original
 
         async def _backend_all():
             # core==original 或无需拆分时，一次调用（含全部后端源）
+            if not all_mode and not backend_set:
+                # 只请了直连源（hal/zhihuiya/patsnap）→ 不调后端
+                return {"papers": [], "source_results": {}, "errors": {}}
             args = {
                 "query": original,
                 "max_results_per_source": max_results_per_source,
@@ -631,7 +643,7 @@ class Tools:
                 async def _sem():
                     args = {"query": original,
                             "max_results_per_source": max_results_per_source,
-                            "sources": (_BACKEND_ALL_SOURCES if all_mode else ",".join(sorted(sem_set)))}
+                            "sources": (_SEMANTIC_ALL_SOURCES if all_mode else ",".join(sorted(sem_set)))}
                     if biorxiv_category: args["biorxiv_category"] = biorxiv_category
                     if medrxiv_category: args["medrxiv_category"] = medrxiv_category
                     return await anyio.to_thread.run_sync(self._mcp_call, "search_papers", args)
