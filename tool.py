@@ -1558,15 +1558,21 @@ class Tools:
 
         # ---- web 搜索兜底链：tavily 主 → firecrawl 备：
         #      触发：任一请求的源出现连接/超时类错误（0 命中/400 参数错不算）。
-        #      域名限定：动态映射自 失败源 ∪ 0结果源（_fallback_domains），非一刀切全量。----
+        #      域名限定：动态映射自 失败源 ∪ 0结果源（_fallback_domains），非一刀切全量。
+        #      返回量：N(1+K/3) 上限 min(3N, 20)，K=失败源数（backend 聚合按 4 计），
+        #              避免大面积失败时补位量不足或拉太多。----
         failed_net = self._net_failed_sources(errors)
         if failed_net and (self._web_fallback_backend(__user__) or self._firecrawl_base(__user__)):
             zero_srcs = [s for s, n in source_results.items()
                          if n == 0 and s not in ("tavily", "firecrawl")]
             fb_domains = self._fallback_domains(failed_net, zero_srcs)
+            # K：失败源数；"backend" 是聚合错误（内含多源），按 4 计
+            k = sum(4 if s == "backend" else 1 for s in failed_net)
+            n = max_results_per_source
+            fb_limit = min(int(round(n * (1 + k / 3))), min(3 * n, 20))
             try:
                 fb_name, wp = await self._web_search_fallback(
-                    original, max_results_per_source, __user__, fb_domains)
+                    original, fb_limit, __user__, fb_domains)
                 if wp:
                     papers.extend(wp)
                     source_results[fb_name] = len(wp)
@@ -1574,6 +1580,7 @@ class Tools:
                     out["source_results"] = source_results
                     out["papers"] = papers
                     out["fallback_domains"] = fb_domains  # LLM/用户可见：补位限定了哪些站点
+                    out["fallback_limit"] = fb_limit      # LLM/用户可见：补位请求了多少条
             except Exception as e:
                 errors["web_fallback"] = f"web 兜底失败: {str(e)[:200]}"
                 out["errors"] = errors
