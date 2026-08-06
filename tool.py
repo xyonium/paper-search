@@ -70,7 +70,7 @@ _QUERY_PREFIXES = (
 )
 
 LITERAL_SOURCES = frozenset({"zhihuiya", "doaj", "iacr"})
-DIRECT_SOURCES = frozenset({"zhihuiya", "hal", "patsnap", "dblp", "zenodo", "ieee", "openaire"})
+DIRECT_SOURCES = frozenset({"zhihuiya", "hal", "patsnap", "dblp", "zenodo", "ieee", "openaire", "firecrawl"})
 # 后端可提供服务的全部源（排除直连源 hal/zhihuiya/patsnap；citeseerx/base/zenodo 等虽在后端但默认不启用）
 _BACKEND_ALL_SOURCES = (
     "arxiv,biorxiv,medrxiv,iacr,semantic,crossref,openalex,pubmed,pmc,core,"
@@ -177,17 +177,17 @@ class Tools:
         )
         firecrawl_base_url: str = Field(
             default="",
-            description="mcpo firecrawl 服务 base URL（如 http://mcp:8000/firecrawl；配了才启用 web 搜索兜底，留空则不启用）。优先级低于 tavily_base_url",
+            description="mcpo firecrawl 服务 base URL（如 http://mcp:8000/firecrawl；配了则启用 firecrawl 独立源——在 sources 里加 firecrawl 生效，无域名限定，内部有查询处理）。留空则不启用",
         )
         tavily_base_url: str = Field(
             default="",
-            description="tavily 代理 base URL（如 http://api-key-rotator:8788/tavily，配了才启用 web 搜索兜底，留空则不启用）。配了则优先于 firecrawl",
+            description="tavily 代理 base URL（如 http://api-key-rotator:8788/tavily；配了才启用 tavily 兜底——其他源出现连接/超时错误时用 include_domains 限定学术站检索补位）。留空则不启用",
         )
 
     class UserValves(BaseModel):
         default_sources: str = Field(
-            default="arxiv,pubmed,iacr,semantic,crossref,openalex,pmc,core,europepmc,dblp,openaire,doaj,hal,zenodo,google_scholar",
-            description="默认搜索源：'all'=全部21源（慢，30s+）；或逗号分隔子集。默认未包含的源：citeseerx,ssrn,base,acm,unpaywall；biorxiv/medrxiv 为学科近30天浏览（非关键词检索），需 sources+biorxiv_category 显式调用。zhihuiya（配 zhihuiya_apikey）与 ieee（配 ieee_apikey）已加回默认，配了 key 自动生效",
+            default="arxiv,pubmed,iacr,semantic,crossref,openalex,pmc,core,europepmc,dblp,openaire,doaj,hal,zenodo,google_scholar,zhihuiya,ieee",
+            description="默认搜索源：'all'=全部21源（慢，30s+）；或逗号分隔子集。默认未包含的源：citeseerx,ssrn,base,acm,unpaywall；biorxiv/medrxiv 为学科近30天浏览（非关键词检索），需 sources+biorxiv_category 显式调用。zhihuiya/ieee 在默认列表中，但仅当配了对应 apikey 才真正启用（未配 key 静默跳过）",
         )
         knowledge_id: str = Field(
             default="", description="下载 PDF 自动加入的 Knowledge 集合 ID"
@@ -221,11 +221,11 @@ class Tools:
         )
         firecrawl_base_url: str = Field(
             default="",
-            description="web 搜索兜底的 firecrawl base URL（个人级，非空时覆盖管理员；留空用管理员配置）",
+            description="firecrawl 独立源的 base URL（个人级，非空时覆盖管理员；留空用管理员配置）",
         )
         tavily_base_url: str = Field(
             default="",
-            description="web 搜索兜底的 tavily base URL（个人级，非空时覆盖管理员；留空用管理员配置）",
+            description="tavily 兜底的 base URL（个人级，非空时覆盖管理员；留空用管理员配置）",
         )
 
     # 覆盖全部 21 个源 + 可选 IEEE/ACM（配 key 后动态注册）
@@ -911,15 +911,13 @@ class Tools:
         return out
 
     def _web_fallback_backend(self, __user__=None) -> str:
-        """返回 "tavily" / "firecrawl" / ""。UserValves 覆盖 Valves；两者都配则 tavily 优先。"""
+        """fallback 专用后端：只认 tavily（配了 tavily_base_url 才返回 "tavily"，否则 ""）。
+        firecrawl 是独立源（want_firecrawl 控制），不做 fallback——它没有域名限定，
+        作为主链源参与检索更合适；tavily 有 include_domains 学术限定，做兜底更精准。"""
         uv = __user__.get("valves") if __user__ else None
         tavily = (getattr(uv, "tavily_base_url", "") or "").strip() if uv else ""
         tavily = tavily or (getattr(self.valves, "tavily_base_url", "") or "").strip()
-        if tavily:
-            return "tavily"
-        fc = (getattr(uv, "firecrawl_base_url", "") or "").strip() if uv else ""
-        fc = fc or (getattr(self.valves, "firecrawl_base_url", "") or "").strip()
-        return "firecrawl" if fc else ""
+        return "tavily" if tavily else ""
 
     def _tavily_base(self, __user__=None) -> str:
         uv = __user__.get("valves") if __user__ else None
@@ -932,12 +930,9 @@ class Tools:
         return (u or (getattr(self.valves, "firecrawl_base_url", "") or "").strip()).rstrip("/")
 
     async def _web_search_fallback(self, query: str, limit: int, __user__=None) -> list:
-        """web 搜索兜底。tavily（JSON，支持 include_domains）优先，否则 firecrawl research（Markdown）。"""
-        backend = self._web_fallback_backend(__user__)
-        if backend == "tavily":
+        """web 搜索兜底：只用 tavily（JSON + include_domains 学术限定）。firecrawl 是独立源不走这里。"""
+        if self._web_fallback_backend(__user__) == "tavily":
             return await self._tavily_search_papers(query, limit, __user__)
-        if backend == "firecrawl":
-            return await self._firecrawl_search_papers(query, limit, __user__)
         return []
 
     def _tavily_call(self, body: dict, __user__=None, timeout: int = 60):
@@ -1234,6 +1229,7 @@ class Tools:
             arxiv, iacr, pmc, europepmc, semantic, openalex, crossref, pubmed,
             core, openaire, doaj, hal, zenodo, dblp（CS书目，非CS查询可能0结果）,
             zhihuiya（需配 zhihuiya_apikey）, ieee（需配 ieee_apikey）,
+            firecrawl（web文献检索，需配 firecrawl_base_url，无域名限定）,
             google_scholar, ssrn, base, citeseerx（端点死/反爬，可能失败）,
             unpaywall（仅DOI查询，不支持关键词）, acm（骨架未实现）,
             biorxiv/medrxiv（学科近30天浏览，非关键词检索，需配 biorxiv_category）
@@ -1261,6 +1257,8 @@ class Tools:
         want_dblp = "dblp" in src_set or all_mode
         want_zenodo = "zenodo" in src_set or all_mode
         want_openaire = "openaire" in src_set or all_mode
+        # firecrawl 是独立源：配了 firecrawl_base_url 且在 sources 里才启用
+        want_firecrawl = bool(self._firecrawl_base(__user__)) and ("firecrawl" in src_set or all_mode)
         ieee_enabled, ieee_key = self._ieee_enabled_key(__user__)
         want_ieee = ieee_enabled and ("ieee" in src_set or all_mode)
 
@@ -1344,6 +1342,10 @@ class Tools:
         async def _openaire():
             return await self._openaire_search(original, max_results_per_source)
 
+        async def _fc():
+            # firecrawl 内部有查询处理，但保守起见用 core（去噪声词，保语义不截断）
+            return await self._firecrawl_search_papers(core, max_results_per_source, __user__)
+
         async def _ieee():
             return await self._ieee_search(original, max_results_per_source, ieee_key)
 
@@ -1360,6 +1362,8 @@ class Tools:
             branches["zenodo"] = _zenodo()
         if want_openaire:
             branches["openaire"] = _openaire()
+        if want_firecrawl:
+            branches["firecrawl"] = _fc()
         if want_ieee:
             branches["ieee"] = _ieee()
 
@@ -1373,10 +1377,11 @@ class Tools:
         dblp_result = outcome.get("dblp")
         zenodo_result = outcome.get("zenodo")
         openaire_result = outcome.get("openaire")
+        firecrawl_result = outcome.get("firecrawl")
         ieee_result = outcome.get("ieee")
 
         # 后端失败处理：若任一直连源有结果则保留，否则报错
-        direct_ok = [r for r in (zh_result, hal_result, dblp_result, zenodo_result, openaire_result, ieee_result) if isinstance(r, list) and r]
+        direct_ok = [r for r in (zh_result, hal_result, dblp_result, zenodo_result, openaire_result, firecrawl_result, ieee_result) if isinstance(r, list) and r]
         if isinstance(backend_result, Exception):
             if direct_ok:
                 result = {"papers": [], "source_results": {},
@@ -1435,6 +1440,14 @@ class Tools:
                 op = [self._trim_paper(p) for p in openaire_result]
                 papers.extend(op)
                 source_results["openaire"] = len(op)
+        if want_firecrawl:
+            if isinstance(firecrawl_result, Exception):
+                source_results["firecrawl"] = 0
+                errors["firecrawl"] = str(firecrawl_result)
+            elif firecrawl_result is not None:
+                fp = [self._trim_paper(p) for p in firecrawl_result]
+                papers.extend(fp)
+                source_results["firecrawl"] = len(fp)
         if want_ieee:
             if isinstance(ieee_result, Exception):
                 source_results["ieee"] = 0
