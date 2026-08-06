@@ -166,6 +166,7 @@ Unpaywall 查 OA 直链（有 DOI 时）→ 是PDF下载 / 非PDF落地页则网
 - **`url` 参数**（v2.7.1）：read_paper 新增 `url` 参数，传 search 结果的出版商落地页 URL。链中**最先**尝试（质量最高）——jina 对 nature/cell/science 等出版商页面可抓 149k 全文。**google_scholar 必须传 url**：正常时其 search 结果 `url` 是出版商链接（cell.com/science.org/nature.com，容器实测），但限流降级时 Scholar 返回纯文本无链接标题（后端 `link['href']` 拿不到，`url=""`，容器直打 Scholar 实测 10/10 无 href）→ 此时 `gs_xxx` 是 hash 不可反推，报引导错误让 LLM 改走 download OA 链。
 - **jina reader** 借鉴 reach-mcp `jina.py`：`https://r.jina.ai/{url}`，`Accept: text/plain` + `X-Retain-Images: none`，keyless 免费 20 RPM。对 pubmed/openalex/出版商落地页有效；对 acs.org/doi.org 付费墙返回挑战页（被 junk 拦截，落 firecrawl）。
 - 成功时返回前缀标注来源：`[经 jina 网页抓取全文：url]` / `[经 firecrawl 网页抓取 OA 全文：url]`。
+- **google_scholar 全文不靠"抓 Scholar 页面"补**：标题无链接只在请求被 Google 降级（指纹/IP 触发）时出现，此时 `url=""`、`gs_xxx` 是 hash 不可反推。cluster 版本页**无法**用 firecrawl/jina 抓（实测 firecrawl "The system can't perform the operation"、jina 403 automated queries）；标题反查不可靠（泛标题匹配错论文）。正确路径是 read_paper 传 `url`（正常时是出版商链接）；降级时改走 `download_paper_to_knowledge` 的 DOI/标题 OA 链。
 
 | Platform | Search | Read Tool | Native Download | Notes |
 |---|---|---|---|---|
@@ -177,7 +178,7 @@ Unpaywall 查 OA 直链（有 DOI 时）→ 是PDF下载 / 非PDF落地页则网
 | **OpenAlex** | ✅ | ⚠️ metadata only | ❌ | Open metadata backbone |
 | **PMC / Europe PMC** | ✅ | ⚠️ Fallback to PDF | ✅ (OA) | High quality biomedical full-text |
 | **CORE** | ✅ | ⚠️ Fallback to PDF | ✅ (OA) | Global repository aggregator |
-| **Google Scholar** | ✅ | ❌ | ❌ | May return 403 without proxy |
+| **Google Scholar** | ✅ | ❌ | ❌ | May return 403 without proxy；read 走 `url` 参数（出版商落地页，v2.7.1） |
 | **IACR** | ✅ | `read_iacr_paper` | ✅ | Cryptography ePrints |
 | **OpenAIRE / DOAJ / HAL** | ✅ | Varies / Fallback | Record-dependent | Domain repositories |
 | **dblp** | ✅ (v2.5.3+ 直连) | ⚠️ ee/DOI → OA fallback | Record-dependent | CS 书目库，无全文；read_paper 自动查 ee 链接 → arXiv PDF / Unpaywall OA；付费墙返回错误提示走 download |
