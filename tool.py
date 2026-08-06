@@ -15,7 +15,7 @@ description: 学术论文搜索、全文阅读、PDF 下载入 Knowledge（RAG�
   · 智慧芽专利（独立工具 search_patents/read_patent，同 key 启用）: patsnap
 
   【查询适配】search_papers 自动按源分发查询变体（不损语义）：
-  · 语义源（openalex/semantic/crossref/pmc/europepmc/pubmed/arxiv/openaire/core/patsnap）
+  · 语义源（openalex/semantic/crossref/pmc/europepmc/pubmed/arxiv/openaire(直连)/core/patsnap）
     → 用原始完整查询
   · 字面源（zhihuiya/doaj/iacr）→ 自动去引号/裸露布尔/噪声词，精简为核心术语
     （长自然语言查询在这些源会 0 命中，精简后恢复）
@@ -70,11 +70,11 @@ _QUERY_PREFIXES = (
 )
 
 LITERAL_SOURCES = frozenset({"zhihuiya", "doaj", "iacr"})
-DIRECT_SOURCES = frozenset({"zhihuiya", "hal", "patsnap", "dblp", "zenodo", "ieee"})
+DIRECT_SOURCES = frozenset({"zhihuiya", "hal", "patsnap", "dblp", "zenodo", "ieee", "openaire"})
 # 后端可提供服务的全部源（排除直连源 hal/zhihuiya/patsnap；citeseerx/base/zenodo 等虽在后端但默认不启用）
 _BACKEND_ALL_SOURCES = (
     "arxiv,biorxiv,medrxiv,iacr,semantic,crossref,openalex,pubmed,pmc,core,"
-    "europepmc,openaire,doaj,google_scholar,ssrn,unpaywall,citeseerx,base,acm"
+    "europepmc,doaj,google_scholar,ssrn,unpaywall,citeseerx,base,acm"
 )
 # all_mode 拆分时语义组使用的后端源（去掉字面源 doaj/iacr，留给 core 变体）
 _SEMANTIC_ALL_SOURCES = ",".join(
@@ -175,6 +175,10 @@ class Tools:
             default="",
             description="Zenodo Access Token（管理员级，可选；配了额度更高/可访问受限记录，留空走公共 API）",
         )
+        firecrawl_fallback: bool = Field(
+            default=True,
+            description="源出现连接/超时错误时，经 mcpo 调 firecrawl_research_search_papers 兜底（走 firecrawl 源，结果标注 source=firecrawl）",
+        )
 
     class UserValves(BaseModel):
         default_sources: str = Field(
@@ -210,6 +214,10 @@ class Tools:
             default="",
             description="Zenodo Access Token（个人级，非空时覆盖管理员 token）",
             json_schema_extra={"input": {"type": "password"}},
+        )
+        firecrawl_fallback: bool = Field(
+            default=True,
+            description="源出现连接/超时错误时启用 firecrawl 兜底（个人级，可覆盖管理员设置）",
         )
 
     # 覆盖全部 21 个源 + 可选 IEEE/ACM（配 key 后动态注册）
@@ -759,7 +767,193 @@ class Tools:
             })
         return papers
 
-    def _mcp_call(self, tool: str, args: dict, timeout: int = 180):
+    _OPENAIRE_SEARCH_URL = "https://api.openaire.eu/search/publications"
+
+    async def _openaire_search(self, query: str, limit: int) -> list:
+        """直连 OpenAIRE search/publications API（正确参数是 keywords，不是 query）。
+        绕后端 openaire.py 双 bug（2026-08 实测 100% 必现）：
+        路径1 researchProducts 端点 404（已废弃，Tomcat 报错）；路径2 legacy fallback
+        用 query= 参数 → OpenAIRE 只认 keywords → 400 Bad Request。
+        与 dblp/zenodo 同模式，网络类错误 3 次退避（2s/4s），4xx 不重试。"""
+        max_attempts = 3
+        backoff = [2, 4]
+
+        def _fetch():
+            last_exc = None
+            for attempt in range(max_attempts):
+                try:
+                    r = requests.get(
+                        self._OPENAIRE_SEARCH_URL,
+                        params={
+                            "keywords": query,
+                            "format": "json",
+                            "size": max(1, min(int(limit), 100)),
+                            "page": 1,
+                        },
+                        headers={
+                            "User-Agent": "paper-search-tool/2.5 (OpenWebUI academic search)",
+                            "Accept": "application/json",
+                        },
+                        timeout=30,
+                    )
+                    if r.status_code == 200:
+                        return r.json()
+                    if r.status_code in (429, 500, 502, 503, 504):
+                        last_exc = RuntimeError(f"OpenAIRE HTTP {r.status_code}")
+                    else:
+                        r.raise_for_status()
+                except Exception as e:
+                    if isinstance(e, requests.exceptions.HTTPError):
+                        raise
+                    last_exc = e
+                if attempt < max_attempts - 1:
+                    import time
+                    time.sleep(backoff[attempt])
+            raise RuntimeError(f"OpenAIRE 检索失败（重试{max_attempts}次）: {last_exc}")
+
+        try:
+            data = await anyio.to_thread.run_sync(_fetch)
+        except Exception as e:
+            raise RuntimeError(f"OpenAIRE 检索失败: {e}")
+
+        # OpenAIRE json: response.results.result[]，每条 metadata.oaf:entity.oaf:result
+        # 实测结构（2026-08）：title/creator/pid 是 dict 或 dict 列表，文本在 "$" 键
+        resp = (data or {}).get("response") or {}
+        results = (resp.get("results") or {}).get("result") or []
+        if isinstance(results, dict):
+            results = [results]
+
+        def _text(node):
+            """dict -> node['$']；list -> 第一个 dict 的 '$'；str -> 原样"""
+            if isinstance(node, dict):
+                return str(node.get("$") or "")
+            if isinstance(node, list):
+                for n in node:
+                    t = _text(n)
+                    if t:
+                        return t
+                return ""
+            return str(node or "")
+
+        papers = []
+        for r in results[:limit]:
+            if not isinstance(r, dict):
+                continue
+            ent = ((r.get("metadata") or {}).get("oaf:entity") or {}).get("oaf:result") or {}
+            title = _text(ent.get("title")).strip()
+            if not title:
+                continue
+            creators = ent.get("creator") or []
+            if isinstance(creators, (str, dict)):
+                creators = [creators]
+            authors = [_text(c).strip() for c in creators]
+            authors = [a for a in authors if a]
+            pub_date = _text(ent.get("dateofacceptance"))[:10]
+            pids = ent.get("pid") or []
+            if isinstance(pids, dict):
+                pids = [pids]
+            doi = next((_text(p) for p in pids
+                        if isinstance(p, dict) and p.get("@classid") == "doi"), "")
+            bar = ent.get("bestaccessright") or {}
+            oa = "open" in str(bar.get("@classid", "")).lower() if isinstance(bar, dict) else False
+            pdf_url = ""
+            ch = (ent.get("children") or {}).get("instance") or []
+            if isinstance(ch, dict):
+                ch = [ch]
+            for inst in ch:
+                url = _text((inst.get("webresource") or {}).get("url") if isinstance(inst, dict) else "")
+                if url and ".pdf" in url.lower():
+                    pdf_url = url
+                    break
+            obj_id = _text((r.get("header") or {}).get("dri:objIdentifier"))
+            papers.append({
+                "title": title,
+                "authors": "; ".join(authors),
+                "published_date": pub_date,
+                "abstract": "",
+                "paper_id": f"openaire:{obj_id[:50]}",
+                "doi": doi,
+                "source": "openaire",
+                "pdf_url": pdf_url if oa else "",
+                "citations": 0,
+                "url": f"https://doi.org/{doi}" if doi else "",
+            })
+        return papers
+
+    # ---------- firecrawl 兜底（经 mcpo 直连，绕后端 papers 服务）----------
+    _FC_NET_ERR_MARKERS = (
+        "超时", "timed out", "timeout", "ssl", "eof", "connection", "refused",
+        "reset", "unreachable", "dns", "502", "503", "504", "429",
+    )
+
+    def _net_failed_sources(self, errors: dict) -> list:
+        """从 errors dict 挑出连接/超时类失败的源（0 命中/400 参数错不算）。"""
+        out = []
+        for src, msg in (errors or {}).items():
+            m = str(msg).lower()
+            if any(k in m for k in self._FC_NET_ERR_MARKERS):
+                out.append(src)
+        return out
+
+    def _firecrawl_fallback_enabled(self, __user__=None) -> bool:
+        uv = __user__.get("valves") if __user__ else None
+        user_v = getattr(uv, "firecrawl_fallback", None) if uv else None
+        admin_v = getattr(self.valves, "firecrawl_fallback", True)
+        return bool(user_v if user_v is not None else admin_v)
+
+    def _mcp_call_service(self, service: str, tool: str, args: dict, timeout: int = 90):
+        """调 mcpo 上非 papers 的服务（如 firecrawl）。mcpo_url 为 .../papers 时替换尾段。"""
+        base = self.valves.mcpo_url.rstrip("/")
+        if base.endswith("/papers"):
+            base = base[: -len("/papers")]
+        headers = {}
+        if self.valves.mcpo_api_key:
+            headers["Authorization"] = f"Bearer {self.valves.mcpo_api_key}"
+        try:
+            resp = requests.post(f"{base}/{service}/{tool}", json=args,
+                                 headers=headers, timeout=timeout)
+            resp.raise_for_status()
+            try:
+                data = resp.json()
+            except ValueError:
+                return resp.text
+            if isinstance(data, dict) and set(data) == {"result"}:
+                return data["result"]
+            return data
+        except requests.exceptions.Timeout:
+            raise RuntimeError(f"mcpo {service}/{tool} 超时 ({timeout}s)")
+        except requests.exceptions.RequestException as e:
+            raise RuntimeError(f"mcpo {service}/{tool} 失败: {e}")
+
+    async def _firecrawl_search_papers(self, query: str, limit: int) -> list:
+        """firecrawl_research_search_papers 兜底：返回 Markdown 文本，解析成 paper dict。"""
+        raw = await anyio.to_thread.run_sync(
+            self._mcp_call_service, "firecrawl", "firecrawl_research_search_papers",
+            {"query": query, "k": max(1, min(int(limit), 10))}, 90)
+        text = raw if isinstance(raw, str) else json.dumps(raw, ensure_ascii=False)
+        papers = []
+        # 条目格式：## [arxiv:2010.03192] Title\nabstract...
+        for m in re.finditer(r"##\s*\[([^\]]+)\]\s*(.+?)(?=\n##\s*\[|\Z)", text, re.S):
+            pid, block = m.group(1).strip(), m.group(2)
+            head, _, body = block.partition("\n")
+            title = head.strip().rstrip("\\")
+            if not title:
+                continue
+            papers.append({
+                "title": title,
+                "authors": "",
+                "published_date": "",
+                "abstract": body.strip(),
+                "paper_id": pid if ":" in pid else f"firecrawl:{pid}",
+                "doi": "",
+                "source": "firecrawl",
+                "pdf_url": "",
+                "citations": 0,
+                "url": "",
+            })
+        return papers
+
+    def _mcp_call(self, tool: str, args: dict, timeout: int = 180, _retried: bool = False):
         headers = {}
         if self.valves.mcpo_api_key:
             headers["Authorization"] = f"Bearer {self.valves.mcpo_api_key}"
@@ -779,7 +973,14 @@ class Tools:
                 return data["result"]
             return data
         except requests.exceptions.Timeout:
-            raise RuntimeError(f"后端 mcpo 调用超时 ({timeout}s)")
+            # 实测（2026-08）：境外学术 API 在突发并发下会间歇性 SSL EOF/慢响应，
+            # 偶发触发 180s 超时；同请求立即重试通常成功 → 超时才重试 1 次。
+            # search_papers 幂等（只读检索），重试安全。
+            if _retried:
+                raise RuntimeError(f"后端 mcpo 调用超时 ({timeout}s，已重试1次)")
+            import time
+            time.sleep(3)
+            return self._mcp_call(tool, args, timeout, _retried=True)
         except requests.exceptions.RequestException as e:
             raise RuntimeError(f"后端 mcpo 请求失败: {e}")
 
@@ -941,6 +1142,7 @@ class Tools:
         want_hal = "hal" in src_set or all_mode
         want_dblp = "dblp" in src_set or all_mode
         want_zenodo = "zenodo" in src_set or all_mode
+        want_openaire = "openaire" in src_set or all_mode
         ieee_enabled, ieee_key = self._ieee_enabled_key(__user__)
         want_ieee = ieee_enabled and ("ieee" in src_set or all_mode)
 
@@ -1021,6 +1223,9 @@ class Tools:
         async def _zenodo():
             return await self._zenodo_search(original, max_results_per_source, __user__)
 
+        async def _openaire():
+            return await self._openaire_search(original, max_results_per_source)
+
         async def _ieee():
             return await self._ieee_search(original, max_results_per_source, ieee_key)
 
@@ -1035,6 +1240,8 @@ class Tools:
             branches["dblp"] = _dblp()
         if want_zenodo:
             branches["zenodo"] = _zenodo()
+        if want_openaire:
+            branches["openaire"] = _openaire()
         if want_ieee:
             branches["ieee"] = _ieee()
 
@@ -1047,10 +1254,11 @@ class Tools:
         hal_result = outcome.get("hal")
         dblp_result = outcome.get("dblp")
         zenodo_result = outcome.get("zenodo")
+        openaire_result = outcome.get("openaire")
         ieee_result = outcome.get("ieee")
 
         # 后端失败处理：若任一直连源有结果则保留，否则报错
-        direct_ok = [r for r in (zh_result, hal_result, dblp_result, zenodo_result, ieee_result) if isinstance(r, list) and r]
+        direct_ok = [r for r in (zh_result, hal_result, dblp_result, zenodo_result, openaire_result, ieee_result) if isinstance(r, list) and r]
         if isinstance(backend_result, Exception):
             if direct_ok:
                 result = {"papers": [], "source_results": {},
@@ -1101,6 +1309,14 @@ class Tools:
                 zp2 = [self._trim_paper(p) for p in zenodo_result]
                 papers.extend(zp2)
                 source_results["zenodo"] = len(zp2)
+        if want_openaire:
+            if isinstance(openaire_result, Exception):
+                source_results["openaire"] = 0
+                errors["openaire"] = str(openaire_result)
+            elif openaire_result is not None:
+                op = [self._trim_paper(p) for p in openaire_result]
+                papers.extend(op)
+                source_results["openaire"] = len(op)
         if want_ieee:
             if isinstance(ieee_result, Exception):
                 source_results["ieee"] = 0
@@ -1120,6 +1336,22 @@ class Tools:
                     adapted[s] = literal_query
             if adapted:
                 out["query_adapted"] = adapted
+
+        # ---- firecrawl 兜底：任一请求的源出现连接/超时类错误时触发（0 命中不算）----
+        failed_net = self._net_failed_sources(errors)
+        if failed_net and self._firecrawl_fallback_enabled(__user__):
+            try:
+                fc_papers = await self._firecrawl_search_papers(original, max_results_per_source)
+                if fc_papers:
+                    papers.extend(fc_papers)
+                    source_results["firecrawl"] = len(fc_papers)
+                    out["total"] = len(papers)
+                    out["source_results"] = source_results
+                    out["papers"] = papers
+            except Exception as e:
+                errors["firecrawl"] = f"firecrawl 兜底失败: {str(e)[:200]}"
+                out["errors"] = errors
+
         return json.dumps(out, ensure_ascii=False, indent=2)
 
     async def search_patents(
