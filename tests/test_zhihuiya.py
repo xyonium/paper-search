@@ -894,3 +894,88 @@ def _paper_pubmed():
 
 async def _async_ret(v):
     return v
+
+
+# ---------------- read_paper fallback 链（v2.7）----------------
+
+def test_normalize_read_source_pmid_prefix():
+    t = Tools()
+    src, pid = t._normalize_read_source("firecrawl", "pmid:40403180")
+    assert src == "pubmed" and pid == "40403180"
+
+def test_normalize_read_source_arxiv_prefix():
+    t = Tools()
+    src, pid = t._normalize_read_source("tavily", "arxiv:2010.03192")
+    assert src == "arxiv" and pid == "2010.03192"
+
+def test_normalize_read_source_unknown_prefix_passthrough():
+    t = Tools()
+    src, pid = t._normalize_read_source("firecrawl", "web:xyz")
+    assert src == "web" and pid == "xyz"
+    # 无前缀原样
+    src2, pid2 = t._normalize_read_source("openalex", "W4384820579")
+    assert src2 == "openalex" and pid2 == "W4384820579"
+
+
+def test_is_unsupported_msg_detects_metadata_only():
+    # 后端 crossref/pubmed 的"不支持"提示（>200 字符、含特征词）必须判为不支持
+    crossref_msg = ("CrossRef papers cannot be read directly through this tool. "
+                    "CrossRef is a citation database that provides metadata about academic papers. "
+                    "Only metadata and abstracts are available through CrossRef's API. "
+                    "To access the full text, please use the paper's DOI or URL.")
+    pubmed_msg = ("PubMed papers cannot be read directly through this tool. "
+                  "Only metadata and abstracts are available through PubMed's API. "
+                  "Please use the paper's DOI or URL to access the full text online.")
+    assert Tools._is_unsupported_msg(crossref_msg) is True
+    assert Tools._is_unsupported_msg(pubmed_msg) is True
+    # 真实全文（长、无特征词）不判为不支持
+    real = ("Introduction " + "lorem ipsum dolor sit amet " * 300)
+    assert Tools._is_unsupported_msg(real) is False
+
+
+def test_is_web_junk():
+    t = Tools()
+    assert t._is_web_junk("") is True
+    assert t._is_web_junk("short") is True
+    assert t._is_web_junk("Just a moment... " + "x" * 600) is True
+    assert t._is_web_junk("# Real Title\n\n" + ("content body " * 100)) is False
+
+
+@pytest.mark.asyncio
+async def test_read_paper_pubmed_falls_back_to_jina():
+    """pubmed 后端仅元数据提示 → 必须降级到网页抓取，不返回提示文本。"""
+    t = Tools(); t.valves = Tools.Valves()
+    # 后端 read_pubmed_paper 返回"不支持"提示
+    t._mcp_call = lambda *a, **k: ("PubMed papers cannot be read directly through this tool. "
+                                   "Only metadata and abstracts are available through PubMed's API. "
+                                   "Please use the paper's DOI or URL to access the full text online.")
+    async def fake_web(url, u=None):
+        assert "pubmed.ncbi.nlm.nih.gov/40403180" in url
+        return "jina", "# Title\n\n" + ("abstract content " * 60)
+    t._web_read_fallback = fake_web
+    out = await t.read_paper(source="pubmed", paper_id="40403180", __user__={})
+    assert out.startswith("[经 jina 网页抓取全文")
+    assert "cannot be read directly" not in out
+
+
+@pytest.mark.asyncio
+async def test_read_paper_crossref_doi_uses_unpaywall_then_web():
+    """crossref（DOI）无 pdf_url：Unpaywall OA 链接非 PDF 时回退网页抓取 OA 链接。"""
+    t = Tools(); t.valves = Tools.Valves()
+    t._mcp_call = lambda *a, **k: ("CrossRef papers cannot be read directly through this tool. "
+                                   "Only metadata and abstracts are available.")
+    t._resolve_oa_pdf = lambda doi: _async_ret("https://www.sciencedirect.com/science/article/pii/X/pdf")
+    # OA PDF 下载失败（非 PDF）
+    def boom_get(*a, **k):
+        raise RuntimeError("not pdf")
+    monkey = pytest.MonkeyPatch()
+    monkey.setattr(tool_mod.requests, "get", boom_get)
+    seen = {}
+    async def fake_web(url, u=None):
+        seen["url"] = url
+        return "firecrawl", "# Paper\n\n" + ("full text " * 80)
+    t._web_read_fallback = fake_web
+    out = await t.read_paper(source="crossref", paper_id="10.1016/j.x.2020.1", __user__={})
+    monkey.undo()
+    assert seen["url"].endswith("/pdf")  # 抓的是 OA 链接而非 doi.org
+    assert out.startswith("[经 firecrawl 网页抓取 OA 全文")

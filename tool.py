@@ -188,6 +188,10 @@ class Tools:
             default="",
             description="tavily 代理 base URL（如 http://api-key-rotator:8788/tavily；配了才启用 tavily 兜底——其他源出现连接/超时错误时用 include_domains 限定学术站检索补位）。留空则不启用",
         )
+        jina_api_key: str = Field(
+            default="",
+            description="Jina Reader API key（管理员级，可选）。read_paper 的网页全文 fallback 用 r.jina.ai：不配 key 免费 20 RPM，配了 500 RPM。留空走 keyless",
+        )
 
     class UserValves(BaseModel):
         default_sources: str = Field(
@@ -237,6 +241,11 @@ class Tools:
             description="NCBI E-utilities API key（个人级，非空时覆盖管理员 key）",
             json_schema_extra={"input": {"type": "password"}},
         )
+        jina_api_key: str = Field(
+            default="",
+            description="Jina Reader API key（个人级，非空时覆盖管理员 key）",
+            json_schema_extra={"input": {"type": "password"}},
+        )
 
     # 覆盖全部 21 个源 + 可选 IEEE/ACM（配 key 后动态注册）
     # None = 后端无 read 工具，直接走 pdf_url fallback
@@ -278,6 +287,14 @@ class Tools:
         "does not provide",
         "metadata-only",
         "not implemented",
+        "cannot be read directly",
+        "cannot be read",
+        "only metadata",
+        "no full text",
+        "no full-text",
+        "full text is not available",
+        "full-text is not available",
+        "metadata and abstracts are available",
     )
 
     @classmethod
@@ -287,7 +304,8 @@ class Tools:
         t = text.strip().lower()
         if len(t) < 200:
             return True
-        return len(t) < 1200 and any(m in t for m in cls._UNSUPPORTED_MARKERS)
+        # 后端"无全文"提示通常很短且含特征词；放宽到 <3000 兜底（真实全文远超此长度）
+        return len(t) < 3000 and any(m in t for m in cls._UNSUPPORTED_MARKERS)
 
     def __init__(self):
         self.valves = self.Valves()
@@ -1952,6 +1970,25 @@ class Tools:
             )
         return md[:max_chars] + ("\n\n[…专利文档截断…]" if len(md) > max_chars else "")
 
+    _PREFIX_TO_SOURCE = {
+        "arxiv": "arxiv", "doi": "crossref", "pubmed": "pubmed", "pmid": "pubmed",
+        "pmc": "pmc", "biorxiv": "biorxiv", "medrxiv": "medrxiv", "hal": "hal",
+        "zenodo": "zenodo", "ieee": "ieee", "dblp": "dblp", "openaire": "openaire",
+        "aclanthology": "web", "web": "web",
+    }
+
+    def _normalize_read_source(self, source: str, paper_id: str) -> tuple:
+        """web 源（firecrawl/tavily）的 paper_id 保留了原始前缀（如 arxiv:xxx、pmid:xxx），
+        据此还原到对应源再处理；返回 (规范源, 规范 paper_id)。"""
+        src = (source or "").strip().lower()
+        pid = (paper_id or "").strip()
+        if src in ("firecrawl", "tavily") and ":" in pid:
+            prefix, _, rest = pid.partition(":")
+            mapped = self._PREFIX_TO_SOURCE.get(prefix.lower())
+            if mapped and rest:
+                return mapped, rest
+        return src, pid
+
     async def read_paper(
         self,
         source: str,
@@ -1961,17 +1998,17 @@ class Tools:
         __user__={},
     ) -> str:
         """
-        阅读论文全文（截断到 max_chars）。
+        阅读论文全文（截断到 max_chars）。**务必同时传 pdf_url 和 url**——多数源无后端全文工具，
+        需靠 fallback 链自动提取。
         - 后端直接可读: arxiv, biorxiv, medrxiv, iacr, semantic, doaj, hal
-        - openaire/zenodo/dblp/ieee: 已改直连，自动用 DOI/pdf_url 走 fallback 提取
-        - pubmed/crossref: 后端仅返回元数据提示，自动降级用 pdf_url 提取
-        - pmc, core, europepmc, openalex, google_scholar, ssrn, base/citeseerx:
-          请同时传 pdf_url，将自动下载提取全文
+        - 其余源（openalex/crossref/pmc/core/europepmc/google_scholar/pubmed 等）:
+          后端无全文或仅元数据 → 自动走 fallback 链：pdf_url 下载 PDF → url/doi 落地页
+          → Unpaywall OA PDF → jina/tavily/firecrawl 网页抓取，全程无需人工干预
         - zhihuiya: 元数据级 read（abstract+著录），全文请用 doi 走 download_paper_to_knowledge
-        - tavily/firecrawl: web 搜索结果，paper_id 含原始 id（如 arxiv:xxx）时按对应源处理
+        - tavily/firecrawl: web 搜索结果，paper_id 含原始前缀（arxiv:xxx/pmid:xxx）时自动按对应源处理
         :param source: search 结果的 source 字段
         :param paper_id: search 结果的 paper_id 字段
-        :param pdf_url: search 结果的 pdf_url 字段（强烈建议总是提供，作 fallback）
+        :param pdf_url: search 结果的 pdf_url 字段（有就必须传，PDF 提取是最高质量 fallback）
         :param max_chars: 最大返回字符数
         """
         try:
@@ -1979,7 +2016,7 @@ class Tools:
         except (TypeError, ValueError):
             max_chars = 25000
 
-        src = (source or "").strip().lower()
+        src, paper_id = self._normalize_read_source(source, paper_id)
         backend_tool = self._READ_TOOLS.get(src)
         backend_err = ""
 
@@ -2084,23 +2121,171 @@ class Tools:
                     return text[:max_chars] + (
                         "\n\n[…全文截断…]" if len(text) > max_chars else ""
                     )
-                return json.dumps({"error": "PDF 提取为空（扫描版图片 PDF）"}, ensure_ascii=False)
+                backend_err = f"{backend_err}；PDF 提取为空（扫描版图片 PDF）".strip("；")
             except Exception as e:
-                return json.dumps(
-                    {
-                        "error": f"全文获取失败。{backend_err}；PDF fallback 失败: {e}",
-                        "hint": "可尝试 download_paper_to_knowledge 走完整 OA fallback 链（含 Unpaywall/Sci-Hub）",
-                    },
-                    ensure_ascii=False,
+                backend_err = f"{backend_err}；PDF fallback 失败: {e}".strip("；")
+
+        # ---- 网页抓取 fallback：落地页 → Unpaywall OA PDF → jina/tavily/firecrawl ----
+        # 对无后端全文工具 / 后端返回"不支持"提示 / PDF 付费墙的源自动兜底，不返回死路错误。
+        landing = ""
+        doi = ""
+        if src == "crossref" and paper_id:
+            doi = paper_id.lstrip("doi:")
+        elif src == "openalex" and paper_id:
+            landing = f"https://openalex.org/{paper_id}"
+        elif src == "pubmed" and paper_id:
+            landing = f"https://pubmed.ncbi.nlm.nih.gov/{paper_id}/"
+        elif src == "pmc" and paper_id:
+            landing = f"https://www.ncbi.nlm.nih.gov/pmc/articles/{paper_id}/"
+        elif src == "web" and paper_id:
+            landing = paper_id if paper_id.startswith("http") else ""
+
+        # Unpaywall：有 DOI 就查 OA PDF 直链（pdf_url 缺失或已失败都回退到这里）
+        if doi:
+            oa = await self._resolve_oa_pdf(doi)
+            if oa and oa != pdf_url:  # 与已失败的 pdf_url 不同才重试
+                oa_text = ""
+                try:
+                    def _fetch_oa():
+                        r = requests.get(oa, timeout=120, headers={"User-Agent": "Mozilla/5.0"})
+                        r.raise_for_status()
+                        if not r.content.startswith(b"%PDF"):
+                            raise RuntimeError("OA 链接非 PDF")
+                        return self._pdf_to_text(r.content)
+                    oa_text = await anyio.to_thread.run_sync(_fetch_oa)
+                except Exception:
+                    oa_text = ""
+                if oa_text:
+                    return oa_text[:max_chars] + (
+                        "\n\n[…全文截断…]" if len(oa_text) > max_chars else ""
+                    )
+                # OA 链接是 HTML 落地页（如 sciencedirect /pdf 反爬）→ 网页抓取它
+                ch, oa_web = await self._web_read_fallback(oa, __user__)
+                if oa_web:
+                    note = f"[经 {ch} 网页抓取 OA 全文：{oa}]"
+                    return f"{note}\n\n" + oa_web[:max_chars] + (
+                        "\n\n[…全文截断…]" if len(oa_web) > max_chars else ""
+                    )
+
+        # 网页抓取三级链（jina → tavily → firecrawl），目标 URL：落地页或 doi.org 跳转
+        if not landing and doi:
+            landing = f"https://doi.org/{doi}"
+        if landing:
+            channel, text = await self._web_read_fallback(landing, __user__)
+            if text:
+                note = f"[经 {channel} 网页抓取全文：{landing}]"
+                return f"{note}\n\n" + text[:max_chars] + (
+                    "\n\n[…全文截断…]" if len(text) > max_chars else ""
                 )
+            backend_err = f"{backend_err}；网页抓取（jina/tavily/firecrawl）失败".strip("；")
 
         return json.dumps(
             {
                 "error": backend_err or "无可用全文途径",
-                "hint": "请从 search_papers 结果中同时传入 pdf_url 重试",
+                "hint": "请从 search_papers 结果中同时传入 pdf_url（和 url）重试；或 download_paper_to_knowledge 走完整 OA fallback 链",
             },
             ensure_ascii=False,
         )
+
+    # ---------- 网页全文抓取 fallback（read_paper 用）----------
+    # 三级链：jina reader（keyless 20RPM/有 key 500RPM，无需配置即可用，对付费墙页面常能
+    # 拿到摘要/全文）→ tavily /extract（配 tavily_base_url 才启用）→ firecrawl_scrape
+    # （配 firecrawl_base_url 才启用，onlyMainContent 去噪）。借鉴 reach-mcp 的 jina.py。
+    def _jina_key(self, __user__=None) -> str:
+        uv = __user__.get("valves") if __user__ else None
+        user_key = (getattr(uv, "jina_api_key", "") or "").strip() if uv else ""
+        return user_key or (getattr(self.valves, "jina_api_key", "") or "").strip()
+
+    async def _jina_read(self, url: str, __user__=None, timeout: int = 45) -> str:
+        """r.jina.ai 网页转 markdown 文本。失败/过短返回 ""。"""
+        key = self._jina_key(__user__)
+        def _fetch():
+            headers = {"Accept": "text/plain", "X-Retain-Images": "none"}
+            if key:
+                headers["Authorization"] = f"Bearer {key}"
+            r = requests.get(f"https://r.jina.ai/{url}", headers=headers, timeout=timeout)
+            if r.status_code != 200:
+                return ""
+            return r.text or ""
+        try:
+            text = await anyio.to_thread.run_sync(_fetch)
+        except Exception:
+            return ""
+        return text.strip()
+
+    async def _tavily_extract_read(self, url: str, __user__=None, timeout: int = 45) -> str:
+        """tavily /extract 抓单 URL，返回 results[0].raw_content。失败返回 ""。"""
+        base = self._tavily_base(__user__)
+        if not base:
+            return ""
+        def _fetch():
+            r = requests.post(
+                f"{base}/extract", json={"urls": [url]},
+                headers={"Content-Type": "application/json"}, timeout=timeout,
+            )
+            if r.status_code != 200:
+                return ""
+            return r.json()
+        try:
+            data = await anyio.to_thread.run_sync(_fetch)
+        except Exception:
+            return ""
+        for item in (data or {}).get("results") or []:
+            if isinstance(item, dict) and item.get("raw_content"):
+                return str(item["raw_content"]).strip()
+        return ""
+
+    async def _firecrawl_scrape_read(self, url: str, __user__=None, timeout: int = 60) -> str:
+        """firecrawl_scrape 抓单 URL（formats=["markdown"]），返回 data.markdown。失败返回 ""。"""
+        base = self._firecrawl_base(__user__)
+        if not base:
+            return ""
+        def _fetch():
+            return self._mcp_call_service_url(
+                base, "firecrawl_scrape",
+                {"url": url, "formats": ["markdown"], "onlyMainContent": True},
+                timeout,
+            )
+        try:
+            data = await anyio.to_thread.run_sync(_fetch)
+        except Exception:
+            return ""
+        if isinstance(data, dict):
+            md = (data.get("data") or {}).get("markdown") or data.get("markdown") or ""
+            return str(md).strip()
+        return str(data).strip() if isinstance(data, str) else ""
+
+    # 抓取占位/反爬挑战页特征（命中视为失败，继续下一级）
+    _WEB_JUNK_MARKERS = (
+        "just a moment", "checking your browser", "verify you are human",
+        "attention required", "cloudflare", "access denied", "request blocked",
+        "are you a robot", "captcha",
+    )
+
+    def _is_web_junk(self, text: str) -> bool:
+        """抓取结果是否为反爬挑战页/占位页（短或含特征词）。"""
+        if not text:
+            return True
+        t = text.strip().lower()
+        if len(t) < 500:
+            return True
+        head = t[:1500]  # 挑战页特征词都在开头
+        return any(m in head for m in self._WEB_JUNK_MARKERS)
+
+    async def _web_read_fallback(self, url: str, __user__=None) -> tuple:
+        """三级网页抓取链。返回 (渠道名, 文本)；全失败返回 ("", "")。"""
+        if not url or not url.startswith("http"):
+            return "", ""
+        text = await self._jina_read(url, __user__)
+        if not self._is_web_junk(text):
+            return "jina", text
+        text = await self._tavily_extract_read(url, __user__)
+        if not self._is_web_junk(text):
+            return "tavily", text
+        text = await self._firecrawl_scrape_read(url, __user__)
+        if not self._is_web_junk(text):
+            return "firecrawl", text
+        return "", ""
 
     async def _resolve_oa_pdf(self, doi: str) -> str:
         """用 Unpaywall API 按 DOI 查开放获取 PDF 直链。查不到返回空字符串。"""

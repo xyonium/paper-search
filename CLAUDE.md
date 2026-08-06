@@ -139,6 +139,34 @@ zhihuiya/ieee/firecrawl 在默认列表中，但**必须同时满足两个条件
 - `all` 模式下后端源用 `_BACKEND_ALL_SOURCES`（排除直连源 hal/zhihuiya/patsnap/dblp/zenodo/ieee/openaire）；拆分时语义组用 `_SEMANTIC_ALL_SOURCES`（再排除字面组 doaj/iacr）。
 - 截断发生时返回 `query_adapted` 字段，列出各字面源实际用的精简查询。
 
+### read_paper 全文 fallback 链（v2.7）
+
+`read_paper` 对无后端全文工具/后端仅元数据的源**自动链式降级，不返回死路错误**：
+
+```
+后端 read 工具（arxiv/biorxiv/medrxiv/iacr/semantic/doaj/hal）
+  │ 返回"不支持"提示（_is_unsupported_msg 检测：>200字符+特征词
+  │ "cannot be read directly"/"only metadata"/"metadata and abstracts are available"）
+  ▼
+pdf_url 直接下载 PDF → _pdf_to_text
+  │ 失败（403付费墙/非PDF/扫描版）
+  ▼
+落地页推导：crossref→doi.org/{doi}、openalex→openalex.org/{id}、
+           pubmed→pubmed.ncbi.nlm.nih.gov/{pmid}、pmc→pmc/articles/{pmcid}
+  ▼
+Unpaywall 查 OA 直链（有 DOI 时）→ 是PDF下载 / 非PDF落地页则网页抓取它
+  ▼
+网页抓取三级链 _web_read_fallback：jina reader（r.jina.ai，keyless 20RPM，
+  配 jina_api_key 500RPM）→ tavily /extract（配 tavily_base_url）→
+  firecrawl_scrape（配 firecrawl_base_url，onlyMainContent 去噪，能绕 acs.org 付费墙）
+  反爬挑战页/占位页用 _is_web_junk 拦截（<500字符 或 开头含 just a moment/captcha/cloudflare 等）
+```
+
+- **前缀规范化** `_normalize_read_source`：firecrawl/tavily 的 paper_id 保留原始前缀（`arxiv:xxx`/`pmid:xxx`/`doi:xxx`），据此还原到对应源再处理（`pmid:40403180`→pubmed、`arxiv:xxx`→arxiv）。
+- **jina reader** 借鉴 reach-mcp `jina.py`：`https://r.jina.ai/{url}`，`Accept: text/plain` + `X-Retain-Images: none`，keyless 免费 20 RPM。对 pubmed/openalex 落地页有效；对 acs.org/doi.org 付费墙返回挑战页（被 junk 拦截，落 firecrawl）。
+- 成功时返回前缀标注来源：`[经 jina 网页抓取全文：url]` / `[经 firecrawl 网页抓取 OA 全文：url]`。
+- google_scholar（paper_id=`gs_xxx` 无 DOI/url/PDF）是唯一仍报错的源——无任何可推导 URL，属合理死路。
+
 | Platform | Search | Read Tool | Native Download | Notes |
 |---|---|---|---|---|
 | **arXiv** | ✅ | `read_arxiv_paper` | ✅ | Open PDF, fast & reliable |
