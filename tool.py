@@ -589,23 +589,45 @@ class Tools:
     async def _ieee_search(self, query: str, limit: int, key: str) -> list:
         """直连 IEEE Xplore REST API（需 apikey）。返回 metadata 级结果（abstract+著录），
         pdf_url 为 ieeexplore stamp 页（需机构访问才能下载 PDF）。
-        绕后端 ieee.py 骨架（raise NotImplementedError，无实际 API 调用）。"""
+        绕后端 ieee.py 骨架（raise NotImplementedError，无实际 API 调用）。
+        实测（2026-08，host/容器均复现）：IEEE API 对含常见词的较长 querytext 会间歇性
+        挂起连接（~80s 后 SSL EOF / Read timeout），同查询重试即恢复 → 与 dblp 一致，
+        网络类错误最多重试3次，退避 2s/4s。"""
+        max_attempts = 3
+        backoff = [2, 4]
+
         def _fetch():
-            r = requests.get(
-                self._IEEE_SEARCH_URL,
-                params={
-                    "apikey": key,
-                    "querytext": query,
-                    "max_records": max(1, min(int(limit), 200)),
-                    "format": "json",
-                    "sort_order": "desc",
-                    "sort_field": "relevance",
-                },
-                headers={"Accept": "application/json"},
-                timeout=30,
-            )
-            r.raise_for_status()
-            return r.json()
+            last_exc = None
+            for attempt in range(max_attempts):
+                try:
+                    r = requests.get(
+                        self._IEEE_SEARCH_URL,
+                        params={
+                            "apikey": key,
+                            "querytext": query,
+                            "max_records": max(1, min(int(limit), 200)),
+                            "format": "json",
+                            "sort_order": "desc",
+                            "sort_field": "relevance",
+                        },
+                        headers={"Accept": "application/json"},
+                        timeout=30,
+                    )
+                    if r.status_code == 200:
+                        return r.json()
+                    if r.status_code in (429, 500, 502, 503, 504):
+                        last_exc = RuntimeError(f"IEEE HTTP {r.status_code}")
+                    else:
+                        # 4xx（如 401 key 无效/403 超限）不重试，直接失败
+                        r.raise_for_status()
+                except Exception as e:
+                    if isinstance(e, requests.exceptions.HTTPError):
+                        raise  # 4xx 不重试
+                    last_exc = e
+                if attempt < max_attempts - 1:
+                    import time
+                    time.sleep(backoff[attempt])
+            raise RuntimeError(f"IEEE 检索失败（重试{max_attempts}次）: {last_exc}")
 
         try:
             data = await anyio.to_thread.run_sync(_fetch)

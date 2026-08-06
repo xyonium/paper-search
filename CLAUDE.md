@@ -122,7 +122,7 @@ Default selection in UserValves:
 - `biorxiv/medrxiv` 非关键词检索，返回"该学科近30天新论文"；可用 `biorxiv_category`/`medrxiv_category` 传学科。
 - `dblp` 后端 dblp.py 有 bug（v2.5.3 起改直连 `_dblp_search` 绕过）：并发/快速请求时 dblp 服务器直接断开连接（ConnectionError），后端无重试退避；且后端 dblp.py 无 rate-limit 感知，生产环境 500/ConnectionError 频繁。直连版加 3 次指数退避重试。注意 dblp 是 CS 书目库，仅收录计算机科学文献，非 CS 查询（如生物医学、材料科学）返回 0 属正常，非 bug。
 - `zenodo` 后端 zenodo.py 有 bug（v2.5.3 起改直连 `_zenodo_search` 绕过）：published_date 传 str 给 Paper 对象，Paper.to_dict() 调 `.isoformat()` 崩溃。直连版正确解析日期字符串。Zenodo 是 OA 仓储，多数记录有 PDF。可选配 `zenodo_access_token`（Valves/UserValves）提额/访问受限记录，不配走公共 API（免费但限频）。直连 timeout=60s（公共 API 较慢）。
-- `ieee` 后端 ieee.py 是骨架（v2.5.3 起改直连 `_ieee_search` 绕过）：`raise NotImplementedError` 占位，但 IEEE Xplore 有公开 REST API（`ieeexploreapi.ieee.org`），需配 `ieee_apikey`（Valves 管理员级或 UserValves 个人级）。返回 metadata 级（abstract+著录），OA 论文有 pdf_url 可直接下载，LOCKED 论文需机构访问。
+- `ieee` 后端 ieee.py 是骨架（v2.5.3 起改直连 `_ieee_search` 绕过）：`raise NotImplementedError` 占位，但 IEEE Xplore 有公开 REST API（`ieeexploreapi.ieee.org`），需配 `ieee_apikey`（Valves 管理员级或 UserValves 个人级）。返回 metadata 级（abstract+著录），OA 论文有 pdf_url 可直接下载，LOCKED 论文需机构访问。**间歇性挂起实测**（2026-08，host/容器均复现）：含常见词的较长 querytext 偶发挂起（30s read timeout 或 ~80s SSL EOF），同查询重试即 1.5s 恢复，非容器网络问题 → `_ieee_search` 与 dblp 同模式加 3 次退避重试（2s/4s），最坏延迟 ~68s，失败信息标注"重试3次"；4xx 不重试。
 - `all` 模式下后端源用 `_BACKEND_ALL_SOURCES`（排除直连源 hal/zhihuiya/patsnap/dblp/zenodo）；拆分时语义组用 `_SEMANTIC_ALL_SOURCES`（再排除字面组 doaj/iacr）。
 - 截断发生时返回 `query_adapted` 字段，列出各字面源实际用的精简查询。
 
