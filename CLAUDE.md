@@ -96,7 +96,9 @@ Maps server name `"papers"` to `http://mcp:8000/papers`:
 
 ### Verified Active Sources
 Default selection in UserValves:
-`default_sources = "arxiv,pubmed,iacr,semantic,crossref,openalex,pmc,core,europepmc,dblp,openaire,doaj,hal"`
+`default_sources = "arxiv,pubmed,iacr,semantic,crossref,openalex,pmc,core,europepmc,dblp,openaire,doaj,hal,zenodo,google_scholar"`
+
+zhihuiya（配 `zhihuiya_apikey`）与 ieee（配 `ieee_apikey`）自 v2.5.4 起**加回默认**——配了 key 自动生效，未配则该源静默跳过（`want_zh`/`want_ieee` 为 False）。google_scholar 同批加回默认（无 proxy 可能 403，失败自动降级不影响整体）。
 
 ### Query Adaptation（查询特性，v2.5.0+）
 
@@ -124,7 +126,7 @@ Default selection in UserValves:
 - `zenodo` 后端 zenodo.py 有 bug（v2.5.3 起改直连 `_zenodo_search` 绕过）：published_date 传 str 给 Paper 对象，Paper.to_dict() 调 `.isoformat()` 崩溃。直连版正确解析日期字符串。Zenodo 是 OA 仓储，多数记录有 PDF。可选配 `zenodo_access_token`（Valves/UserValves）提额/访问受限记录，不配走公共 API（免费但限频）。直连 timeout=60s（公共 API 较慢）。
 - `ieee` 后端 ieee.py 是骨架（v2.5.3 起改直连 `_ieee_search` 绕过）：`raise NotImplementedError` 占位，但 IEEE Xplore 有公开 REST API（`ieeexploreapi.ieee.org`），需配 `ieee_apikey`（Valves 管理员级或 UserValves 个人级）。返回 metadata 级（abstract+著录），OA 论文有 pdf_url 可直接下载，LOCKED 论文需机构访问。**间歇性挂起实测**（2026-08，host/容器均复现）：含常见词的较长 querytext 偶发挂起（30s read timeout 或 ~80s SSL EOF），同查询重试即 1.5s 恢复，非容器网络问题 → `_ieee_search` 与 dblp 同模式加 3 次退避重试（2s/4s），最坏延迟 ~68s，失败信息标注"重试3次"；4xx 不重试。
 - `openaire` 后端 openaire.py 双 bug（v2.5.4 起改直连 `_openaire_search` 绕过，2026-08 实测 100% 必现，非慢/非网络）：路径1 `search/researchProducts` 端点已废弃 404（Tomcat 报错）；路径2 legacy fallback 用 `query=` 参数，OpenAIRE API 只认 `keywords=` → 400 Bad Request。直连版用 `search/publications?keywords=`，返回结构 `response.results.result[].metadata.oaf:entity.oaf:result`（title/creator/pid 为 dict 或 dict 列表，文本在 `$` 键，doi 取 `pid[@classid=doi]`）。OpenAIRE 是欧洲仓储聚合，OA 记录有 pdf_url。无 abstract 字段（API 不返回）。
-- **firecrawl 兜底**（v2.5.4 新增，Valves/UserValves `firecrawl_fallback` 开关，默认开）：任一**请求的源**出现连接/超时类错误（匹配 超时/timeout/ssl/eof/connection/502/503/504/429 等；0 命中或 400 参数错不触发）时，经 mcpo `firecrawl_research_search_papers` 用 **original** 查询兜底（firecrawl 内部有查询处理，无需截断）。结果标注 `source="firecrawl"`，`paper_id` 保留原始 id（如 `arxiv:xxx`）。定位：只在主链出现网络类失败时补位，不替代结构化 API 源。
+- **web 搜索兜底**（v2.5.4 新增）：任一**请求的源**出现连接/超时类错误（匹配 超时/timeout/ssl/eof/connection/502/503/504/429；0 命中或 400 参数错不触发）时触发。后端选择：`tavily_base_url` 配了走 **tavily**（优先，`POST {tavily_base_url}/search`，经 api-key-rotator 代理 key 池轮转），否则 `firecrawl_base_url` 配了走 **firecrawl**（mcpo `firecrawl_research_search_papers`），都不配则不启用（无独立开关）。查询用 **original**（tavily/firecrawl 内部有查询处理，无需截断）。结果 `source="tavily"/"firecrawl"`，`paper_id` 从 URL 提取（arxiv/ieee/pubmed/aclanthology/doi/biorxiv 模式），tavily 另从 `raw_content` 正则回填 doi。**tavily vs firecrawl 实测对比**（2026-08，同查询）：tavily 返回结构化 JSON（url/title/content/score）+ 支持 `include_domains` 限定学术站（arxiv/ieee/aclanthology 等 12 域名），实测 5 条全中高相关；firecrawl research 返回 Markdown 需正则解析、无域名限定。故 tavily 优先。注意：tavily `include_domains` 为软提示（服务端可能返回域名外结果，如德国图书馆仓储），rotator 原样透传请求体不干预。
 - **境外学术 API 间歇性不稳定**（2026-08 实测）：出口链路对突发并发 TLS 流不稳（疑似中间设备 RST/限速），后端 mcpo 一次 fan-out 11 源时随机个别 host（eutils/openaire/ieee 轮流）SSL EOF 或握手超时，同请求重试即恢复 → `_mcp_call` 超时后自动重试 1 次（+3s），直连源均带 3 次退避。
 - `all` 模式下后端源用 `_BACKEND_ALL_SOURCES`（排除直连源 hal/zhihuiya/patsnap/dblp/zenodo/ieee/openaire）；拆分时语义组用 `_SEMANTIC_ALL_SOURCES`（再排除字面组 doaj/iacr）。
 - 截断发生时返回 `query_adapted` 字段，列出各字面源实际用的精简查询。

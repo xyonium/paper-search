@@ -175,15 +175,19 @@ class Tools:
             default="",
             description="Zenodo Access Token（管理员级，可选；配了额度更高/可访问受限记录，留空走公共 API）",
         )
-        firecrawl_fallback: bool = Field(
-            default=True,
-            description="源出现连接/超时错误时，经 mcpo 调 firecrawl_research_search_papers 兜底（走 firecrawl 源，结果标注 source=firecrawl）",
+        firecrawl_base_url: str = Field(
+            default="",
+            description="mcpo firecrawl 服务 base URL（如 http://mcp:8000/firecrawl；配了才启用 web 搜索兜底，留空则不启用）。优先级低于 tavily_base_url",
+        )
+        tavily_base_url: str = Field(
+            default="",
+            description="tavily 代理 base URL（如 http://api-key-rotator:8788/tavily，配了才启用 web 搜索兜底，留空则不启用）。配了则优先于 firecrawl",
         )
 
     class UserValves(BaseModel):
         default_sources: str = Field(
-            default="arxiv,pubmed,iacr,semantic,crossref,openalex,pmc,core,europepmc,dblp,openaire,doaj,hal,zenodo",
-            description="默认搜索源：'all'=全部21源（慢，30s+）；或逗号分隔子集。默认未包含的源：google_scholar,citeseerx,ssrn,base,acm,unpaywall；zhihuiya 需配 zhihuiya_apikey，ieee 需配 ieee_apikey；biorxiv/medrxiv 为学科近30天浏览（非关键词检索），需 sources+biorxiv_category 显式调用",
+            default="arxiv,pubmed,iacr,semantic,crossref,openalex,pmc,core,europepmc,dblp,openaire,doaj,hal,zenodo,google_scholar",
+            description="默认搜索源：'all'=全部21源（慢，30s+）；或逗号分隔子集。默认未包含的源：citeseerx,ssrn,base,acm,unpaywall；biorxiv/medrxiv 为学科近30天浏览（非关键词检索），需 sources+biorxiv_category 显式调用。zhihuiya（配 zhihuiya_apikey）与 ieee（配 ieee_apikey）已加回默认，配了 key 自动生效",
         )
         knowledge_id: str = Field(
             default="", description="下载 PDF 自动加入的 Knowledge 集合 ID"
@@ -215,9 +219,13 @@ class Tools:
             description="Zenodo Access Token（个人级，非空时覆盖管理员 token）",
             json_schema_extra={"input": {"type": "password"}},
         )
-        firecrawl_fallback: bool = Field(
-            default=True,
-            description="源出现连接/超时错误时启用 firecrawl 兜底（个人级，可覆盖管理员设置）",
+        firecrawl_base_url: str = Field(
+            default="",
+            description="web 搜索兜底的 firecrawl base URL（个人级，非空时覆盖管理员；留空用管理员配置）",
+        )
+        tavily_base_url: str = Field(
+            default="",
+            description="web 搜索兜底的 tavily base URL（个人级，非空时覆盖管理员；留空用管理员配置）",
         )
 
     # 覆盖全部 21 个源 + 可选 IEEE/ACM（配 key 后动态注册）
@@ -880,11 +888,18 @@ class Tools:
             })
         return papers
 
-    # ---------- firecrawl 兜底（经 mcpo 直连，绕后端 papers 服务）----------
+    # ---------- web 搜索兜底（tavily 优先，firecrawl 备选；配了 base_url 才启用）----------
     _FC_NET_ERR_MARKERS = (
         "超时", "timed out", "timeout", "ssl", "eof", "connection", "refused",
         "reset", "unreachable", "dns", "502", "503", "504", "429",
     )
+    # 学术站点域名（tavily include_domains / firecrawl site: 共用）
+    _ACADEMIC_DOMAINS = [
+        "arxiv.org", "ieeexplore.ieee.org", "aclanthology.org",
+        "semanticscholar.org", "openreview.net", "dl.acm.org",
+        "link.springer.com", "sciencedirect.com", "pubmed.ncbi.nlm.nih.gov",
+        "nature.com", "biorxiv.org", "medrxiv.org",
+    ]
 
     def _net_failed_sources(self, errors: dict) -> list:
         """从 errors dict 挑出连接/超时类失败的源（0 命中/400 参数错不算）。"""
@@ -895,22 +910,123 @@ class Tools:
                 out.append(src)
         return out
 
-    def _firecrawl_fallback_enabled(self, __user__=None) -> bool:
+    def _web_fallback_backend(self, __user__=None) -> str:
+        """返回 "tavily" / "firecrawl" / ""。UserValves 覆盖 Valves；两者都配则 tavily 优先。"""
         uv = __user__.get("valves") if __user__ else None
-        user_v = getattr(uv, "firecrawl_fallback", None) if uv else None
-        admin_v = getattr(self.valves, "firecrawl_fallback", True)
-        return bool(user_v if user_v is not None else admin_v)
+        tavily = (getattr(uv, "tavily_base_url", "") or "").strip() if uv else ""
+        tavily = tavily or (getattr(self.valves, "tavily_base_url", "") or "").strip()
+        if tavily:
+            return "tavily"
+        fc = (getattr(uv, "firecrawl_base_url", "") or "").strip() if uv else ""
+        fc = fc or (getattr(self.valves, "firecrawl_base_url", "") or "").strip()
+        return "firecrawl" if fc else ""
+
+    def _tavily_base(self, __user__=None) -> str:
+        uv = __user__.get("valves") if __user__ else None
+        u = (getattr(uv, "tavily_base_url", "") or "").strip() if uv else ""
+        return (u or (getattr(self.valves, "tavily_base_url", "") or "").strip()).rstrip("/")
+
+    def _firecrawl_base(self, __user__=None) -> str:
+        uv = __user__.get("valves") if __user__ else None
+        u = (getattr(uv, "firecrawl_base_url", "") or "").strip() if uv else ""
+        return (u or (getattr(self.valves, "firecrawl_base_url", "") or "").strip()).rstrip("/")
+
+    async def _web_search_fallback(self, query: str, limit: int, __user__=None) -> list:
+        """web 搜索兜底。tavily（JSON，支持 include_domains）优先，否则 firecrawl research（Markdown）。"""
+        backend = self._web_fallback_backend(__user__)
+        if backend == "tavily":
+            return await self._tavily_search_papers(query, limit, __user__)
+        if backend == "firecrawl":
+            return await self._firecrawl_search_papers(query, limit, __user__)
+        return []
+
+    def _tavily_call(self, body: dict, __user__=None, timeout: int = 60):
+        """POST tavily /search（经 api-key-rotator 代理，key 池轮转）。"""
+        base = self._tavily_base(__user__)
+        try:
+            resp = requests.post(f"{base}/search", json=body,
+                                 headers={"Content-Type": "application/json"},
+                                 timeout=timeout)
+            resp.raise_for_status()
+            return resp.json()
+        except requests.exceptions.Timeout:
+            raise RuntimeError(f"tavily 搜索超时 ({timeout}s)")
+        except requests.exceptions.RequestException as e:
+            raise RuntimeError(f"tavily 搜索失败: {e}")
+
+    async def _tavily_search_papers(self, query: str, limit: int, __user__=None) -> list:
+        """tavily /search，include_domains 限定学术站点，返回结构化 paper dict。"""
+        data = await anyio.to_thread.run_sync(
+            self._tavily_call,
+            {"query": query, "max_results": max(1, min(int(limit), 10)),
+             "search_depth": "advanced", "include_domains": self._ACADEMIC_DOMAINS},
+            __user__, 60)
+        papers = []
+        for r in (data or {}).get("results") or []:
+            if not isinstance(r, dict):
+                continue
+            title = str(r.get("title") or "").strip()
+            url = str(r.get("url") or "")
+            if not title or not url:
+                continue
+            # raw_content 里常有 doi（arXiv/IEEE/出版社页面），有则回填
+            raw = str(r.get("raw_content") or "")
+            doi = ""
+            m = re.search(r"\bdoi[.:]\s*(10\.\d{4,9}/[^\s\"<>]+)", raw, re.I) or \
+                re.search(r"doi\.org/(10\.\d{4,9}/[^\s\"<>]+)", raw)
+            if m:
+                doi = m.group(1).rstrip(".,;)")
+            papers.append({
+                "title": title,
+                "authors": "",
+                "published_date": str(r.get("published_date") or ""),
+                "abstract": str(r.get("content") or "").strip(),
+                "paper_id": self._paper_id_from_url(url),
+                "doi": doi,
+                "source": "tavily",
+                "pdf_url": "",
+                "citations": 0,
+                "url": url,
+            })
+        return papers
+
+    @staticmethod
+    def _paper_id_from_url(url: str) -> str:
+        """从学术 URL 提取 paper_id。arXiv/ieee/pubmed/aclanthology/springer/doi 优先。"""
+        m = re.search(r"arxiv\.org/(?:abs|html|pdf)/([0-9]{4}\.[0-9]{4,5})", url)
+        if m:
+            return f"arxiv:{m.group(1)}"
+        m = re.search(r"ieeexplore\.ieee\.org/document/(\d+)", url)
+        if m:
+            return f"ieee:{m.group(1)}"
+        m = re.search(r"pubmed\.ncbi\.nlm\.nih\.gov/(\d+)", url)
+        if m:
+            return f"pubmed:{m.group(1)}"
+        m = re.search(r"aclanthology\.org/([A-Za-z0-9.\-]+?)(?:\.pdf)?/?$", url)
+        if m and not m.group(1).lower() in ("", "anthology"):
+            return f"aclanthology:{m.group(1)}"
+        m = re.search(r"doi\.org/(10\.\d{4,9}/[^\s?#]+)", url)
+        if m:
+            return f"doi:{m.group(1)}"
+        m = re.search(r"biorxiv\.org/content/(10\.\d{4,9}/[^\s?#]+?)(?:\.full)?(?:\.pdf)?$", url)
+        if m:
+            return f"biorxiv:{m.group(1)}"
+        return f"web:{url[-60:]}"
 
     def _mcp_call_service(self, service: str, tool: str, args: dict, timeout: int = 90):
-        """调 mcpo 上非 papers 的服务（如 firecrawl）。mcpo_url 为 .../papers 时替换尾段。"""
+        """调 mcpo 上非 papers 的服务。mcpo_url 为 .../papers 时替换尾段。"""
         base = self.valves.mcpo_url.rstrip("/")
         if base.endswith("/papers"):
             base = base[: -len("/papers")]
+        return self._mcp_call_service_url(f"{base}/{service}", tool, args, timeout)
+
+    def _mcp_call_service_url(self, base_url: str, tool: str, args: dict, timeout: int = 90):
+        """调指定 base URL 的 mcpo 工具端点：POST {base_url}/{tool}。"""
         headers = {}
         if self.valves.mcpo_api_key:
             headers["Authorization"] = f"Bearer {self.valves.mcpo_api_key}"
         try:
-            resp = requests.post(f"{base}/{service}/{tool}", json=args,
+            resp = requests.post(f"{base_url.rstrip('/')}/{tool}", json=args,
                                  headers=headers, timeout=timeout)
             resp.raise_for_status()
             try:
@@ -921,14 +1037,16 @@ class Tools:
                 return data["result"]
             return data
         except requests.exceptions.Timeout:
-            raise RuntimeError(f"mcpo {service}/{tool} 超时 ({timeout}s)")
+            raise RuntimeError(f"mcpo {base_url}/{tool} 超时 ({timeout}s)")
         except requests.exceptions.RequestException as e:
-            raise RuntimeError(f"mcpo {service}/{tool} 失败: {e}")
+            raise RuntimeError(f"mcpo {base_url}/{tool} 失败: {e}")
 
-    async def _firecrawl_search_papers(self, query: str, limit: int) -> list:
-        """firecrawl_research_search_papers 兜底：返回 Markdown 文本，解析成 paper dict。"""
+    async def _firecrawl_search_papers(self, query: str, limit: int, __user__=None) -> list:
+        """firecrawl_research_search_papers 兜底：返回 Markdown 文本，解析成 paper dict。
+        base URL 用 Valves/UserValves.firecrawl_base_url（配了才走到这里）。"""
+        base = self._firecrawl_base(__user__)
         raw = await anyio.to_thread.run_sync(
-            self._mcp_call_service, "firecrawl", "firecrawl_research_search_papers",
+            self._mcp_call_service_url, base, "firecrawl_research_search_papers",
             {"query": query, "k": max(1, min(int(limit), 10))}, 90)
         text = raw if isinstance(raw, str) else json.dumps(raw, ensure_ascii=False)
         papers = []
@@ -1129,7 +1247,7 @@ class Tools:
         src = (
             sources
             or (uv.default_sources if uv else None)
-            or "arxiv,semantic,openalex,pubmed,pmc,core,europepmc"
+            or "arxiv,semantic,openalex,pubmed,pmc,core,europepmc,google_scholar"
         )
         src_set = {s.strip().lower() for s in src.split(",") if s.strip()}
         all_mode = src.strip().lower() == "all"
@@ -1337,19 +1455,21 @@ class Tools:
             if adapted:
                 out["query_adapted"] = adapted
 
-        # ---- firecrawl 兜底：任一请求的源出现连接/超时类错误时触发（0 命中不算）----
+        # ---- web 搜索兜底（tavily 优先/firecrawl 备选，配了 base_url 才启用）：
+        #      任一请求的源出现连接/超时类错误时触发（0 命中/400 参数错不算）----
         failed_net = self._net_failed_sources(errors)
-        if failed_net and self._firecrawl_fallback_enabled(__user__):
+        web_backend = self._web_fallback_backend(__user__)
+        if failed_net and web_backend:
             try:
-                fc_papers = await self._firecrawl_search_papers(original, max_results_per_source)
-                if fc_papers:
-                    papers.extend(fc_papers)
-                    source_results["firecrawl"] = len(fc_papers)
+                wp = await self._web_search_fallback(original, max_results_per_source, __user__)
+                if wp:
+                    papers.extend(wp)
+                    source_results[web_backend] = len(wp)
                     out["total"] = len(papers)
                     out["source_results"] = source_results
                     out["papers"] = papers
             except Exception as e:
-                errors["firecrawl"] = f"firecrawl 兜底失败: {str(e)[:200]}"
+                errors[web_backend] = f"{web_backend} 兜底失败: {str(e)[:200]}"
                 out["errors"] = errors
 
         return json.dumps(out, ensure_ascii=False, indent=2)
