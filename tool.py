@@ -1279,10 +1279,10 @@ class Tools:
                 "citations": 0,
                 "url": url,
             })
-        # 富化 authors/year/doi（tavily 无 authors；paper_id 前缀可查 inspect_paper 时补）
-        for p in papers:
+        # 富化 authors/year/doi（tavily 无 authors；paper_id 前缀可查 inspect 时补，并行 gather）
+        async def _enrich(p):
             if p["authors"] and p["published_date"]:
-                continue
+                return
             meta = await self._research_inspect(p["paper_id"], __user__)
             if meta.get("authors") and not p["authors"]:
                 p["authors"] = meta["authors"]
@@ -1290,6 +1290,7 @@ class Tools:
                 p["published_date"] = meta["year"]
             if meta.get("doi") and not p["doi"]:
                 p["doi"] = meta["doi"]
+        await asyncio.gather(*(_enrich(p) for p in papers), return_exceptions=True)
         return papers
 
     @staticmethod
@@ -1443,8 +1444,9 @@ class Tools:
                 "citations": 0,
                 "url": "",
             })
-        # 富化 authors/year/doi（inspect_paper 按 id 查；pmid/pmcid/arxiv 前缀覆盖好）
-        for p in papers:
+        # 富化 authors/year/doi（inspect_paper 逐条查，无批量参数；并行 gather 避免串行 N 次往返）
+        # pmid/pmcid/arxiv 前缀覆盖好，doi 前缀部分覆盖不到
+        async def _enrich(p):
             meta = await self._research_inspect(p["paper_id"], __user__)
             if meta.get("authors"):
                 p["authors"] = meta["authors"]
@@ -1452,6 +1454,7 @@ class Tools:
                 p["published_date"] = meta["year"]
             if meta.get("doi"):
                 p["doi"] = meta["doi"]
+        await asyncio.gather(*(_enrich(p) for p in papers), return_exceptions=True)
         return papers
 
     def _mcp_call(self, tool: str, args: dict, timeout: int = 180, _retried: bool = False):
