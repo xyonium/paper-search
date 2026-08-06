@@ -1,31 +1,28 @@
 """
 title: Academic Paper Search
-description: 学术论文搜索、全文阅读、PDF 下载入 Knowledge（RAG）。智慧芽文献/专利 + IEEE Xplore（有 key 自动启用）+ arXiv/PubMed/Semantic Scholar/OpenAlex/CORE/HAL/dblp/Zenodo/IACR/DOAJ/OpenAIRE/Europe PMC/Crossref/PMC，内置 OA fallback 下载链。
+description: 学术论文搜索、全文阅读、PDF 下载入 Knowledge（RAG）。16 个学术源 + 智慧芽文献/专利 + IEEE Xplore + web 搜索兜底（tavily/firecrawl）。单源失败不影响整体，源连接错误时自动用 tavily→firecrawl 补位。
 
   【搜索源清单】（search_papers 的 sources 参数可用值，'all' 为全部）：
   · 预印本/开放获取（可搜可读全文）: arxiv, iacr, pmc, europepmc
-  · 综合索引: semantic (Semantic Scholar), openalex, crossref, pubmed, core,
-    openaire, doaj, hal, dblp (CS书目), zenodo (OA仓储，可选 zenodo_access_token 提额)
-  · 学科新论文浏览（非关键词检索，默认不启用，sources+biorxiv_category 显式用）: biorxiv, medrxiv
-  · 支持搜索但端点死/反爬/不稳（默认不启用，失败自动降级）: google_scholar, ssrn, base, citeseerx
-  · 支持搜索但未实现（配 key 也报错，不可用）: acm
-  · 仅 DOI 查询（不支持关键词搜索，用于 download fallback 链查 OA PDF）: unpaywall
-  · 智慧芽（需配 zhihuiya_apikey，有 key 自动启用）: zhihuiya
-  · IEEE Xplore（需配 ieee_apikey，有 key 自动启用，直连 REST API）: ieee
-  · 智慧芽专利（独立工具 search_patents/read_patent，同 key 启用）: patsnap
+  · 综合索引: semantic, openalex, crossref, pubmed, core, openaire, doaj, hal,
+    dblp (CS书目), zenodo (OA仓储)
+  · 需配 key/url 才启用（未配静默跳过）: zhihuiya (zhihuiya_apikey),
+    ieee (ieee_apikey), firecrawl (firecrawl_base_url，web文献检索)
+  · 学科新论文浏览（非关键词检索，需 sources+biorxiv_category 显式用）: biorxiv, medrxiv
+  · 不稳定（可能 403/超时，失败自动降级）: google_scholar, ssrn, base, citeseerx
+  · 不可用: acm（未实现）, unpaywall（仅DOI查询，用于下载 fallback）
 
-  【查询适配】search_papers 自动按源分发查询变体（不损语义）：
-  · 语义源（openalex/semantic/crossref/pmc/europepmc/pubmed/arxiv/openaire(直连)/core/patsnap）
-    → 用原始完整查询
-  · 字面源（zhihuiya/doaj/iacr）→ 自动去引号/裸露布尔/噪声词，精简为核心术语
-    （长自然语言查询在这些源会 0 命中，精简后恢复）
-  · hal/dblp/zenodo 已改直连（绕后端 bug），均用 original 查询
-  · biorxiv/medrxiv 非关键词检索，返回"该学科近30天新论文"；
-    可用 biorxiv_category/medrxiv_category 传学科（如 biochemistry）提高相关性
+  【查询适配】search_papers 按源自动分发查询变体（不损语义，LLM 无需处理）：
+  · 大多数源用原始完整查询；zhihuiya/doaj/iacr 对长自然语言会 0 命中，
+    自动精简为核心术语后恢复（返回含 query_adapted 字段说明）
+
+  【web 搜索兜底】源出现连接/超时错误时自动触发，tavily 主 → firecrawl 备，
+  域名限定动态映射自失败源（如 arxiv 失败只补 arxiv.org）。配 tavily_base_url /
+  firecrawl_base_url 启用，返回含 fallback_domains/fallback_limit 字段。
 
   【工具用法】
   1. search_papers(query)      → 多源并发搜索+去重，返回标题/作者/摘要/引用数/pdf_url
-  2. read_paper(source, paper_id, pdf_url) → 读全文（后端工具 + pdf_url 自动 fallback）
+  2. read_paper(source, paper_id, pdf_url) → 读全文（pdf_url 作 fallback，建议总传）
   3. download_paper_to_knowledge(...)      → PDF 下载并加入 Knowledge 知识库
   4. search_patents(query)     → 智慧芽专利语义检索（需配 zhihuiya_apikey）
   5. read_patent(patent_number) → 读专利全文 markdown（权利要求+说明书+法律状态）
@@ -165,11 +162,11 @@ class Tools:
         )
         zhihuiya_apikey: str = Field(
             default="",
-            description="智慧芽(zhihuiya)科学文献 API key（管理员/公司级，留空则不启用该源）",
+            description="智慧芽(zhihuiya)科学文献 API key（管理员/公司级）。需同时在 default_sources 含 zhihuiya 才启用，留空则该源静默跳过",
         )
         ieee_apikey: str = Field(
             default="",
-            description="IEEE Xplore API key（管理员级，留空则不启用 ieee 源）",
+            description="IEEE Xplore API key（管理员级）。需同时在 default_sources 含 ieee 才启用，留空则该源静默跳过",
         )
         zenodo_access_token: str = Field(
             default="",
@@ -177,7 +174,7 @@ class Tools:
         )
         firecrawl_base_url: str = Field(
             default="",
-            description="mcpo firecrawl 服务 base URL（如 http://mcp:8000/firecrawl；配了则启用 firecrawl 独立源——在 sources 里加 firecrawl 生效，无域名限定，内部有查询处理）。留空则不启用",
+            description="mcpo firecrawl 服务 base URL（如 http://mcp:8000/firecrawl）。两个用途：(a) 独立源——需在 default_sources 含 firecrawl；(b) 二级 web 兜底——tavily 未配/失败时自动用。留空则两者都不启用",
         )
         tavily_base_url: str = Field(
             default="",
@@ -1310,17 +1307,13 @@ class Tools:
         """
         搜索学术论文：多源并发查询 + 去重，返回 title/authors/year/source/paper_id/doi/citations/pdf_url/abstract。
         - source+paper_id → read_paper 读全文；doi/pdf_url → download_paper_to_knowledge 入库
-        - 单源失败不影响整体（见返回的 errors 字段）
+        - 单源失败不影响整体（见返回的 errors 字段）；源连接错误自动触发 tavily→firecrawl 兜底
         :param query: 学术检索词，越具体越好（如 'CRISPR base editing off-target'）
-        :param max_results_per_source: 每源条数（默认5，勿调大）
-        :param sources: 留空用默认；或逗号分隔子集，可选值:
-            arxiv, iacr, pmc, europepmc, semantic, openalex, crossref, pubmed,
-            core, openaire, doaj, hal, zenodo, dblp（CS书目，非CS查询可能0结果）,
-            zhihuiya（需配 zhihuiya_apikey）, ieee（需配 ieee_apikey）,
-            firecrawl（web文献检索，需配 firecrawl_base_url，无域名限定）,
-            google_scholar, ssrn, base, citeseerx（端点死/反爬，可能失败）,
-            unpaywall（仅DOI查询，不支持关键词）, acm（骨架未实现）,
-            biorxiv/medrxiv（学科近30天浏览，非关键词检索，需配 biorxiv_category）
+        :param max_results_per_source: 每源条数（默认5）。调大会显著拖慢响应（后端多源并发，
+            每源都要等最慢的那个），一般不建议超过10
+        :param sources: 留空用默认；或逗号分隔子集。可选值见模块顶部【搜索源清单】，
+            常用: arxiv, semantic, openalex, pubmed, pmc, core, europepmc, zhihuiya, ieee,
+            firecrawl, dblp, hal, zenodo, openaire, doaj, iacr, crossref, google_scholar
         :param biorxiv_category: 可选 bioRxiv 学科分类（如 biochemistry, cell_biology,
             bioinformatics, neuroscience 等，空格转下划线）。biorxiv/medrxiv 非关键词检索，
             返回该学科近30天新论文；传学科可提高相关性。
@@ -1709,15 +1702,13 @@ class Tools:
     ) -> str:
         """
         阅读论文全文（截断到 max_chars）。
-        - 后端直接可读: arxiv, biorxiv, medrxiv, iacr, semantic, doaj, hal, openaire
-        - pubmed/crossref 后端仅返回元数据提示，会自动降级用 pdf_url 提取
-        - dblp: 元数据库（无全文），自动用 DOI 查 ee 链接走 PDF fallback
-        - zenodo: 直连搜索（已绕过后端 bug），多数记录有 pdf_url 可直接提取
-        - base/citeseerx: 端点不可达（IP封/已下线），走 pdf_url fallback
-        - pmc, core, europepmc, openalex, google_scholar, ssrn, unpaywall:
+        - 后端直接可读: arxiv, biorxiv, medrxiv, iacr, semantic, doaj, hal
+        - openaire/zenodo/dblp/ieee: 已改直连，自动用 DOI/pdf_url 走 fallback 提取
+        - pubmed/crossref: 后端仅返回元数据提示，自动降级用 pdf_url 提取
+        - pmc, core, europepmc, openalex, google_scholar, ssrn, base/citeseerx:
           请同时传 pdf_url，将自动下载提取全文
-        - zhihuiya（智慧芽）: 元数据级 read（literature_bibliography 取 abstract+著录），
-          全文请用 doi 走 download_paper_to_knowledge 的 OA fallback 链
+        - zhihuiya: 元数据级 read（abstract+著录），全文请用 doi 走 download_paper_to_knowledge
+        - tavily/firecrawl: web 搜索结果，paper_id 含原始 id（如 arxiv:xxx）时按对应源处理
         :param source: search 结果的 source 字段
         :param paper_id: search 结果的 paper_id 字段
         :param pdf_url: search 结果的 pdf_url 字段（强烈建议总是提供，作 fallback）
