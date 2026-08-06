@@ -893,13 +893,52 @@ class Tools:
         "超时", "timed out", "timeout", "ssl", "eof", "connection", "refused",
         "reset", "unreachable", "dns", "502", "503", "504", "429",
     )
-    # 学术站点域名（tavily include_domains / firecrawl site: 共用）
-    _ACADEMIC_DOMAINS = [
-        "arxiv.org", "ieeexplore.ieee.org", "aclanthology.org",
-        "semanticscholar.org", "openreview.net", "dl.acm.org",
-        "link.springer.com", "sciencedirect.com", "pubmed.ncbi.nlm.nih.gov",
-        "nature.com", "biorxiv.org", "medrxiv.org",
-    ]
+    # 源 → 学术域名映射（fallback 的 include_domains 动态限定用）。
+    # 每个源对应其官方/主站点域名；未映射的源不参与域名限定（fallback 用全量域名）。
+    _SOURCE_TO_DOMAINS = {
+        "arxiv": ["arxiv.org"],
+        "biorxiv": ["biorxiv.org"],
+        "medrxiv": ["medrxiv.org"],
+        "iacr": ["eprint.iacr.org"],
+        "semantic": ["semanticscholar.org"],
+        "crossref": ["doi.org"],
+        "openalex": ["openalex.org"],
+        "pubmed": ["pubmed.ncbi.nlm.nih.gov"],
+        "pmc": ["ncbi.nlm.nih.gov"],
+        "europepmc": ["europepmc.org"],
+        "core": ["core.ac.uk"],
+        "openaire": ["explore.openaire.eu"],
+        "doaj": ["doaj.org"],
+        "hal": ["hal.science"],
+        "zenodo": ["zenodo.org"],
+        "dblp": ["dblp.org"],
+        "ieee": ["ieeexplore.ieee.org"],
+        "google_scholar": ["scholar.google.com"],
+        "zhihuiya": ["zhihuiya.com"],
+        "ssrn": ["ssrn.com"],
+        "base": ["base-search.net"],
+        "acm": ["dl.acm.org"],
+    }
+    # 全量学术域名（无源映射信息时的兜底集合）
+    _ACADEMIC_DOMAINS = sorted({d for ds in _SOURCE_TO_DOMAINS.values() for d in ds} | {
+        "aclanthology.org", "openreview.net", "link.springer.com",
+        "sciencedirect.com", "nature.com",
+    })
+
+    def _fallback_domains(self, failed: list, zero: list) -> list:
+        """根据失败/0结果的源动态算出 include_domains。
+        "backend" 是聚合错误（后端 search_papers 整批失败），展开为主要后端源的域名。
+        有映射的源 → 其域名并集；全部无映射 → 全量 _ACADEMIC_DOMAINS。"""
+        srcs = list(dict.fromkeys((failed or []) + (zero or [])))  # 去重保序
+        domains = []
+        for s in srcs:
+            if s == "backend":
+                # 后端批量失败 → 展开为主要后端学术源的域名（arxiv/semantic/pubmed 等）
+                domains.extend(self._ACADEMIC_DOMAINS)
+                continue
+            domains.extend(self._SOURCE_TO_DOMAINS.get(s, []))
+        domains = sorted(set(domains))
+        return domains or self._ACADEMIC_DOMAINS
 
     def _net_failed_sources(self, errors: dict) -> list:
         """从 errors dict 挑出连接/超时类失败的源（0 命中/400 参数错不算）。"""
@@ -929,21 +968,20 @@ class Tools:
         u = (getattr(uv, "firecrawl_base_url", "") or "").strip() if uv else ""
         return (u or (getattr(self.valves, "firecrawl_base_url", "") or "").strip()).rstrip("/")
 
-    async def _web_search_fallback(self, query: str, limit: int, __user__=None) -> tuple:
+    async def _web_search_fallback(self, query: str, limit: int, __user__=None, domains: list = None) -> tuple:
         """web 搜索兜底链：tavily 主 → firecrawl 备。
-        tavily：include_domains 限定 12 学术站，结构化 JSON。
-        firecrawl：firecrawl_search（非 research 端点）+ includeDomains 硬过滤同 12 学术站。
-        tavily 未配/调用失败/返回 0 条时，落到 firecrawl；两者都未配则返回 ("", [])。
+        domains 由 _fallback_domains 根据失败/0结果源动态限定；为 None 时用全量学术域名。
         返回 (backend_name, papers)，backend_name 用于 source 标注。"""
+        domains = domains or self._ACADEMIC_DOMAINS
         if self._web_fallback_backend(__user__) == "tavily":
             try:
-                papers = await self._tavily_search_papers(query, limit, __user__)
+                papers = await self._tavily_search_papers(query, limit, __user__, domains)
                 if papers:
                     return "tavily", papers
             except Exception:
                 pass  # tavily 失败 → 落 firecrawl
         if self._firecrawl_base(__user__):
-            papers = await self._firecrawl_search_domains(query, limit, __user__)
+            papers = await self._firecrawl_search_domains(query, limit, __user__, domains)
             if papers:
                 return "firecrawl", papers
         return "", []
@@ -962,12 +1000,12 @@ class Tools:
         except requests.exceptions.RequestException as e:
             raise RuntimeError(f"tavily 搜索失败: {e}")
 
-    async def _tavily_search_papers(self, query: str, limit: int, __user__=None) -> list:
+    async def _tavily_search_papers(self, query: str, limit: int, __user__=None, domains: list = None) -> list:
         """tavily /search，include_domains 限定学术站点，返回结构化 paper dict。"""
         data = await anyio.to_thread.run_sync(
             self._tavily_call,
             {"query": query, "max_results": max(1, min(int(limit), 10)),
-             "search_depth": "advanced", "include_domains": self._ACADEMIC_DOMAINS},
+             "search_depth": "advanced", "include_domains": domains or self._ACADEMIC_DOMAINS},
             __user__, 60)
         papers = []
         for r in (data or {}).get("results") or []:
@@ -1049,7 +1087,7 @@ class Tools:
         except requests.exceptions.RequestException as e:
             raise RuntimeError(f"mcpo {base_url}/{tool} 失败: {e}")
 
-    async def _firecrawl_search_domains(self, query: str, limit: int, __user__=None) -> list:
+    async def _firecrawl_search_domains(self, query: str, limit: int, __user__=None, domains: list = None) -> list:
         """firecrawl_search（通用 web 搜索）+ includeDomains 硬过滤学术站，fallback 用。
         实测（2026-08）：includeDomains 是硬过滤（5 条全在限定域名内）；site: 操作符返回空不可用。
         返回干净 JSON（url/title/description/position），description 含摘要/著录片段。"""
@@ -1057,7 +1095,7 @@ class Tools:
         raw = await anyio.to_thread.run_sync(
             self._mcp_call_service_url, base, "firecrawl_search",
             {"query": query, "limit": max(1, min(int(limit), 10)),
-             "includeDomains": self._ACADEMIC_DOMAINS}, 60)
+             "includeDomains": domains or self._ACADEMIC_DOMAINS}, 60)
         data = raw if isinstance(raw, dict) else {}
         web = (data.get("data") or {}).get("web") or []
         papers = []
@@ -1519,17 +1557,23 @@ class Tools:
                 out["query_adapted"] = adapted
 
         # ---- web 搜索兜底链：tavily 主 → firecrawl 备：
-        #      任一请求的源出现连接/超时类错误时触发（0 命中/400 参数错不算）----
+        #      触发：任一请求的源出现连接/超时类错误（0 命中/400 参数错不算）。
+        #      域名限定：动态映射自 失败源 ∪ 0结果源（_fallback_domains），非一刀切全量。----
         failed_net = self._net_failed_sources(errors)
         if failed_net and (self._web_fallback_backend(__user__) or self._firecrawl_base(__user__)):
+            zero_srcs = [s for s, n in source_results.items()
+                         if n == 0 and s not in ("tavily", "firecrawl")]
+            fb_domains = self._fallback_domains(failed_net, zero_srcs)
             try:
-                fb_name, wp = await self._web_search_fallback(original, max_results_per_source, __user__)
+                fb_name, wp = await self._web_search_fallback(
+                    original, max_results_per_source, __user__, fb_domains)
                 if wp:
                     papers.extend(wp)
                     source_results[fb_name] = len(wp)
                     out["total"] = len(papers)
                     out["source_results"] = source_results
                     out["papers"] = papers
+                    out["fallback_domains"] = fb_domains  # LLM/用户可见：补位限定了哪些站点
             except Exception as e:
                 errors["web_fallback"] = f"web 兜底失败: {str(e)[:200]}"
                 out["errors"] = errors
