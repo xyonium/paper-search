@@ -1279,18 +1279,8 @@ class Tools:
                 "citations": 0,
                 "url": url,
             })
-        # 富化 authors/year/doi（tavily 无 authors；paper_id 前缀可查 inspect 时补，并行 gather）
-        async def _enrich(p):
-            if p["authors"] and p["published_date"]:
-                return
-            meta = await self._research_inspect(p["paper_id"], __user__)
-            if meta.get("authors") and not p["authors"]:
-                p["authors"] = meta["authors"]
-            if meta.get("year") and not p["published_date"]:
-                p["published_date"] = meta["year"]
-            if meta.get("doi") and not p["doi"]:
-                p["doi"] = meta["doi"]
-        await asyncio.gather(*(_enrich(p) for p in papers), return_exceptions=True)
+        # 不在此逐篇 inspect 补 authors/year/doi（N 次调用易限流/计费）；
+        # tavily 有 url，元数据补全挪到 read_paper 按需
         return papers
 
     @staticmethod
@@ -1417,8 +1407,9 @@ class Tools:
     async def _firecrawl_search_papers(self, query: str, limit: int, __user__=None) -> list:
         """firecrawl_research_search_papers 兜底：返回 Markdown 文本，解析成 paper dict。
         base URL 用 Valves/UserValves.firecrawl_base_url（配了才走到这里）。
-        search 端点只回 title/abstract/id（abstract 上游预截断带"…"，无法用参数改）；
-        authors/year/doi 靠 inspect_paper 富化（pmid/pmcid/arxiv 前缀可查）。"""
+        search 端点只回 title/abstract/id（abstract 上游预截断，无法用参数改）。
+        不在此逐篇 inspect 补 authors/year/doi——N 篇即 N 次调用易触发限流/计费；
+        元数据补全挪到 read_paper 按需（单篇一次 inspect）。"""
         base = self._firecrawl_base(__user__)
         raw = await anyio.to_thread.run_sync(
             self._mcp_call_service_url, base, "firecrawl_research_search_papers",
@@ -1444,17 +1435,6 @@ class Tools:
                 "citations": 0,
                 "url": "",
             })
-        # 富化 authors/year/doi（inspect_paper 逐条查，无批量参数；并行 gather 避免串行 N 次往返）
-        # pmid/pmcid/arxiv 前缀覆盖好，doi 前缀部分覆盖不到
-        async def _enrich(p):
-            meta = await self._research_inspect(p["paper_id"], __user__)
-            if meta.get("authors"):
-                p["authors"] = meta["authors"]
-            if meta.get("year"):
-                p["published_date"] = meta["year"]
-            if meta.get("doi"):
-                p["doi"] = meta["doi"]
-        await asyncio.gather(*(_enrich(p) for p in papers), return_exceptions=True)
         return papers
 
     def _mcp_call(self, tool: str, args: dict, timeout: int = 180, _retried: bool = False):
@@ -2078,9 +2058,27 @@ class Tools:
         except (TypeError, ValueError):
             max_chars = 25000
 
+        raw_pid_orig = (paper_id or "").strip()  # 规范化前的原始 id（含 pmid:/arxiv: 前缀）
         src, paper_id = self._normalize_read_source(source, paper_id)
         backend_tool = self._READ_TOOLS.get(src)
         backend_err = ""
+
+        # ---- web 源（firecrawl/tavily）按需 inspect：单篇一次调用补著录+doi ----
+        # search 阶段不逐篇 inspect（N 次调用易限流/计费）；read 单篇时一次 inspect 划算：
+        # 补 authors/year 头部 + doi（供 Unpaywall/OA 链定位全文）。仅 web 源且原 id 可 inspect 时用。
+        web_meta_header = ""
+        web_doi = ""
+        if (source or "").strip().lower() in ("firecrawl", "tavily") and ":" in raw_pid_orig:
+            meta = await self._research_inspect(raw_pid_orig, __user__)
+            if meta:
+                parts = []
+                if meta.get("authors"):
+                    parts.append(f"Authors: {meta['authors']}")
+                if meta.get("year"):
+                    parts.append(f"Year: {meta['year']}")
+                if parts:
+                    web_meta_header = "[" + " | ".join(parts) + "]\n\n"
+                web_doi = meta.get("doi", "")
 
         if src == "zhihuiya":
             zh_enabled, zh_key = self._zhihuiya_enabled_key(__user__)
@@ -2200,9 +2198,9 @@ class Tools:
             backend_err = f"{backend_err}；出版商 url 抓取失败".strip("；")
 
         landing = ""
-        doi = ""
+        doi = web_doi  # web 源 inspect 补到的 doi 优先（供 Unpaywall/OA 链）
         if src == "crossref" and paper_id:
-            doi = paper_id.lstrip("doi:")
+            doi = doi or paper_id.lstrip("doi:")
         elif src == "openalex" and paper_id:
             landing = f"https://openalex.org/{paper_id}"
         elif src == "pubmed" and paper_id:
@@ -2235,7 +2233,7 @@ class Tools:
                 ch, oa_web = await self._web_read_fallback(oa, __user__)
                 if oa_web:
                     note = f"[经 {ch} 网页抓取 OA 全文：{oa}]"
-                    return f"{note}\n\n" + oa_web[:max_chars] + (
+                    return f"{web_meta_header}{note}\n\n" + oa_web[:max_chars] + (
                         "\n\n[…全文截断…]" if len(oa_web) > max_chars else ""
                     )
 
@@ -2246,7 +2244,7 @@ class Tools:
             channel, text = await self._web_read_fallback(landing, __user__)
             if text:
                 note = f"[经 {channel} 网页抓取全文：{landing}]"
-                return f"{note}\n\n" + text[:max_chars] + (
+                return f"{web_meta_header}{note}\n\n" + text[:max_chars] + (
                     "\n\n[…全文截断…]" if len(text) > max_chars else ""
                 )
             backend_err = f"{backend_err}；网页抓取（jina/tavily/firecrawl）失败".strip("；")
