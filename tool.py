@@ -1,6 +1,6 @@
 """
 title: Academic Paper Search
-description: 学术论文搜索、全文阅读、PDF 下载入 Knowledge（RAG）。16 个学术源 + 智慧芽文献/专利 + IEEE Xplore + web 搜索兜底（tavily/firecrawl）。单源失败不影响整体，源连接错误时自动用 tavily→firecrawl 补位。
+description: 学术论文搜索、全文阅读、PDF 下载入 Knowledge（RAG）。智慧芽文献/专利 + IEEE Xplore + arXiv/PubMed/Semantic Scholar/OpenAlex/CORE/HAL/dblp/Zenodo/IACR/DOAJ/OpenAIRE/Europe PMC/Crossref/PMC + firecrawl（web文献检索），web 搜索兜底 tavily→firecrawl。单源失败不影响整体，源连接错误时自动补位。
 
   【搜索源清单】（search_papers 的 sources 参数可用值，'all' 为全部）：
   · 预印本/开放获取（可搜可读全文）: arxiv, iacr, pmc, europepmc
