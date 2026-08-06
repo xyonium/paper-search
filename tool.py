@@ -2317,14 +2317,16 @@ class Tools:
         return ""
 
     async def _firecrawl_scrape_read(self, url: str, __user__=None, timeout: int = 60) -> str:
-        """firecrawl_scrape 抓单 URL（formats=["markdown"]），返回 data.markdown。失败返回 ""。"""
+        """firecrawl_scrape 抓单 URL（formats=["markdown"]），返回 data.markdown。失败返回 ""。
+        proxy="auto"：正常页走 basic（1 credit），遇 Cloudflare 挑战页自动升级 Enhanced
+        反爬管道（5 credits/页）救回——只在需要时付费，不盲目全开。"""
         base = self._firecrawl_base(__user__)
         if not base:
             return ""
         def _fetch():
             return self._mcp_call_service_url(
                 base, "firecrawl_scrape",
-                {"url": url, "formats": ["markdown"], "onlyMainContent": True},
+                {"url": url, "formats": ["markdown"], "onlyMainContent": True, "proxy": "auto"},
                 timeout,
             )
         try:
