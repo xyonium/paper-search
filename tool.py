@@ -13,7 +13,7 @@ description: 学术论文搜索、全文阅读、PDF 下载入 Knowledge（RAG�
   · 不可用: acm（未实现）, unpaywall（仅DOI查询，用于下载 fallback）
 
   【查询适配】search_papers 按源自动分发查询变体（不损语义，LLM 无需处理）：
-  · 大多数源用原始完整查询；zhihuiya/doaj/iacr 对长自然语言会 0 命中，
+  · 大多数源用原始完整查询；zhihuiya/doaj 对长自然语言会 0 命中，
     自动精简为核心术语后恢复（返回含 query_adapted 字段说明）
 
   【web 搜索兜底】源出现连接/超时错误时自动触发，tavily 主 → firecrawl 备，
@@ -66,14 +66,18 @@ _QUERY_PREFIXES = (
     "review of", "research on", "studies on",
 )
 
-LITERAL_SOURCES = frozenset({"zhihuiya", "doaj", "iacr"})
-DIRECT_SOURCES = frozenset({"zhihuiya", "hal", "patsnap", "dblp", "zenodo", "ieee", "openaire", "firecrawl"})
-# 后端可提供服务的全部源（排除直连源 hal/zhihuiya/patsnap；citeseerx/base/zenodo 等虽在后端但默认不启用）
+LITERAL_SOURCES = frozenset({"zhihuiya", "doaj"})
+# 直连源（绕后端 mcpo）。pubmed/pmc 直连原因（2026-08 实测）：后端 pubmed.py 走 HTTPS 且
+# requests.get 无 timeout，境外出口对突发并发 TLS 不稳（SSL EOF）时会无限挂起，asyncio.gather
+# 等齐所有源 → 整批 180s 超时，首批尤甚（DNS/连接冷 + 并发突发）；改走 HTTP + timeout=20 + 3次退避。
+DIRECT_SOURCES = frozenset({"zhihuiya", "hal", "patsnap", "dblp", "zenodo", "ieee", "openaire", "firecrawl", "pubmed", "pmc"})
+# 后端可提供服务的全部源（排除直连源 zhihuiya/hal/patsnap/dblp/zenodo/ieee/openaire/firecrawl/pubmed/pmc；
+# citeseerx/base/ssrn/unpaywall/acm 等虽在后端但默认不启用）
 _BACKEND_ALL_SOURCES = (
-    "arxiv,biorxiv,medrxiv,iacr,semantic,crossref,openalex,pubmed,pmc,core,"
+    "arxiv,biorxiv,medrxiv,iacr,semantic,crossref,openalex,core,"
     "europepmc,doaj,google_scholar,ssrn,unpaywall,citeseerx,base,acm"
 )
-# all_mode 拆分时语义组使用的后端源（去掉字面源 doaj/iacr，留给 core 变体）
+# all_mode 拆分时语义组使用的后端源（去掉字面源 doaj，留给 core 变体）
 _SEMANTIC_ALL_SOURCES = ",".join(
     s for s in _BACKEND_ALL_SOURCES.split(",") if s not in LITERAL_SOURCES
 )
@@ -113,7 +117,7 @@ _GENERIC_TERMS = frozenset({
 
 
 def _distill_core_terms(text: str, max_terms: int = 5) -> str:
-    """对字面源（zhihuiya/doaj/iacr）在 core 基础上按术语区分度截断到 max_terms 词。
+    """对字面源（zhihuiya/doaj）在 core 基础上按术语区分度截断到 max_terms 词。
     保留专业/罕见词（含连字符/数字/括号、全大写缩写、长词），砍泛化词；保持原顺序。
     词数 ≤ max_terms 时原样返回。实测临界：>5 词在字面源易 0 命中。"""
     words = text.split()
@@ -172,6 +176,10 @@ class Tools:
             default="",
             description="Zenodo Access Token（管理员级，可选；配了额度更高/可访问受限记录，留空走公共 API）",
         )
+        ncbi_api_key: str = Field(
+            default="",
+            description="NCBI E-utilities API key（管理员级，可选）。用于 pubmed/pmc 直连检索：配了 10 req/s、否则 3 req/s。2026-08 实测后端 paper-search-mcp 的 pubmed.py 走 HTTPS 且无 timeout，境外链路 SSL EOF 后会无限挂起拖垮整批（180s 超时），故 pubmed/pmc 改直连 HTTP",
+        )
         firecrawl_base_url: str = Field(
             default="",
             description="mcpo firecrawl 服务 base URL（如 http://mcp:8000/firecrawl）。两个用途：(a) 独立源——需在 default_sources 含 firecrawl；(b) 二级 web 兜底——tavily 未配/失败时自动用。留空则两者都不启用",
@@ -183,8 +191,8 @@ class Tools:
 
     class UserValves(BaseModel):
         default_sources: str = Field(
-            default="arxiv,pubmed,iacr,semantic,crossref,openalex,pmc,core,europepmc,dblp,openaire,doaj,hal,zenodo,google_scholar,zhihuiya,ieee,firecrawl",
-            description="默认搜索源：'all'=全部21源（慢，30s+）；或逗号分隔子集。默认未包含的源：citeseerx,ssrn,base,acm,unpaywall；biorxiv/medrxiv 为学科近30天浏览（非关键词检索），需 sources+biorxiv_category 显式调用。zhihuiya/ieee/firecrawl 在默认列表中，但仅当配了对应 key/url 才真正启用（未配静默跳过）",
+            default="arxiv,pubmed,semantic,crossref,openalex,pmc,core,europepmc,dblp,openaire,doaj,hal,zenodo,google_scholar,zhihuiya,ieee,firecrawl",
+            description="默认搜索源：'all'=全部21源（慢，30s+）；或逗号分隔子集。默认未包含的源：iacr（密码学 ePrint 细分库，需要时 sources=iacr 显式调用）、citeseerx,ssrn,base,acm,unpaywall；biorxiv/medrxiv 为学科近30天浏览（非关键词检索），需 sources+biorxiv_category 显式调用。zhihuiya/ieee/firecrawl 在默认列表中，但仅当配了对应 key/url 才真正启用（未配静默跳过）",
         )
         knowledge_id: str = Field(
             default="", description="下载 PDF 自动加入的 Knowledge 集合 ID"
@@ -223,6 +231,11 @@ class Tools:
         tavily_base_url: str = Field(
             default="",
             description="tavily 兜底的 base URL（个人级，非空时覆盖管理员；留空用管理员配置）",
+        )
+        ncbi_api_key: str = Field(
+            default="",
+            description="NCBI E-utilities API key（个人级，非空时覆盖管理员 key）",
+            json_schema_extra={"input": {"type": "password"}},
         )
 
     # 覆盖全部 21 个源 + 可选 IEEE/ACM（配 key 后动态注册）
@@ -885,6 +898,223 @@ class Tools:
             })
         return papers
 
+    # ---------- NCBI 直连（pubmed/pmc）----------
+    # 2026-08 实测根因：后端 paper-search-mcp 的 pubmed.py 走 HTTPS 且 requests.get 无
+    # timeout，境外出口对突发并发 TLS 不稳（SSL: UNEXPECTED_EOF_WHILE_READING，urllib3 对
+    # SSL EOF 默认不重试）→ 偶发无限挂起，后端 asyncio.gather 等齐所有源 → 整批 180s 超时。
+    # 每次 tool 调用的首个后端批次必现（DNS/连接冷 + 语义/字面拆分同刻并发），后续复现看网络。
+    # 直连改走 HTTP（绕开境外 TLS 中间设备，NCBI 与 pmc/europepmc 等同 host 实测零异常）+
+    # timeout=20 + 3 次退避（2s/4s），429/5xx/连接错误重试，4xx 不重试。
+    _NCBI_EUTILS = "http://eutils.ncbi.nlm.nih.gov/entrez/eutils"
+
+    def _ncbi_key(self, __user__=None) -> str:
+        """NCBI API key：UserValves 优先，否则 admin Valves；都没有返回 ""。"""
+        uv = __user__.get("valves") if __user__ else None
+        user_key = (getattr(uv, "ncbi_api_key", "") or "").strip() if uv else ""
+        return user_key or (getattr(self.valves, "ncbi_api_key", "") or "").strip()
+
+    def _eutils_get(self, path: str, params: dict, api_key: str = ""):
+        """E-utilities GET（HTTP），3 次退避；返回 response。"""
+        import time
+        if api_key:
+            params = {**params, "api_key": api_key}
+        last_exc = None
+        for attempt in range(3):
+            try:
+                r = requests.get(
+                    f"{self._NCBI_EUTILS}/{path}",
+                    params=params,
+                    headers={"User-Agent": "paper-search-tool/2.6 (OpenWebUI academic search)"},
+                    timeout=20,
+                )
+                if r.status_code == 200:
+                    return r
+                if r.status_code in (429, 500, 502, 503, 504):
+                    last_exc = RuntimeError(f"NCBI HTTP {r.status_code}")
+                else:
+                    r.raise_for_status()
+            except Exception as e:
+                if isinstance(e, requests.exceptions.HTTPError):
+                    raise
+                last_exc = e
+            if attempt < 2:
+                time.sleep([2, 4][attempt])
+        raise RuntimeError(f"NCBI E-utilities 失败（重试3次）: {last_exc}")
+
+    @staticmethod
+    def _xml_text(elem) -> str:
+        """ElementTree 节点 → 拼接全部文本（AbstractText/ArticleTitle 常含子标签）。"""
+        return "".join(elem.itertext()).strip() if elem is not None else ""
+
+    def _parse_pubmed_xml(self, root, source: str, limit: int) -> list:
+        """PubmedArticleSet → paper dict 列表。pubmed 与 pmc 共用同一 XML 格式；
+        source 决定 paper_id 前缀与 url（pmc 用 PMCID，pubmed 用 PMID）。"""
+        papers = []
+        for article in root.findall(".//PubmedArticle"):
+            if len(papers) >= limit:
+                break
+            medline = article.find("MedlineCitation")
+            art = medline.find("Article") if medline is not None else None
+            if medline is None or art is None:
+                continue
+            pmid = self._xml_text(medline.find("PMID"))
+            if not pmid:
+                continue
+            title = self._xml_text(art.find("ArticleTitle"))
+            if not title:
+                continue
+            authors = []
+            for au in art.findall("AuthorList/Author"):
+                last = self._xml_text(au.find("LastName"))
+                init = self._xml_text(au.find("Initials"))
+                coll = self._xml_text(au.find("CollectiveName"))
+                if last:
+                    authors.append(f"{last} {init}".strip())
+                elif coll:
+                    authors.append(coll)
+            abstract = " ".join(
+                t for t in (self._xml_text(a) for a in art.findall("Abstract/AbstractText")) if t
+            )
+            ids = {}
+            for aid in article.findall("PubmedData/ArticleIdList/ArticleId"):
+                id_type = aid.get("IdType", "")
+                if id_type and aid.text:
+                    ids[id_type] = aid.text.strip()
+            doi = ids.get("doi", "")
+            pmcid = ids.get("pmc", "")
+            year = (art.findtext("Journal/JournalIssue/PubDate/Year")
+                    or art.findtext("Journal/JournalIssue/PubDate/MedlineDate") or "")[:4]
+            if source == "pmc":
+                if not pmcid:  # PMC 库正常都有 PMCID，防御性跳过
+                    continue
+                paper_id, url = f"pmc:{pmcid}", f"https://www.ncbi.nlm.nih.gov/pmc/articles/{pmcid}/"
+            else:
+                paper_id, url = f"pubmed:{pmid}", f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/"
+            papers.append({
+                "title": title,
+                "authors": "; ".join(authors),
+                "published_date": year,
+                "abstract": abstract,
+                "paper_id": paper_id,
+                "doi": doi,
+                "source": source,
+                "pdf_url": f"https://www.ncbi.nlm.nih.gov/pmc/articles/{pmcid}/pdf/" if pmcid else "",
+                "citations": 0,
+                "url": url,
+            })
+        return papers
+
+    @staticmethod
+    def _first_text(elem, paths) -> str:
+        """按 xpath 列表取第一个非空文本（兼容命名空间变体）。"""
+        for p in paths:
+            t = elem.findtext(p)
+            if t:
+                return t.strip()
+        return ""
+
+    def _parse_pmc_article(self, article, limit_count: int) -> dict:
+        """JATS <article>（PMC efetch 格式）→ paper dict。"""
+        front = article.find("front")
+        ameta = front.find("article-meta") if front is not None else None
+        if ameta is None:
+            return None
+        ids = {}
+        for aid in ameta.findall("article-id"):
+            id_type = aid.get("pub-id-type", "")
+            if id_type and aid.text:
+                ids[id_type] = aid.text.strip()
+        # 真实 PMC JATS 的 pub-id-type 是 "pmcid"（值带 PMC 前缀）/"pmcaid"（纯数字），不是 "pmc"
+        pmcid = ids.get("pmcid") or ids.get("pmc") or ids.get("pmcaid", "")
+        if pmcid and not pmcid.upper().startswith("PMC"):
+            pmcid = f"PMC{pmcid}"
+        if not pmcid:
+            return None
+        title_node = ameta.find("title-group/article-title")
+        title = self._xml_text(title_node)
+        if not title:
+            return None
+        authors = []
+        for contrib in ameta.findall("contrib-group/contrib"):
+            if contrib.get("contrib-type", "author") != "author":
+                continue
+            surname = self._xml_text(contrib.find("name/surname"))
+            given = self._xml_text(contrib.find("name/given-names"))
+            coll = self._xml_text(contrib.find("collab"))
+            if surname:
+                authors.append(f"{surname} {given}".strip())
+            elif coll:
+                authors.append(coll)
+        abstract = " ".join(
+            t for t in (self._xml_text(a) for a in ameta.findall("abstract")) if t
+        )
+        year = (self._first_text(ameta, ["pub-date/year"])
+                or self._first_text(ameta, ["pub-date/date"])
+                or self._first_text(ameta, ["history/date/year"]))[:4]
+        return {
+            "title": title,
+            "authors": "; ".join(authors),
+            "published_date": year,
+            "abstract": abstract,
+            "paper_id": f"pmc:{pmcid}",
+            "doi": ids.get("doi", ""),
+            "source": "pmc",
+            "pdf_url": f"https://www.ncbi.nlm.nih.gov/pmc/articles/{pmcid}/pdf/",
+            "citations": 0,
+            "url": f"https://www.ncbi.nlm.nih.gov/pmc/articles/{pmcid}/",
+        }
+
+    async def _pubmed_search(self, query: str, limit: int, __user__=None) -> list:
+        """直连 NCBI E-utilities 搜 PubMed（esearch+efetch），绕后端 pubmed.py 无 timeout 挂起 bug。"""
+        from xml.etree import ElementTree as ET
+
+        def _fetch():
+            key = self._ncbi_key(__user__)
+            r1 = self._eutils_get("esearch.fcgi", {
+                "db": "pubmed", "term": query, "retmax": max(1, min(int(limit), 200)),
+                "retmode": "xml", "sort": "relevance"}, key)
+            ids = [e.text for e in ET.fromstring(r1.content).findall(".//Id") if e.text]
+            if not ids:
+                return []
+            r2 = self._eutils_get("efetch.fcgi", {
+                "db": "pubmed", "id": ",".join(ids), "retmode": "xml"}, key)
+            return self._parse_pubmed_xml(ET.fromstring(r2.content), "pubmed", limit)
+
+        try:
+            return await anyio.to_thread.run_sync(_fetch)
+        except Exception as e:
+            raise RuntimeError(f"PubMed 检索失败: {e}")
+
+    async def _pmc_search(self, query: str, limit: int, __user__=None) -> list:
+        """直连 NCBI E-utilities 搜 PMC 全文库（esearch+efetch），绕后端 pmc.py 同 host HTTPS 风险。
+        PMC efetch 返回 JATS 全文 XML（pmc-articleset），非 PubmedArticleSet → 用 JATS 解析。"""
+        from xml.etree import ElementTree as ET
+
+        def _fetch():
+            key = self._ncbi_key(__user__)
+            r1 = self._eutils_get("esearch.fcgi", {
+                "db": "pmc", "term": query, "retmax": max(1, min(int(limit), 200)),
+                "retmode": "xml", "sort": "relevance"}, key)
+            ids = [e.text for e in ET.fromstring(r1.content).findall(".//Id") if e.text]
+            if not ids:
+                return []
+            r2 = self._eutils_get("efetch.fcgi", {
+                "db": "pmc", "id": ",".join(ids), "retmode": "xml"}, key)
+            root = ET.fromstring(r2.content)
+            papers = []
+            for art in root.findall(".//article"):
+                p = self._parse_pmc_article(art, len(papers))
+                if p:
+                    papers.append(p)
+                if len(papers) >= limit:
+                    break
+            return papers
+
+        try:
+            return await anyio.to_thread.run_sync(_fetch)
+        except Exception as e:
+            raise RuntimeError(f"PMC 检索失败: {e}")
+
     # ---------- web 搜索兜底（tavily 优先，firecrawl 备选；配了 base_url 才启用）----------
     _FC_NET_ERR_MARKERS = (
         "超时", "timed out", "timeout", "ssl", "eof", "connection", "refused",
@@ -1338,6 +1568,8 @@ class Tools:
         want_dblp = "dblp" in src_set or all_mode
         want_zenodo = "zenodo" in src_set or all_mode
         want_openaire = "openaire" in src_set or all_mode
+        want_pubmed = "pubmed" in src_set or all_mode
+        want_pmc = "pmc" in src_set or all_mode
         # firecrawl 是独立源：配了 firecrawl_base_url 且在 sources 里才启用
         want_firecrawl = bool(self._firecrawl_base(__user__)) and ("firecrawl" in src_set or all_mode)
         ieee_enabled, ieee_key = self._ieee_enabled_key(__user__)
@@ -1349,13 +1581,13 @@ class Tools:
             backend_set = None  # None 表示后端用 _BACKEND_ALL_SOURCES（不含直连源）
 
         # 后端按变体分组：字面组用 core，语义组用 original
-        # all_mode 下字面组固定为 LITERAL_SOURCES - DIRECT_SOURCES = {doaj, iacr}（zhihuiya 直连单独处理）
+        # all_mode 下字面组固定为 LITERAL_SOURCES - DIRECT_SOURCES = {doaj}（zhihuiya 直连单独处理）
         backend_literal = (
             (LITERAL_SOURCES - DIRECT_SOURCES)
             if all_mode
             else ((src_set & LITERAL_SOURCES) - DIRECT_SOURCES)
         )
-        # 字面源（doaj/iacr/zhihuiya）长术语查询需进一步按区分度截断到 5 词，否则 0 命中
+        # 字面源（doaj/zhihuiya）长术语查询需进一步按区分度截断到 5 词，否则 0 命中
         literal_query = _distill_core_terms(core, max_terms=5)
 
         async def _backend_all():
@@ -1423,6 +1655,12 @@ class Tools:
         async def _openaire():
             return await self._openaire_search(original, max_results_per_source)
 
+        async def _pubmed():
+            return await self._pubmed_search(original, max_results_per_source, __user__)
+
+        async def _pmc():
+            return await self._pmc_search(original, max_results_per_source, __user__)
+
         async def _fc():
             # firecrawl 内部有查询处理，但保守起见用 core（去噪声词，保语义不截断）
             return await self._firecrawl_search_papers(core, max_results_per_source, __user__)
@@ -1443,6 +1681,10 @@ class Tools:
             branches["zenodo"] = _zenodo()
         if want_openaire:
             branches["openaire"] = _openaire()
+        if want_pubmed:
+            branches["pubmed"] = _pubmed()
+        if want_pmc:
+            branches["pmc"] = _pmc()
         if want_firecrawl:
             branches["firecrawl"] = _fc()
         if want_ieee:
@@ -1460,9 +1702,11 @@ class Tools:
         openaire_result = outcome.get("openaire")
         firecrawl_result = outcome.get("firecrawl")
         ieee_result = outcome.get("ieee")
+        pubmed_result = outcome.get("pubmed")
+        pmc_result = outcome.get("pmc")
 
         # 后端失败处理：若任一直连源有结果则保留，否则报错
-        direct_ok = [r for r in (zh_result, hal_result, dblp_result, zenodo_result, openaire_result, firecrawl_result, ieee_result) if isinstance(r, list) and r]
+        direct_ok = [r for r in (zh_result, hal_result, dblp_result, zenodo_result, openaire_result, firecrawl_result, ieee_result, pubmed_result, pmc_result) if isinstance(r, list) and r]
         if isinstance(backend_result, Exception):
             if direct_ok:
                 result = {"papers": [], "source_results": {},
@@ -1521,6 +1765,22 @@ class Tools:
                 op = [self._trim_paper(p) for p in openaire_result]
                 papers.extend(op)
                 source_results["openaire"] = len(op)
+        if want_pubmed:
+            if isinstance(pubmed_result, Exception):
+                source_results["pubmed"] = 0
+                errors["pubmed"] = str(pubmed_result)
+            elif pubmed_result is not None:
+                pp = [self._trim_paper(p) for p in pubmed_result]
+                papers.extend(pp)
+                source_results["pubmed"] = len(pp)
+        if want_pmc:
+            if isinstance(pmc_result, Exception):
+                source_results["pmc"] = 0
+                errors["pmc"] = str(pmc_result)
+            elif pmc_result is not None:
+                mp = [self._trim_paper(p) for p in pmc_result]
+                papers.extend(mp)
+                source_results["pmc"] = len(mp)
         if want_firecrawl:
             if isinstance(firecrawl_result, Exception):
                 source_results["firecrawl"] = 0

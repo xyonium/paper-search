@@ -106,9 +106,9 @@ zhihuiya/ieee/firecrawl 在默认列表中，但**必须同时满足两个条件
 
 | 源类 | 源 | 发送的查询 |
 |---|---|---|
-| **语义/分词** | openalex, semantic, crossref, pmc, europepmc, pubmed, arxiv, openaire, core, patsnap | `original`（原始完整查询，保语义） |
-| **字面关键词** | zhihuiya, doaj, iacr | `core`（去引号/裸露 OR/AND/NOT/中英噪声词）再 `_distill_core_terms` 截断到 ≤5 个高区分度术语 |
-| **直连**（绕后端） | hal, zhihuiya, patsnap, dblp, zenodo | hal 走 `_hal_search`（绕后端 hal.py 的 isoformat bug）；hal 用 core，zhihuiya 用 distilled；dblp 走 `_dblp_search`（v2.5.3+，绕后端 dblp.py 的并发 ConnectionError + 无退避重试 bug）用 original（CS 书目，非 CS 查询 0 结果属正常）；zenodo 走 `_zenodo_search`（v2.5.3+，绕后端 zenodo.py 的 published_date str→isoformat crash bug）用 original |
+| **语义/分词** | openalex, semantic, crossref, europepmc, arxiv, core, patsnap | `original`（原始完整查询，保语义） |
+| **字面关键词** | zhihuiya, doaj | `core`（去引号/裸露 OR/AND/NOT/中英噪声词）再 `_distill_core_terms` 截断到 ≤5 个高区分度术语 |
+| **直连**（绕后端） | hal, zhihuiya, patsnap, dblp, zenodo, pubmed, pmc | hal 走 `_hal_search`（绕后端 hal.py 的 isoformat bug）；hal 用 core，zhihuiya 用 distilled；dblp 走 `_dblp_search`（v2.5.3+，绕后端 dblp.py 的并发 ConnectionError + 无退避重试 bug）用 original（CS 书目，非 CS 查询 0 结果属正常）；zenodo 走 `_zenodo_search`（v2.5.3+，绕后端 zenodo.py 的 published_date str→isoformat crash bug）用 original；pubmed/pmc 走 `_pubmed_search`/`_pmc_search`（v2.6+，绕后端 pubmed.py 无 timeout 无限挂起 bug）用 original |
 
 **字面源截断临界点实测**（真实环境，决定 max_terms=5 的依据）：
 
@@ -116,21 +116,26 @@ zhihuiya/ieee/firecrawl 在默认列表中，但**必须同时满足两个条件
 |---|---|---|---|---|---|
 | zhihuiya | 0 | 恢复 | ✅ | ✅ | ≤6 词 |
 | doaj | 0 | **0** | ✅ | ✅ | **必须 ≤5 词** |
-| iacr | 0 | 恢复 | ✅ | ✅ | ≤6 词 |
+| ~~iacr~~ | — | — | — | — | 已移出字面组（v2.6） |
 
-→ 三者统一截到 **5 词**（doaj 是硬需求，其余更保守不亏）。截断按术语区分度：保留专业/罕见词
+→ 统一截到 **5 词**（doaj 是硬需求，其余更保守不亏）。截断按术语区分度：保留专业/罕见词
 （含连字符/数字/括号、全大写缩写、长词），砍泛化词（sensor/coating/film/room temperature 等稀释相关性）。
+
+**doaj 词数限制复核**（2026-08-06，同主题词 2→11 词逐个测 + DOAJ 官方 API 直打对照）：**不是词数硬限制，是查询组合太具体无匹配文献**。同主题词 3 词=11 命中、4 词=1、5 词=0，官方 API 直打结果一致；AND 连接 5 词同样 0 → DOAJ 把空格分词当 AND 处理（Lucene 默认），词越多要求同时命中的词越多、结果越窄直至 0。5 词截断保留是因为真实查询多为长尾描述性短语（biofouling/degradation/mechanism/vivo 堆叠必然 0 命中），截断后取高区分度词可恢复命中；并非"超过 N 词 API 报错/拒绝"。
+
+**iacr 移出字面组与默认源**（v2.6）：iacr 无需精简——密码学主题词实测 2-8 词全部 ≥3 命中（ePrint 全文索引，相关性宽松）；之前 04:16 日志的 0 命中是"非密码学查询必然 0"（`continuous monitoring biofouling...`），不是词数问题。iacr 是密码学 ePrint **细分库**（非覆盖完整大学科），默认源应覆盖完整学科（计算机/生物/医学等），故移出默认；需要密码学文献时 `sources=iacr` 显式调用（仍走后端，用 original 查询）。
 
 - `biorxiv/medrxiv` 非关键词检索，返回"该学科近30天新论文"；可用 `biorxiv_category`/`medrxiv_category` 传学科。
 - `dblp` 后端 dblp.py 有 bug（v2.5.3 起改直连 `_dblp_search` 绕过）：并发/快速请求时 dblp 服务器直接断开连接（ConnectionError），后端无重试退避；且后端 dblp.py 无 rate-limit 感知，生产环境 500/ConnectionError 频繁。直连版加 3 次指数退避重试。注意 dblp 是 CS 书目库，仅收录计算机科学文献，非 CS 查询（如生物医学、材料科学）返回 0 属正常，非 bug。
 - `zenodo` 后端 zenodo.py 有 bug（v2.5.3 起改直连 `_zenodo_search` 绕过）：published_date 传 str 给 Paper 对象，Paper.to_dict() 调 `.isoformat()` 崩溃。直连版正确解析日期字符串。Zenodo 是 OA 仓储，多数记录有 PDF。可选配 `zenodo_access_token`（Valves/UserValves）提额/访问受限记录，不配走公共 API（免费但限频）。直连 timeout=60s（公共 API 较慢）。
 - `ieee` 后端 ieee.py 是骨架（v2.5.3 起改直连 `_ieee_search` 绕过）：`raise NotImplementedError` 占位，但 IEEE Xplore 有公开 REST API（`ieeexploreapi.ieee.org`），需配 `ieee_apikey`（Valves 管理员级或 UserValves 个人级）。返回 metadata 级（abstract+著录），OA 论文有 pdf_url 可直接下载，LOCKED 论文需机构访问。**间歇性挂起实测**（2026-08，host/容器均复现）：含常见词的较长 querytext 偶发挂起（30s read timeout 或 ~80s SSL EOF），同查询重试即 1.5s 恢复，非容器网络问题 → `_ieee_search` 与 dblp 同模式加 3 次退避重试（2s/4s），最坏延迟 ~68s，失败信息标注"重试3次"；4xx 不重试。
 - `openaire` 后端 openaire.py 双 bug（v2.5.4 起改直连 `_openaire_search` 绕过，2026-08 实测 100% 必现，非慢/非网络）：路径1 `search/researchProducts` 端点已废弃 404（Tomcat 报错）；路径2 legacy fallback 用 `query=` 参数，OpenAIRE API 只认 `keywords=` → 400 Bad Request。直连版用 `search/publications?keywords=`，返回结构 `response.results.result[].metadata.oaf:entity.oaf:result`（title/creator/pid 为 dict 或 dict 列表，文本在 `$` 键，doi 取 `pid[@classid=doi]`）。OpenAIRE 是欧洲仓储聚合，OA 记录有 pdf_url。无 abstract 字段（API 不返回）。
+- `pubmed`/`pmc` 后端 pubmed.py 致命 bug（v2.6 起改直连 `_pubmed_search`/`_pmc_search` 绕过，2026-08 实测**首次后端批量调用必现 180s 超时**的根因）：pubmed.py 走 **HTTPS** 且 `requests.get` **无 timeout**，境外出口对突发并发 TLS 不稳（SSL: UNEXPECTED_EOF_WHILE_READING，urllib3 对 SSL EOF 默认不重试）→ 偶发无限挂起，后端 `asyncio.gather` 等齐所有源 → 整批 180s 超时；连续两次超时的另一案例是 google_scholar 有界重试最坏 ~240s 叠加所致（偶发，网络条件决定）。直连版改走 **HTTP**（绕开境外 TLS 中间设备；NCBI 与 pmc/europepmc 等同 host，后端这些源实测零异常）+ `timeout=20` + 3 次退避（2s/4s），429/5xx/连接错误重试、4xx 不重试。pubmed efetch 返回 `PubmedArticleSet` XML；**pmc efetch 返回 JATS 全文 XML（pmc-articleset，非 PubmedArticleSet）**，`pub-id-type` 是 `pmcid`（值带 PMC 前缀）/`pmcaid`（纯数字），解析见 `_parse_pmc_article`。可选 `ncbi_api_key`（Valves/UserValves）：配了 10 req/s、否则 3 req/s；config.json 里 `NCBI_API_KEY` 仅对后端生效，直连走 tool.py 自己的阀值。pmc 记录恒有 PMCID（OA）→ `pdf_url` 恒有值；pubmed 仅当文章在 PMC 有存档时有 pdf_url。read_paper 对 pubmed 仍走后端 `read_pubmed_paper`（metadata 提示后自动降级 pdf_url）。
 - **web 搜索双轨**（v2.5.4）：
   - **firecrawl = 独立源**（同时兼任二级 fallback）：配 `firecrawl_base_url`（如 `http://mcp:8000/firecrawl`）+ sources 含 `firecrawl`（已加入默认列表，未配 URL 静默跳过）。独立源走 mcpo `firecrawl_research_search_papers`（firecrawl 里唯一的学术文献专用端点，`firecrawl_search` 是通用 web 搜索）。**无域名限定**（research 接口不支持 include_domains），查询用 **core 变体**（去噪声词，firecrawl 内部有查询处理故不截断）。结果 `source="firecrawl"`，`paper_id` 保留原 id（如 `arxiv:xxx`，实测 5 条全中高相关）。定位：作为主链源参与检索，补 API 源覆盖不到的网页文献。
   - **tavily = 主 fallback**（非独立源）：配 `tavily_base_url`（如 `http://api-key-rotator:8788/tavily`，经 api-key-rotator 代理 key 池轮转）才启用。任一**请求的源**出现连接/超时类错误（匹配 超时/timeout/ssl/eof/connection/502/503/504/429；0 命中或 400 参数错不触发）时触发，`POST {tavily_base_url}/search` 用 **original** 查询 + `include_domains` **动态限定**（`_fallback_domains` 映射自 失败源 ∪ 0结果源：`arxiv`→`arxiv.org`、`ieee`→`ieeexplore.ieee.org`、`semantic`→`semanticscholar.org` 等 21 个源映射；`backend` 聚合错误展开为全量学术域名；无映射源回退全量）。**返回量动态调整**：`N(1+K/3)` 上限 `min(3N, 20)`，N=原始 per-source limit，K=失败源数（`backend` 聚合按 4 计）——1 源失败≈1.33N，2 源≈1.67N，backend 聚合≈2.33N。结果 `source="tavily"`，`paper_id` 从 URL 提取（arxiv/ieee/pubmed/aclanthology/doi/biorxiv 模式），doi 另从 `raw_content` 正则回填。返回含 `fallback_domains`/`fallback_limit` 字段（LLM/用户可见）。**tavily `include_domains` 实测是硬过滤**（2026-08：pizza 查询+限定 arxiv.org 返回 5 条全在 arxiv.org 内）。api-key-rotator 原样透传请求体不干预。
   - **firecrawl = 二级 fallback**（tavily 未配/调用失败/返回 0 条时落此）：用 `firecrawl_search`（通用 web 搜索，**非** research 端点）+ `includeDomains` 硬过滤（同 `_fallback_domains` 动态限定）。实测硬过滤：`includeDomains=["arxiv.org","ieeexplore.ieee.org"]` 返回 5 条全在限定域名内；`site:` 操作符返回空不可用。返回干净 JSON（url/title/description/position），比 research 端点的 Markdown 好解析。结果 `source="firecrawl"`。**fallback 链分工**：tavily 主（结构化+学术限定精准）→ firecrawl 备（同域名限定，覆盖 tavily 未配/失败/0 结果的场景）。
-- **境外学术 API 间歇性不稳定**（2026-08 实测）：出口链路对突发并发 TLS 流不稳（疑似中间设备 RST/限速），后端 mcpo 一次 fan-out 11 源时随机个别 host（eutils/openaire/ieee 轮流）SSL EOF 或握手超时，同请求重试即恢复 → `_mcp_call` 超时后自动重试 1 次（+3s），直连源均带 3 次退避。
+- **境外学术 API 间歇性不稳定**（2026-08 实测）：出口链路对突发并发 TLS 流不稳（疑似中间设备 RST/限速）。无 timeout 的源（pubmed.py，已 v2.6 直连绕过）会无限挂起；有 timeout 的源（arxiv 3×30s、google_scholar 3×(30s+重试等待)~240s、crossref/openalex/pmc/core/europepmc 各 30s）偶发挂起时**有界但仍慢**——后端 `asyncio.gather` 等齐最慢源，叠加 tool.py `_mcp_call` 超时重试 1 次（+3s）后整批最坏 ~360s 才返回。首批（DNS/连接冷 + 并发突发）更易触发。直连源均带 3 次退避。
 - `all` 模式下后端源用 `_BACKEND_ALL_SOURCES`（排除直连源 hal/zhihuiya/patsnap/dblp/zenodo/ieee/openaire）；拆分时语义组用 `_SEMANTIC_ALL_SOURCES`（再排除字面组 doaj/iacr）。
 - 截断发生时返回 `query_adapted` 字段，列出各字面源实际用的精简查询。
 

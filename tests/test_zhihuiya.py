@@ -522,8 +522,9 @@ def test_variants_all_noise_falls_back_to_original():
 
 
 def test_source_groups():
-    assert tool_mod.LITERAL_SOURCES == frozenset({"zhihuiya", "doaj", "iacr"})
+    assert tool_mod.LITERAL_SOURCES == frozenset({"zhihuiya", "doaj"})
     assert "hal" in tool_mod.DIRECT_SOURCES and "zhihuiya" in tool_mod.DIRECT_SOURCES
+    assert "pubmed" in tool_mod.DIRECT_SOURCES and "pmc" in tool_mod.DIRECT_SOURCES
 
 
 @pytest.mark.asyncio
@@ -666,12 +667,12 @@ async def test_all_mode_split_gives_literal_sources_core():
     by_q = {c["query"]: c["sources"] for c in calls}
     core_q = [q for q in by_q if "latest" not in q and "what" not in q][0]
     orig_q = [q for q in by_q if q != core_q][0]
-    # 字面组用 core，且只含 doaj/iacr
+    # 字面组用 core，且只含 doaj（iacr 已移出字面组与默认源）
     lit_srcs = set(by_q[core_q].split(","))
-    assert lit_srcs == {"doaj", "iacr"}
-    # 语义组用 original，且不含 doaj/iacr
+    assert lit_srcs == {"doaj"}
+    # 语义组用 original，且不含 doaj；iacr 归入语义组
     sem_srcs = set(by_q[orig_q].split(","))
-    assert "doaj" not in sem_srcs and "iacr" not in sem_srcs
+    assert "doaj" not in sem_srcs and "iacr" in sem_srcs
     assert "hal" not in sem_srcs  # 直连源不进后端
 
 
@@ -697,12 +698,14 @@ def test_default_sources_exclude_biorxiv_medrxiv():
 
 
 def test_default_sources_include_zenodo_not_ieee():
-    """zenodo 已加入默认源（v2.5.3 直连修复）；ieee 需配 key 不进默认。"""
+    """zenodo 已加入默认源（v2.5.3 直连修复）；ieee/firecrawl 在默认列表但配 key/url 才启用。"""
     ds = Tools.UserValves().default_sources
     tokens = {s.strip() for s in ds.split(",")}
     assert "zenodo" in tokens      # 直连修复后可用，加入默认
-    assert "ieee" not in tokens    # 需配 key，opt-in
+    assert "ieee" in tokens        # 默认列表成员；未配 key 时静默跳过（want_ieee 双条件）
+    assert "firecrawl" in tokens   # 默认列表成员；未配 firecrawl_base_url 时静默跳过
     assert "dblp" in tokens        # 直连修复后仍在默认
+    assert "pubmed" in tokens and "pmc" in tokens  # v2.6 直连（绕后端无 timeout 挂起 bug）
 
 
 def test_distill_core_terms_truncates_long_query():
@@ -747,3 +750,147 @@ async def test_search_papers_adds_query_adapted_hint():
     # 字面源的查询应被截断到 ≤5 词
     for s, qq in out["query_adapted"].items():
         assert len(qq.split()) <= 5
+
+
+# ---------------- NCBI 直连（pubmed/pmc，v2.6）----------------
+
+_ESEARCH_XML = """<?xml version="1.0"?>
+<eSearchResult><Count>2</Count><IdList><Id>111</Id><Id>222</Id></IdList></eSearchResult>"""
+
+_EFETCH_XML = """<?xml version="1.0"?>
+<PubmedArticleSet>
+<PubmedArticle>
+  <MedlineCitation>
+    <PMID>111</PMID>
+    <Article>
+      <ArticleTitle>Continuous <i>glucose</i> monitoring sensor biofouling</ArticleTitle>
+      <AuthorList><Author><LastName>Smith</LastName><Initials>J</Initials></Author></AuthorList>
+      <Abstract><AbstractText>In vivo biofouling <b>degrades</b> sensor signal.</AbstractText></Abstract>
+      <Journal><JournalIssue><PubDate><Year>2021</Year></PubDate></JournalIssue></Journal>
+    </Article>
+  </MedlineCitation>
+  <PubmedData><ArticleIdList>
+    <ArticleId IdType="pubmed">111</ArticleId>
+    <ArticleId IdType="doi">10.1000/xyz111</ArticleId>
+    <ArticleId IdType="pmc">PMC999</ArticleId>
+  </ArticleIdList></PubmedData>
+</PubmedArticle>
+<PubmedArticle>
+  <MedlineCitation>
+    <PMID>222</PMID>
+    <Article>
+      <ArticleTitle>Second paper</ArticleTitle>
+      <Abstract><AbstractText>abstract two</AbstractText></Abstract>
+    </Article>
+  </MedlineCitation>
+  <PubmedData><ArticleIdList><ArticleId IdType="pubmed">222</ArticleId></ArticleIdList></PubmedData>
+</PubmedArticle>
+</PubmedArticleSet>"""
+
+
+class _FakeResp:
+    def __init__(self, content, status=200):
+        self.content = content.encode()
+        self.status_code = status
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            import requests as _rq
+            raise _rq.exceptions.HTTPError(f"HTTP {self.status_code}")
+
+
+def _fake_eutils_get(url, params=None, headers=None, timeout=None):
+    """模拟 eutils：esearch 返回 2 个 id，efetch 返回 2 篇文章。"""
+    assert url.startswith("http://eutils.ncbi.nlm.nih.gov/")  # 必须走 HTTP 而非 HTTPS
+    assert timeout == 20
+    if "esearch" in url:
+        return _FakeResp(_ESEARCH_XML)
+    return _FakeResp(_EFETCH_XML)
+
+
+@pytest.mark.asyncio
+async def test_pubmed_search_direct_parses_results():
+    t = Tools(); t.valves = Tools.Valves()
+    monkey = pytest.MonkeyPatch()
+    monkey.setattr(tool_mod.requests, "get", _fake_eutils_get)
+    papers = await t._pubmed_search("glucose sensor", 5)
+    monkey.undo()
+    assert len(papers) == 2
+    p = papers[0]
+    assert p["source"] == "pubmed"
+    assert p["paper_id"] == "pubmed:111"
+    assert p["doi"] == "10.1000/xyz111"
+    assert p["pdf_url"].endswith("PMC999/pdf/")
+    assert "glucose" in p["title"] and "<i>" not in p["title"]  # 子标签文本已拼接
+    assert p["authors"] == "Smith J"
+    assert p["published_date"] == "2021"
+    assert "biofouling" in p["abstract"] and "<b>" not in p["abstract"]
+    # 第二篇无 PMCID → 无 pdf_url，但保留
+    assert papers[1]["paper_id"] == "pubmed:222"
+    assert papers[1]["pdf_url"] == ""
+
+
+@pytest.mark.asyncio
+async def test_pmc_search_direct_uses_pmcid():
+    t = Tools(); t.valves = Tools.Valves()
+    monkey = pytest.MonkeyPatch()
+
+    jats = """<?xml version="1.0"?>
+<pmc-articleset>
+<article><front><article-meta>
+  <article-id pub-id-type="pmcid">PMC13437042</article-id>
+  <article-id pub-id-type="doi">10.1093/rb/rbae001</article-id>
+  <title-group><article-title>Implantable <italic>glucose</italic> sensors: biofouling</article-title></title-group>
+  <contrib-group><contrib contrib-type="author"><name><surname>Wang</surname><given-names>Li</given-names></name></contrib></contrib-group>
+  <abstract><p>In vivo biofouling limits CGM lifetime.</p></abstract>
+  <pub-date><year>2024</year></pub-date>
+</article-meta></front></article>
+<article><front><article-meta>
+  <article-id pub-id-type="doi">10.x/no-pmc</article-id>
+  <title-group><article-title>no pmcid should be skipped</article-title></title-group>
+</article-meta></front></article>
+</pmc-articleset>"""
+
+    def fake_get(url, params=None, headers=None, timeout=None):
+        if "esearch" in url:
+            return _FakeResp(_ESEARCH_XML)
+        return _FakeResp(jats)
+
+    monkey.setattr(tool_mod.requests, "get", fake_get)
+    papers = await t._pmc_search("glucose sensor", 5)
+    monkey.undo()
+    assert len(papers) == 1  # 无 PMCID 的第二篇被跳过
+    p = papers[0]
+    assert p["source"] == "pmc"
+    assert p["paper_id"] == "pmc:PMC13437042"
+    assert p["doi"] == "10.1093/rb/rbae001"
+    assert "pmc/articles/PMC13437042" in p["url"]
+    assert p["pdf_url"].endswith("PMC13437042/pdf/")
+    assert "glucose" in p["title"] and "<italic>" not in p["title"]
+    assert p["authors"] == "Wang Li"
+    assert p["published_date"] == "2024"
+
+
+@pytest.mark.asyncio
+async def test_pubmed_not_sent_to_backend():
+    """pubmed/pmc 是直连源：不进后端 sources，后端批次不含它们。"""
+    t = Tools(); t.valves = Tools.Valves()
+    calls = []
+    t._mcp_call = lambda tool, args, timeout=180: (calls.append(dict(args)), {"papers": [], "source_results": {}, "errors": {}})[1]
+    t._pubmed_search = lambda q, n, u=None: _async_ret([_paper_pubmed()])
+    t._pmc_search = lambda q, n, u=None: _async_ret([])
+    out = json.loads(await t.search_papers("glucose sensor biofouling", sources="arxiv,pubmed,pmc"))
+    assert calls, "arxiv 应走后端"
+    for c in calls:
+        assert "pubmed" not in c["sources"] and "pmc" not in c["sources"]
+    assert out["source_results"].get("pubmed") == 1
+    assert any(p["paper_id"] == "pubmed:111" for p in out["papers"])
+
+
+def _paper_pubmed():
+    return {"title": "x", "authors": "", "published_date": "", "abstract": "",
+            "paper_id": "pubmed:111", "doi": "", "source": "pubmed", "pdf_url": "",
+            "citations": 0, "url": ""}
+
+
+async def _async_ret(v):
+    return v
