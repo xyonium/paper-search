@@ -1618,6 +1618,19 @@ class Tools:
         variants = _make_query_variants(query)
         original, core = variants["original"], variants["core"]
 
+        # 各分支耗时诊断（用户可见，用于定位慢/超时源）
+        import time as _time
+        _t0 = _time.monotonic()
+        _timings = {}  # 分支名 → 耗时秒（一级分支 + backend 的 sem/lit 子调用）
+
+        async def _timed(name, coro_fn):
+            """包裹一个分支函数，记录耗时。coro_fn 是返回协程的无参函数。"""
+            t = _time.monotonic()
+            try:
+                return await coro_fn()
+            finally:
+                _timings[name] = round(_time.monotonic() - t, 1)
+
         zh_enabled, zh_key = self._zhihuiya_enabled_key(__user__)
         want_zh = zh_enabled and ("zhihuiya" in src_set or all_mode)
         want_hal = "hal" in src_set or all_mode
@@ -1651,16 +1664,20 @@ class Tools:
             if not all_mode and not backend_set:
                 # 只请了直连源（hal/zhihuiya/patsnap）→ 不调后端
                 return {"papers": [], "source_results": {}, "errors": {}}
-            args = {
-                "query": original,
-                "max_results_per_source": max_results_per_source,
-                "sources": (_BACKEND_ALL_SOURCES if all_mode else ",".join(sorted(backend_set))),
-            }
-            if biorxiv_category:
-                args["biorxiv_category"] = biorxiv_category
-            if medrxiv_category:
-                args["medrxiv_category"] = medrxiv_category
-            return await anyio.to_thread.run_sync(self._mcp_call, "search_papers", args)
+            t = _time.monotonic()
+            try:
+                args = {
+                    "query": original,
+                    "max_results_per_source": max_results_per_source,
+                    "sources": (_BACKEND_ALL_SOURCES if all_mode else ",".join(sorted(backend_set))),
+                }
+                if biorxiv_category:
+                    args["biorxiv_category"] = biorxiv_category
+                if medrxiv_category:
+                    args["medrxiv_category"] = medrxiv_category
+                return await anyio.to_thread.run_sync(self._mcp_call, "search_papers", args)
+            finally:
+                _timings["backend_sem"] = round(_time.monotonic() - t, 1)
 
         async def _backend_split():
             # core!=original：语义组 original + 字面组 core 两次并发
@@ -1669,20 +1686,28 @@ class Tools:
             labels = []
             if sem_set is None or sem_set:
                 async def _sem():
-                    args = {"query": original,
-                            "max_results_per_source": max_results_per_source,
-                            "sources": (_SEMANTIC_ALL_SOURCES if all_mode else ",".join(sorted(sem_set)))}
-                    if biorxiv_category: args["biorxiv_category"] = biorxiv_category
-                    if medrxiv_category: args["medrxiv_category"] = medrxiv_category
-                    return await anyio.to_thread.run_sync(self._mcp_call, "search_papers", args)
+                    t = _time.monotonic()
+                    try:
+                        args = {"query": original,
+                                "max_results_per_source": max_results_per_source,
+                                "sources": (_SEMANTIC_ALL_SOURCES if all_mode else ",".join(sorted(sem_set)))}
+                        if biorxiv_category: args["biorxiv_category"] = biorxiv_category
+                        if medrxiv_category: args["medrxiv_category"] = medrxiv_category
+                        return await anyio.to_thread.run_sync(self._mcp_call, "search_papers", args)
+                    finally:
+                        _timings["backend_sem"] = round(_time.monotonic() - t, 1)
                 tasks.append(_sem()); labels.append("sem")
             if backend_literal:
                 async def _lit():
-                    return await anyio.to_thread.run_sync(
-                        self._mcp_call, "search_papers",
-                        {"query": literal_query,
-                         "max_results_per_source": max_results_per_source,
-                         "sources": ",".join(sorted(backend_literal))})
+                    t = _time.monotonic()
+                    try:
+                        return await anyio.to_thread.run_sync(
+                            self._mcp_call, "search_papers",
+                            {"query": literal_query,
+                             "max_results_per_source": max_results_per_source,
+                             "sources": ",".join(sorted(backend_literal))})
+                    finally:
+                        _timings["backend_lit"] = round(_time.monotonic() - t, 1)
                 tasks.append(_lit()); labels.append("lit")
             results = await asyncio.gather(*tasks, return_exceptions=True)
             merged = {"papers": [], "source_results": {}, "errors": {}}
@@ -1724,27 +1749,27 @@ class Tools:
         async def _ieee():
             return await self._ieee_search(original, max_results_per_source, ieee_key)
 
-        # 组装并发分支
+        # 组装并发分支（每个分支计时，写入 _timings）
         branches = {}
-        branches["backend"] = _backend_split() if core != original else _backend_all()
+        branches["backend"] = _timed("backend", _backend_split if core != original else _backend_all)
         if want_zh:
-            branches["zhihuiya"] = _zh()
+            branches["zhihuiya"] = _timed("zhihuiya", _zh)
         if want_hal:
-            branches["hal"] = _hal()
+            branches["hal"] = _timed("hal", _hal)
         if want_dblp:
-            branches["dblp"] = _dblp()
+            branches["dblp"] = _timed("dblp", _dblp)
         if want_zenodo:
-            branches["zenodo"] = _zenodo()
+            branches["zenodo"] = _timed("zenodo", _zenodo)
         if want_openaire:
-            branches["openaire"] = _openaire()
+            branches["openaire"] = _timed("openaire", _openaire)
         if want_pubmed:
-            branches["pubmed"] = _pubmed()
+            branches["pubmed"] = _timed("pubmed", _pubmed)
         if want_pmc:
-            branches["pmc"] = _pmc()
+            branches["pmc"] = _timed("pmc", _pmc)
         if want_firecrawl:
-            branches["firecrawl"] = _fc()
+            branches["firecrawl"] = _timed("firecrawl", _fc)
         if want_ieee:
-            branches["ieee"] = _ieee()
+            branches["ieee"] = _timed("ieee", _ieee)
 
         keys = list(branches)
         results = await asyncio.gather(*branches.values(), return_exceptions=True)
@@ -1864,6 +1889,16 @@ class Tools:
                     adapted[s] = literal_query
             if adapted:
                 out["query_adapted"] = adapted
+
+        # ---- 各分支耗时诊断（用户可见）：定位慢/超时源，决定后续优化 ----
+        _total_s = round(_time.monotonic() - _t0, 1)
+        _timed_srcs = sorted(_timings.items(), key=lambda kv: -kv[1])
+        out["diagnostics"] = {
+            "total_seconds": _total_s,
+            "branch_seconds": dict(_timed_srcs),  # 各分支耗时（降序）
+            "slowest_branch": _timed_srcs[0][0] if _timed_srcs else "",
+            "slowest_seconds": _timed_srcs[0][1] if _timed_srcs else 0,
+        }
 
         # ---- web 搜索兜底链：tavily 主 → firecrawl 备：
         #      触发：任一请求的源出现连接/超时类错误（0 命中/400 参数错不算）。

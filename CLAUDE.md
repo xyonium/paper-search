@@ -138,6 +138,7 @@ zhihuiya/ieee/firecrawl 在默认列表中，但**必须同时满足两个条件
 - **境外学术 API 间歇性不稳定**（2026-08 实测）：出口链路对突发并发 TLS 流不稳（疑似中间设备 RST/限速）。无 timeout 的源（pubmed.py，已 v2.6 直连绕过）会无限挂起；有 timeout 的源（arxiv 3×30s、google_scholar 3×(30s+重试等待)~240s、crossref/openalex/pmc/core/europepmc 各 30s）偶发挂起时**有界但仍慢**——后端 `asyncio.gather` 等齐最慢源，叠加 tool.py `_mcp_call` 超时重试 1 次（+3s）后整批最坏 ~360s 才返回。首批（DNS/连接冷 + 并发突发）更易触发。直连源均带 3 次退避。
 - `all` 模式下后端源用 `_BACKEND_ALL_SOURCES`（排除直连源 hal/zhihuiya/patsnap/dblp/zenodo/ieee/openaire）；拆分时语义组用 `_SEMANTIC_ALL_SOURCES`（再排除字面组 doaj/iacr）。
 - 截断发生时返回 `query_adapted` 字段，列出各字面源实际用的精简查询。
+- **耗时诊断（v2.9）**：返回含 `diagnostics` 字段——`total_seconds`（整批耗时）、`branch_seconds`（各分支耗时降序：backend 一级 + backend_sem/backend_lit 子调用 + 各直连源）、`slowest_branch`/`slowest_seconds`（最慢分支）。用于定位慢/超时源（如 pmc 偶发 13s 拖垮整批），决定后续把哪些源直连出去或加退避。
 
 ### read_paper 全文 fallback 链（v2.7）
 
