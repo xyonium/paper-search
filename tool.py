@@ -1994,21 +1994,25 @@ class Tools:
         source: str,
         paper_id: str = "",
         pdf_url: str = "",
+        url: str = "",
         max_chars: int = 25000,
         __user__={},
     ) -> str:
         """
-        阅读论文全文（截断到 max_chars）。**务必同时传 pdf_url 和 url**——多数源无后端全文工具，
-        需靠 fallback 链自动提取。
+        阅读论文全文（截断到 max_chars）。**务必把 search 结果的 pdf_url 和 url 都传上**——
+        多数源无后端全文工具，需靠 fallback 链自动提取；url 是出版商落地页时抓取质量最高。
         - 后端直接可读: arxiv, biorxiv, medrxiv, iacr, semantic, doaj, hal
         - 其余源（openalex/crossref/pmc/core/europepmc/google_scholar/pubmed 等）:
-          后端无全文或仅元数据 → 自动走 fallback 链：pdf_url 下载 PDF → url/doi 落地页
-          → Unpaywall OA PDF → jina/tavily/firecrawl 网页抓取，全程无需人工干预
+          后端无全文或仅元数据 → 自动走 fallback 链：pdf_url 下载 PDF → url 出版商落地页
+          抓取 → 推导落地页(doi/pmid) → Unpaywall OA → jina/tavily/firecrawl，全程无需人工干预
+        - google_scholar: search 结果的 url 通常是出版商链接（nature/cell/science 等），
+          务必传 url；仅 paper_id(gs_xxx) 时无法反推，会报错
         - zhihuiya: 元数据级 read（abstract+著录），全文请用 doi 走 download_paper_to_knowledge
         - tavily/firecrawl: web 搜索结果，paper_id 含原始前缀（arxiv:xxx/pmid:xxx）时自动按对应源处理
         :param source: search 结果的 source 字段
         :param paper_id: search 结果的 paper_id 字段
         :param pdf_url: search 结果的 pdf_url 字段（有就必须传，PDF 提取是最高质量 fallback）
+        :param url: search 结果的 url 字段（出版商落地页，有就传；jina/firecrawl 可直接抓取）
         :param max_chars: 最大返回字符数
         """
         try:
@@ -2125,8 +2129,18 @@ class Tools:
             except Exception as e:
                 backend_err = f"{backend_err}；PDF fallback 失败: {e}".strip("；")
 
-        # ---- 网页抓取 fallback：落地页 → Unpaywall OA PDF → jina/tavily/firecrawl ----
+        # ---- 网页抓取 fallback：出版商 url → 落地页 → Unpaywall OA PDF → jina/tavily/firecrawl ----
         # 对无后端全文工具 / 后端返回"不支持"提示 / PDF 付费墙的源自动兜底，不返回死路错误。
+        # 优先用 search 结果传入的出版商 url（google_scholar/其他源的 url 多为出版商链接，质量最高）。
+        if url and url.startswith("http"):
+            ch, web = await self._web_read_fallback(url, __user__)
+            if web:
+                note = f"[经 {ch} 网页抓取全文：{url}]"
+                return f"{note}\n\n" + web[:max_chars] + (
+                    "\n\n[…全文截断…]" if len(web) > max_chars else ""
+                )
+            backend_err = f"{backend_err}；出版商 url 抓取失败".strip("；")
+
         landing = ""
         doi = ""
         if src == "crossref" and paper_id:
@@ -2178,6 +2192,17 @@ class Tools:
                     "\n\n[…全文截断…]" if len(text) > max_chars else ""
                 )
             backend_err = f"{backend_err}；网页抓取（jina/tavily/firecrawl）失败".strip("；")
+
+        # google_scholar 仅 paper_id(gs_xxx，hash 不可反推) 且无 url 时的专属引导
+        if src == "google_scholar" and not url and not pdf_url:
+            return json.dumps(
+                {
+                    "error": "google_scholar 全文需要出版商落地页 URL（paper_id 是 Scholar 内部 hash，无法反推）",
+                    "hint": "请把该条 search_papers 结果的 url 字段（出版商链接）作为 url 参数传入重试；"
+                            "若 search 结果 url 为空（Scholar 限流降级），改用 download_paper_to_knowledge 走 OA fallback 链",
+                },
+                ensure_ascii=False,
+            )
 
         return json.dumps(
             {

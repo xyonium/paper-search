@@ -163,9 +163,9 @@ Unpaywall 查 OA 直链（有 DOI 时）→ 是PDF下载 / 非PDF落地页则网
 ```
 
 - **前缀规范化** `_normalize_read_source`：firecrawl/tavily 的 paper_id 保留原始前缀（`arxiv:xxx`/`pmid:xxx`/`doi:xxx`），据此还原到对应源再处理（`pmid:40403180`→pubmed、`arxiv:xxx`→arxiv）。
-- **jina reader** 借鉴 reach-mcp `jina.py`：`https://r.jina.ai/{url}`，`Accept: text/plain` + `X-Retain-Images: none`，keyless 免费 20 RPM。对 pubmed/openalex 落地页有效；对 acs.org/doi.org 付费墙返回挑战页（被 junk 拦截，落 firecrawl）。
+- **`url` 参数**（v2.7.1）：read_paper 新增 `url` 参数，传 search 结果的出版商落地页 URL。链中**最先**尝试（质量最高）——jina 对 nature/cell/science 等出版商页面可抓 149k 全文。**google_scholar 必须传 url**：正常时其 search 结果 `url` 是出版商链接（cell.com/science.org/nature.com，容器实测），但限流降级时 Scholar 返回纯文本无链接标题（后端 `link['href']` 拿不到，`url=""`，容器直打 Scholar 实测 10/10 无 href）→ 此时 `gs_xxx` 是 hash 不可反推，报引导错误让 LLM 改走 download OA 链。
+- **jina reader** 借鉴 reach-mcp `jina.py`：`https://r.jina.ai/{url}`，`Accept: text/plain` + `X-Retain-Images: none`，keyless 免费 20 RPM。对 pubmed/openalex/出版商落地页有效；对 acs.org/doi.org 付费墙返回挑战页（被 junk 拦截，落 firecrawl）。
 - 成功时返回前缀标注来源：`[经 jina 网页抓取全文：url]` / `[经 firecrawl 网页抓取 OA 全文：url]`。
-- google_scholar（paper_id=`gs_xxx` 无 DOI/url/PDF）是唯一仍报错的源——无任何可推导 URL，属合理死路。
 
 | Platform | Search | Read Tool | Native Download | Notes |
 |---|---|---|---|---|
