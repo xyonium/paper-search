@@ -1279,6 +1279,17 @@ class Tools:
                 "citations": 0,
                 "url": url,
             })
+        # 富化 authors/year/doi（tavily 无 authors；paper_id 前缀可查 inspect_paper 时补）
+        for p in papers:
+            if p["authors"] and p["published_date"]:
+                continue
+            meta = await self._research_inspect(p["paper_id"], __user__)
+            if meta.get("authors") and not p["authors"]:
+                p["authors"] = meta["authors"]
+            if meta.get("year") and not p["published_date"]:
+                p["published_date"] = meta["year"]
+            if meta.get("doi") and not p["doi"]:
+                p["doi"] = meta["doi"]
         return papers
 
     @staticmethod
@@ -1369,9 +1380,44 @@ class Tools:
             })
         return papers
 
+    async def _research_inspect(self, paper_id: str, __user__=None) -> dict:
+        """firecrawl_research_inspect_paper：按 paperId 取完整元数据（authors/dates/doi/ids）。
+        用于富化 firecrawl/tavily 结果（它们 search 只回 title/abstract/id）。解析
+        fmtPaperMetadata 的 Markdown：'IDs: doi:.., pmid:..'、'Authors: a; b'、'Dates: created YYYY-MM-DD'。
+        失败/无数据返回 {}。"""
+        base = self._firecrawl_base(__user__)
+        if not base or not paper_id or ":" not in paper_id:
+            return {}
+        try:
+            raw = await anyio.to_thread.run_sync(
+                self._mcp_call_service_url, base, "firecrawl_research_inspect_paper",
+                {"paperId": paper_id}, 30)
+        except Exception:
+            return {}
+        text = raw if isinstance(raw, str) else ""
+        if not text or "not found" in text.lower():
+            return {}
+        out = {}
+        m = re.search(r"^IDs?:\s*(.+)$", text, re.M)
+        if m:
+            dm = re.search(r"doi:(10\.\d{4,9}/[^\s,]+)", m.group(1))
+            if dm:
+                out["doi"] = dm.group(1).rstrip(".,;)")
+        m = re.search(r"^Authors:\s*(.+)$", text, re.M)
+        if m:
+            out["authors"] = re.sub(r";\s*\+\d+ more$", "", m.group(1).strip())
+        m = re.search(r"^Dates?:\s*(.+)$", text, re.M)
+        if m:
+            ym = re.search(r"(19|20)\d{2}", m.group(1))
+            if ym:
+                out["year"] = ym.group(0)
+        return out
+
     async def _firecrawl_search_papers(self, query: str, limit: int, __user__=None) -> list:
         """firecrawl_research_search_papers 兜底：返回 Markdown 文本，解析成 paper dict。
-        base URL 用 Valves/UserValves.firecrawl_base_url（配了才走到这里）。"""
+        base URL 用 Valves/UserValves.firecrawl_base_url（配了才走到这里）。
+        search 端点只回 title/abstract/id（abstract 上游预截断带"…"，无法用参数改）；
+        authors/year/doi 靠 inspect_paper 富化（pmid/pmcid/arxiv 前缀可查）。"""
         base = self._firecrawl_base(__user__)
         raw = await anyio.to_thread.run_sync(
             self._mcp_call_service_url, base, "firecrawl_research_search_papers",
@@ -1397,6 +1443,15 @@ class Tools:
                 "citations": 0,
                 "url": "",
             })
+        # 富化 authors/year/doi（inspect_paper 按 id 查；pmid/pmcid/arxiv 前缀覆盖好）
+        for p in papers:
+            meta = await self._research_inspect(p["paper_id"], __user__)
+            if meta.get("authors"):
+                p["authors"] = meta["authors"]
+            if meta.get("year"):
+                p["published_date"] = meta["year"]
+            if meta.get("doi"):
+                p["doi"] = meta["doi"]
         return papers
 
     def _mcp_call(self, tool: str, args: dict, timeout: int = 180, _retried: bool = False):
