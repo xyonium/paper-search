@@ -206,7 +206,7 @@ async def test_search_papers_merges_zhihuiya_branch():
     t._mcp_call = lambda *a, **k: backend
     t._zhihuiya_search = fake_zh_search
 
-    out = json.loads(await t.search_papers("q", sources="arxiv,zhihuiya",
+    out = json.loads(await t.search_papers("q", sources="openalex,zhihuiya",
                                            __user__=_user()))
     assert out["source_results"]["zhihuiya"] == 1
     sources = {p["source"] for p in out["papers"]}
@@ -225,7 +225,7 @@ async def test_search_papers_zhihuiya_failure_isolated():
     t._mcp_call = lambda *a, **k: backend
     t._zhihuiya_search = boom
 
-    out = json.loads(await t.search_papers("q", sources="arxiv,zhihuiya",
+    out = json.loads(await t.search_papers("q", sources="openalex,zhihuiya",
                                            __user__=_user()))
     assert "zhihuiya" in out["errors"]
     assert out["source_results"]["zhihuiya"] == 0
@@ -326,7 +326,7 @@ async def test_search_papers_keeps_zhihuiya_when_backend_fails():
     t._mcp_call = boom_mcp
     t._zhihuiya_search = fake_zh_search
 
-    out = json.loads(await t.search_papers("q", sources="arxiv,zhihuiya",
+    out = json.loads(await t.search_papers("q", sources="openalex,zhihuiya",
                                            __user__=_user()))
     assert "backend" in out["errors"]
     assert out["source_results"]["zhihuiya"] == 1
@@ -878,8 +878,8 @@ async def test_pubmed_not_sent_to_backend():
     t._mcp_call = lambda tool, args, timeout=180: (calls.append(dict(args)), {"papers": [], "source_results": {}, "errors": {}})[1]
     t._pubmed_search = lambda q, n, u=None: _async_ret([_paper_pubmed()])
     t._pmc_search = lambda q, n, u=None: _async_ret([])
-    out = json.loads(await t.search_papers("glucose sensor biofouling", sources="arxiv,pubmed,pmc"))
-    assert calls, "arxiv 应走后端"
+    out = json.loads(await t.search_papers("glucose sensor biofouling", sources="openalex,pubmed,pmc"))
+    assert calls, "openalex 应走后端"
     for c in calls:
         assert "pubmed" not in c["sources"] and "pmc" not in c["sources"]
     assert out["source_results"].get("pubmed") == 1

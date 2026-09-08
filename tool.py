@@ -28,7 +28,7 @@ description: 学术论文搜索、全文阅读、PDF 下载入 Knowledge（RAG�
   5. read_patent(patent_number) → 读专利全文 markdown（权利要求+说明书+法律状态）
 author: openags-bridge
 requirements: requests, pymupdf, anyio
-version: 2.5.4
+version: 2.8.0
 license: MIT
 """
 
@@ -70,11 +70,13 @@ LITERAL_SOURCES = frozenset({"zhihuiya", "doaj"})
 # 直连源（绕后端 mcpo）。pubmed/pmc 直连原因（2026-08 实测）：后端 pubmed.py 走 HTTPS 且
 # requests.get 无 timeout，境外出口对突发并发 TLS 不稳（SSL EOF）时会无限挂起，asyncio.gather
 # 等齐所有源 → 整批 180s 超时，首批尤甚（DNS/连接冷 + 并发突发）；改走 HTTP + timeout=20 + 3次退避。
-DIRECT_SOURCES = frozenset({"zhihuiya", "hal", "patsnap", "dblp", "zenodo", "ieee", "openaire", "firecrawl", "pubmed", "pmc"})
-# 后端可提供服务的全部源（排除直连源 zhihuiya/hal/patsnap/dblp/zenodo/ieee/openaire/firecrawl/pubmed/pmc；
+# arxiv 直连原因（v2.8）：去 paper-search-mcp 依赖的第一步——后端适配器同步无超时是共同风险，
+# arxiv 是搜索量最大的源，先接管。注意 arxiv 走 https（http 会 301），与 NCBI 相反。
+DIRECT_SOURCES = frozenset({"arxiv", "zhihuiya", "hal", "patsnap", "dblp", "zenodo", "ieee", "openaire", "firecrawl", "pubmed", "pmc"})
+# 后端可提供服务的全部源（排除直连源 arxiv/zhihuiya/hal/patsnap/dblp/zenodo/ieee/openaire/firecrawl/pubmed/pmc；
 # citeseerx/base/ssrn/unpaywall/acm 等虽在后端但默认不启用）
 _BACKEND_ALL_SOURCES = (
-    "arxiv,biorxiv,medrxiv,iacr,semantic,crossref,openalex,core,"
+    "biorxiv,medrxiv,iacr,semantic,crossref,openalex,core,"
     "europepmc,doaj,google_scholar,ssrn,unpaywall,citeseerx,base,acm"
 )
 # all_mode 拆分时语义组使用的后端源（去掉字面源 doaj，留给 core 变体）
@@ -1133,6 +1135,110 @@ class Tools:
         except Exception as e:
             raise RuntimeError(f"PMC 检索失败: {e}")
 
+    # ---------- arXiv 直连（v2.8：替代后端 mcpo arxiv 源）----------
+    _ARXIV_API = "https://export.arxiv.org/api/query"
+    _ARXIV_NS = {"atom": "http://www.w3.org/2005/Atom",
+                 "arxiv": "http://arxiv.org/schemas/atom"}
+
+    def _arxiv_get(self, params: dict):
+        """arXiv Atom API GET，3 次退避；返回 response。注意 export.arxiv.org 的
+        http 会 301 到 https，必须直连 https（与 NCBI 刻意走 http 相反）。"""
+        import time
+        last_exc = None
+        for attempt in range(3):
+            try:
+                r = requests.get(
+                    self._ARXIV_API,
+                    params=params,
+                    headers={"User-Agent": "paper-search-tool/2.8 (OpenWebUI academic search)"},
+                    timeout=20,
+                )
+                if r.status_code == 200:
+                    return r
+                if r.status_code in (429, 500, 502, 503, 504):
+                    last_exc = RuntimeError(f"arXiv HTTP {r.status_code}")
+                else:
+                    r.raise_for_status()
+            except Exception as e:
+                if isinstance(e, requests.exceptions.HTTPError):
+                    raise
+                last_exc = e
+            if attempt < 2:
+                time.sleep([2, 4][attempt])
+        raise RuntimeError(f"arXiv API 失败（重试3次）: {last_exc}")
+
+    def _parse_arxiv_atom(self, root, limit: int) -> list:
+        """arXiv Atom feed → paper dict 列表。id 去掉 vN 版本后缀（ canonical id，
+        read/download 链按无版本 id 解析）。"""
+        papers = []
+        for entry in root.findall("atom:entry", self._ARXIV_NS):
+            if len(papers) >= limit:
+                break
+            id_url = self._xml_text(entry.find("atom:id", self._ARXIV_NS))
+            m = re.search(r"/abs/([^/\s]+)", id_url)
+            if not m:
+                continue
+            aid = re.sub(r"v\d+$", "", m.group(1))
+            title = re.sub(r"\s+", " ", self._xml_text(entry.find("atom:title", self._ARXIV_NS)))
+            if not title:
+                continue
+            authors = "; ".join(
+                n for n in (self._xml_text(a.find("atom:name", self._ARXIV_NS))
+                            for a in entry.findall("atom:author", self._ARXIV_NS)) if n
+            )
+            abstract = re.sub(r"\s+", " ", self._xml_text(entry.find("atom:summary", self._ARXIV_NS)))
+            published = self._xml_text(entry.find("atom:published", self._ARXIV_NS))[:10]
+            doi = self._xml_text(entry.find("arxiv:doi", self._ARXIV_NS))
+            papers.append({
+                "title": title,
+                "authors": authors,
+                "published_date": published,
+                "abstract": abstract,
+                "paper_id": f"arxiv:{aid}",
+                "doi": doi,
+                "source": "arxiv",
+                "pdf_url": f"https://arxiv.org/pdf/{aid}",
+                "citations": 0,
+                "url": f"https://arxiv.org/abs/{aid}",
+            })
+        return papers
+
+    async def _arxiv_search(self, query: str, limit: int) -> list:
+        """直连 arXiv Atom API。arXiv 查询语法是字段级布尔组合：全词 AND 过严
+        （2026-09 实测 3 个专精词相交即 0 命中），全词 OR 则被高频词灌入噪声
+        （sortBy=relevance 也压不住）。因此做逐级放宽：先 AND 全部词（≤5 个），
+        0 命中就砍尾词重试，直到剩 1 个最高区分度词——专精查询（如 iCVD）最终
+        落在稀有词上结果仍精准，常见查询通常首次即中。调用方传 core 变体。
+        单次请求即含 title/authors/abstract/doi 全部元数据，无需二次 fetch。"""
+        from xml.etree import ElementTree as ET
+
+        terms = [re.sub(r'["():\\]', "", t) for t in (query or "").split()]
+        terms = [t for t in terms if t]
+        if len(terms) > 6:
+            terms = _distill_core_terms(" ".join(terms), max_terms=6).split()
+        if not terms:
+            return []
+
+        def _fetch():
+            n = int(limit)
+            for k in range(min(len(terms), 5), 0, -1):
+                r = self._arxiv_get({
+                    "search_query": " AND ".join(f"all:{t}" for t in terms[:k]),
+                    "start": 0,
+                    "max_results": max(1, min(n, 100)),
+                    "sortBy": "relevance",
+                    "sortOrder": "descending",
+                })
+                papers = self._parse_arxiv_atom(ET.fromstring(r.content), n)
+                if papers:
+                    return papers
+            return []
+
+        try:
+            return await anyio.to_thread.run_sync(_fetch)
+        except Exception as e:
+            raise RuntimeError(f"arXiv 检索失败: {e}")
+
     # ---------- web 搜索兜底（tavily 优先，firecrawl 备选；配了 base_url 才启用）----------
     _FC_NET_ERR_MARKERS = (
         "超时", "timed out", "timeout", "ssl", "eof", "connection", "refused",
@@ -1639,6 +1745,7 @@ class Tools:
         want_openaire = "openaire" in src_set or all_mode
         want_pubmed = "pubmed" in src_set or all_mode
         want_pmc = "pmc" in src_set or all_mode
+        want_arxiv = "arxiv" in src_set or all_mode
         # firecrawl 是独立源：配了 firecrawl_base_url 且在 sources 里才启用
         want_firecrawl = bool(self._firecrawl_base(__user__)) and ("firecrawl" in src_set or all_mode)
         ieee_enabled, ieee_key = self._ieee_enabled_key(__user__)
@@ -1742,6 +1849,10 @@ class Tools:
         async def _pmc():
             return await self._pmc_search(original, max_results_per_source, __user__)
 
+        async def _arxiv():
+            # arxiv 字段布尔语法：自然语言整句全词 AND 会 0 命中，用 core 变体
+            return await self._arxiv_search(core, max_results_per_source)
+
         async def _fc():
             # firecrawl 内部有查询处理，但保守起见用 core（去噪声词，保语义不截断）
             return await self._firecrawl_search_papers(core, max_results_per_source, __user__)
@@ -1766,6 +1877,8 @@ class Tools:
             branches["pubmed"] = _timed("pubmed", _pubmed)
         if want_pmc:
             branches["pmc"] = _timed("pmc", _pmc)
+        if want_arxiv:
+            branches["arxiv"] = _timed("arxiv", _arxiv)
         if want_firecrawl:
             branches["firecrawl"] = _timed("firecrawl", _fc)
         if want_ieee:
@@ -1785,9 +1898,10 @@ class Tools:
         ieee_result = outcome.get("ieee")
         pubmed_result = outcome.get("pubmed")
         pmc_result = outcome.get("pmc")
+        arxiv_result = outcome.get("arxiv")
 
         # 后端失败处理：若任一直连源有结果则保留，否则报错
-        direct_ok = [r for r in (zh_result, hal_result, dblp_result, zenodo_result, openaire_result, firecrawl_result, ieee_result, pubmed_result, pmc_result) if isinstance(r, list) and r]
+        direct_ok = [r for r in (zh_result, hal_result, dblp_result, zenodo_result, openaire_result, firecrawl_result, ieee_result, pubmed_result, pmc_result, arxiv_result) if isinstance(r, list) and r]
         if isinstance(backend_result, Exception):
             if direct_ok:
                 result = {"papers": [], "source_results": {},
@@ -1862,6 +1976,14 @@ class Tools:
                 mp = [self._trim_paper(p) for p in pmc_result]
                 papers.extend(mp)
                 source_results["pmc"] = len(mp)
+        if want_arxiv:
+            if isinstance(arxiv_result, Exception):
+                source_results["arxiv"] = 0
+                errors["arxiv"] = str(arxiv_result)
+            elif arxiv_result is not None:
+                ap = [self._trim_paper(p) for p in arxiv_result]
+                papers.extend(ap)
+                source_results["arxiv"] = len(ap)
         if want_firecrawl:
             if isinstance(firecrawl_result, Exception):
                 source_results["firecrawl"] = 0
