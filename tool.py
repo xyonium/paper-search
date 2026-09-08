@@ -11,6 +11,8 @@ description: 学术论文搜索、全文阅读、PDF 下载入 Knowledge（RAG�
   · 学科新论文浏览（非关键词检索，需 sources+biorxiv_category 显式用）: biorxiv, medrxiv
   · 不稳定（可能 403/超时，失败自动降级）: google_scholar, ssrn, base, citeseerx
   · 不可用: acm（未实现）, unpaywall（仅DOI查询，用于下载 fallback）
+  · v2.9 起 semantic/openalex/crossref/europepmc/core/biorxiv/medrxiv/iacr 转直连，
+    后端 mcpo 仅剩 doaj/google_scholar/ssrn/unpaywall/citeseerx/base/acm 作安全网
 
   【查询适配】search_papers 按源自动分发查询变体（不损语义，LLM 无需处理）：
   · 大多数源用原始完整查询；zhihuiya/doaj 对长自然语言会 0 命中，
@@ -28,7 +30,7 @@ description: 学术论文搜索、全文阅读、PDF 下载入 Knowledge（RAG�
   5. read_patent(patent_number) → 读专利全文 markdown（权利要求+说明书+法律状态）
 author: openags-bridge
 requirements: requests, pymupdf, anyio
-version: 2.8.0
+version: 2.9.0
 license: MIT
 """
 
@@ -72,12 +74,18 @@ LITERAL_SOURCES = frozenset({"zhihuiya", "doaj"})
 # 等齐所有源 → 整批 180s 超时，首批尤甚（DNS/连接冷 + 并发突发）；改走 HTTP + timeout=20 + 3次退避。
 # arxiv 直连原因（v2.8）：去 paper-search-mcp 依赖的第一步——后端适配器同步无超时是共同风险，
 # arxiv 是搜索量最大的源，先接管。注意 arxiv 走 https（http 会 301），与 NCBI 相反。
-DIRECT_SOURCES = frozenset({"arxiv", "zhihuiya", "hal", "patsnap", "dblp", "zenodo", "ieee", "openaire", "firecrawl", "pubmed", "pmc"})
-# 后端可提供服务的全部源（排除直连源 arxiv/zhihuiya/hal/patsnap/dblp/zenodo/ieee/openaire/firecrawl/pubmed/pmc；
+# v2.9：semantic/openalex/crossref/europepmc/core/biorxiv/medrxiv/iacr 全部转直连
+# （后端 mcpo 仅剩 doaj/google_scholar/ssrn/unpaywall/citeseerx/base/acm 作安全网）。
+DIRECT_SOURCES = frozenset({
+    "arxiv", "zhihuiya", "hal", "patsnap", "dblp", "zenodo", "ieee", "openaire",
+    "firecrawl", "pubmed", "pmc",
+    "semantic", "openalex", "crossref", "europepmc", "core",
+    "biorxiv", "medrxiv", "iacr",
+})
+# 后端可提供服务的全部源（v2.9 起仅剩未直连的：doaj 字面源 + 不稳定源 + 特殊用途源；
 # citeseerx/base/ssrn/unpaywall/acm 等虽在后端但默认不启用）
 _BACKEND_ALL_SOURCES = (
-    "biorxiv,medrxiv,iacr,semantic,crossref,openalex,core,"
-    "europepmc,doaj,google_scholar,ssrn,unpaywall,citeseerx,base,acm"
+    "doaj,google_scholar,ssrn,unpaywall,citeseerx,base,acm"
 )
 # all_mode 拆分时语义组使用的后端源（去掉字面源 doaj，留给 core 变体）
 _SEMANTIC_ALL_SOURCES = ",".join(
@@ -193,6 +201,14 @@ class Tools:
         jina_api_key: str = Field(
             default="",
             description="Jina Reader API key（管理员级，可选）。read_paper 的网页全文 fallback 用 r.jina.ai：不配 key 免费 20 RPM，配了 500 RPM。留空走 keyless",
+        )
+        semantic_api_key: str = Field(
+            default="",
+            description="Semantic Scholar Graph API key（管理员级，可选）。用于 semantic 直连检索：配了独立配额（1 RPS），留空走匿名共享池（易被限流 429，已自动退避重试）。403 说明 key 失效，会自动降级匿名重试一次",
+        )
+        core_api_key: str = Field(
+            default="",
+            description="CORE API key（管理员级，可选）。用于 core 直连检索：留空走匿名（配额低），401/403 时自动降级匿名重试一次",
         )
 
     class UserValves(BaseModel):
@@ -1239,6 +1255,456 @@ class Tools:
         except Exception as e:
             raise RuntimeError(f"arXiv 检索失败: {e}")
 
+    # ---------- v2.9 直连批次二：semantic/openalex/crossref/europepmc/core/biorxiv/medrxiv/iacr ----------
+    # 共同模式：_http_get 统一重试（429/5xx 退避 3 次，其余 4xx 立即失败）→ 源专属解析。
+    # 全部用 original 查询变体（这些 API 原生支持自然语言/全文检索，不需要 arxiv 式字段布尔）。
+
+    def _http_get(self, url: str, params: dict, name: str, headers: dict = None,
+                  honor_retry_after: bool = False):
+        """JSON/HTML API GET，3 次退避；429/5xx 重试，其余 4xx 立即失败（RuntimeError
+        含 "HTTP <code>"，供调用方识别 401/403 做降级）。honor_retry_after=True 时
+        429 优先遵守 Retry-After 头（上限 10s）。返回 response 对象。"""
+        import time
+        last_exc = None
+        for attempt in range(3):
+            try:
+                r = requests.get(
+                    url,
+                    params=params,
+                    headers={"User-Agent": "paper-search-tool/2.9 (OpenWebUI academic search)",
+                             **(headers or {})},
+                    timeout=20,
+                )
+                if r.status_code == 200:
+                    return r
+                if r.status_code in (429, 500, 502, 503, 504):
+                    last_exc = RuntimeError(f"{name} HTTP {r.status_code}")
+                    if r.status_code == 429 and honor_retry_after:
+                        ra = r.headers.get("Retry-After", "")
+                        if ra.isdigit() and attempt < 2:
+                            time.sleep(min(int(ra), 10))
+                            continue
+                else:
+                    raise RuntimeError(f"{name} HTTP {r.status_code}")
+            except RuntimeError:
+                raise
+            except Exception as e:
+                last_exc = e
+            if attempt < 2:
+                time.sleep([2, 4][attempt])
+        raise RuntimeError(f"{name} API 失败（重试3次）: {last_exc}")
+
+    # ---------- Semantic Scholar 直连 ----------
+    _S2_API = "https://api.semanticscholar.org/graph/v1/paper/search"
+    _S2_FIELDS = ("title,abstract,year,citationCount,authors,url,"
+                  "publicationDate,externalIds,openAccessPdf")
+
+    def _semantic_key(self, __user__=None) -> str:
+        uv = __user__.get("valves") if __user__ else None
+        return ((getattr(uv, "semantic_api_key", "") or "").strip()
+                or (getattr(self.valves, "semantic_api_key", "") or "").strip())
+
+    async def _semantic_search(self, query: str, limit: int, __user__=None) -> list:
+        """直连 S2 Graph API。匿名共享池极易 429（实测同 IP 有 shim 在用更甚），
+        遵守 Retry-After 重试；配 key 后 403 说明 key 被拒，自动降级匿名重试一次。"""
+        def _fetch():
+            key = self._semantic_key(__user__)
+            params = {"query": query, "limit": min(max(1, int(limit)), 100),
+                      "fields": self._S2_FIELDS}
+            try:
+                data = self._http_get(
+                    self._S2_API, params, "Semantic Scholar",
+                    headers={"x-api-key": key} if key else None,
+                    honor_retry_after=True).json()
+            except RuntimeError as e:
+                if key and "HTTP 403" in str(e):
+                    data = self._http_get(self._S2_API, params, "Semantic Scholar",
+                                          honor_retry_after=True).json()
+                else:
+                    raise
+            papers = []
+            for it in (data.get("data") or []):
+                if len(papers) >= limit:
+                    break
+                pid = it.get("paperId") or ""
+                title = (it.get("title") or "").strip()
+                if not pid or not title:
+                    continue
+                ext = it.get("externalIds") or {}
+                oapdf = it.get("openAccessPdf") or {}
+                pdf_url = oapdf.get("url") or ""
+                if not pdf_url and oapdf.get("disclaimer"):
+                    # openAccessPdf.url 为空时 disclaimer 里常嵌直链（doi.org/arxiv）
+                    m = re.search(r"https?://[^\s,)]+", oapdf["disclaimer"])
+                    pdf_url = m.group(0) if m else ""
+                papers.append({
+                    "title": title,
+                    "authors": "; ".join(a.get("name", "") for a in (it.get("authors") or [])
+                                         if a.get("name")),
+                    "published_date": it.get("publicationDate") or str(it.get("year") or ""),
+                    "abstract": it.get("abstract") or "",
+                    "paper_id": f"semantic:{pid}",
+                    "doi": ext.get("DOI") or "",
+                    "source": "semantic",
+                    "pdf_url": pdf_url,
+                    "citations": it.get("citationCount") or 0,
+                    "url": it.get("url") or f"https://www.semanticscholar.org/paper/{pid}",
+                })
+            return papers
+
+        try:
+            return await anyio.to_thread.run_sync(_fetch)
+        except Exception as e:
+            raise RuntimeError(f"Semantic Scholar 检索失败: {e}")
+
+    # ---------- OpenAlex 直连 ----------
+    _OPENALEX_API = "https://api.openalex.org/works"
+
+    @staticmethod
+    def _openalex_abstract(inverted_index: dict) -> str:
+        """OpenAlex 用倒排索引存摘要（省空间），按位置重建原文。"""
+        if not inverted_index:
+            return ""
+        try:
+            pos_words = [(p, w) for w, ps in inverted_index.items() for p in ps]
+            pos_words.sort()
+            return " ".join(w for _, w in pos_words)
+        except Exception:
+            return ""
+
+    async def _openalex_search(self, query: str, limit: int) -> list:
+        def _fetch():
+            data = self._http_get(self._OPENALEX_API,
+                                  {"search": query, "per-page": min(max(1, int(limit)), 200)},
+                                  "OpenAlex").json()
+            papers = []
+            for it in (data.get("results") or []):
+                if len(papers) >= limit:
+                    break
+                wid = (it.get("id") or "").replace("https://openalex.org/", "")
+                title = (it.get("title") or "").strip()
+                if not wid or not title:
+                    continue
+                loc = it.get("primary_location") or {}
+                oa = it.get("open_access") or {}
+                pdf_url = loc.get("pdf_url") or ""
+                if not pdf_url and oa.get("is_oa"):
+                    pdf_url = oa.get("oa_url") or ""
+                papers.append({
+                    "title": title,
+                    "authors": "; ".join(
+                        a.get("author", {}).get("display_name", "")
+                        for a in (it.get("authorships") or [])
+                        if a.get("author", {}).get("display_name")),
+                    "published_date": it.get("publication_date") or "",
+                    "abstract": self._openalex_abstract(it.get("abstract_inverted_index")),
+                    "paper_id": f"openalex:{wid}",
+                    "doi": (it.get("doi") or "").replace("https://doi.org/", ""),
+                    "source": "openalex",
+                    "pdf_url": pdf_url,
+                    "citations": it.get("cited_by_count") or 0,
+                    "url": loc.get("landing_page_url") or it.get("id") or "",
+                })
+            return papers
+
+        try:
+            return await anyio.to_thread.run_sync(_fetch)
+        except Exception as e:
+            raise RuntimeError(f"OpenAlex 检索失败: {e}")
+
+    # ---------- Crossref 直连 ----------
+    _CROSSREF_API = "https://api.crossref.org/works"
+
+    async def _crossref_search(self, query: str, limit: int) -> list:
+        """直连 Crossref。注意 title 是 list；abstract 可能带 JATS 标签需剥离；
+        日期在 published/issued/created 的 date-parts[[y,m,d]]（允许只有年）。"""
+        def _fetch():
+            data = self._http_get(self._CROSSREF_API,
+                                  {"query": query, "rows": min(max(1, int(limit)), 100)},
+                                  "Crossref").json()
+            papers = []
+            for it in (((data.get("message") or {}).get("items")) or []):
+                if len(papers) >= limit:
+                    break
+                t = it.get("title") or []
+                title = (t[0] if isinstance(t, list) and t else str(t or "")).strip()
+                doi = it.get("DOI") or ""
+                if not title or not doi:
+                    continue
+                authors = []
+                for a in (it.get("author") or []):
+                    if isinstance(a, dict):
+                        nm = " ".join(x for x in (a.get("given", ""), a.get("family", "")) if x)
+                        if nm:
+                            authors.append(nm)
+                date = ""
+                for fld in ("published", "issued", "created"):
+                    parts = (((it.get(fld) or {}).get("date-parts")) or [[]])[0]
+                    if parts:
+                        date = str(parts[0]) + "".join(
+                            f"-{str(p).zfill(2)}" for p in parts[1:3])
+                        break
+                pdf_url = ""
+                for ln in (it.get("link") or []):
+                    if (isinstance(ln, dict)
+                            and ln.get("content-type") == "application/pdf"
+                            and ln.get("URL")):
+                        pdf_url = ln["URL"]
+                        break
+                cit = it.get("is-referenced-by-count")
+                papers.append({
+                    "title": title,
+                    "authors": "; ".join(authors),
+                    "published_date": date,
+                    "abstract": re.sub(r"\s+", " ",
+                                       re.sub(r"<[^>]+>", " ", it.get("abstract") or "")).strip(),
+                    "paper_id": f"crossref:{doi}",
+                    "doi": doi,
+                    "source": "crossref",
+                    "pdf_url": pdf_url,
+                    "citations": cit if isinstance(cit, int) else 0,
+                    "url": it.get("URL") or f"https://doi.org/{doi}",
+                })
+            return papers
+
+        try:
+            return await anyio.to_thread.run_sync(_fetch)
+        except Exception as e:
+            raise RuntimeError(f"Crossref 检索失败: {e}")
+
+    # ---------- Europe PMC 直连 ----------
+    _EUPMC_API = "https://www.ebi.ac.uk/europepmc/webservices/rest/search"
+
+    async def _europepmc_search(self, query: str, limit: int) -> list:
+        """直连 Europe PMC。id 按 source 字段区分：MED→pmid:、PMC→pmc:（补 PMC 前缀）、
+        其他→europepmc:。pdf_url 从 fullTextUrlList 挑 documentStyle=pdf。"""
+        def _fetch():
+            data = self._http_get(self._EUPMC_API,
+                                  {"query": query, "format": "json",
+                                   "pageSize": min(max(1, int(limit)), 100)},
+                                  "Europe PMC").json()
+            papers = []
+            for it in (((data.get("resultList") or {}).get("result")) or []):
+                if len(papers) >= limit:
+                    break
+                rid = str(it.get("id") or "")
+                title = (it.get("title") or "").strip()
+                if not rid or not title:
+                    continue
+                kind = it.get("source") or ""
+                if kind == "MED":
+                    pid = f"pmid:{rid}"
+                elif kind == "PMC":
+                    pmcid = rid if rid.startswith("PMC") else f"PMC{rid}"
+                    pid = f"pmc:{pmcid}"
+                else:
+                    pmcid = ""
+                    pid = f"europepmc:{rid}"
+                authors = []
+                al = (it.get("authorList") or {}).get("author") or []
+                for a in al:
+                    if isinstance(a, dict) and a.get("fullName"):
+                        authors.append(a["fullName"])
+                    elif isinstance(a, str):
+                        authors.append(a)
+                doi = it.get("doi") or ""
+                y = str(it.get("pubYear") or "")
+                mo, dy = str(it.get("pubMonth") or ""), str(it.get("pubDay") or "")
+                date = y
+                if y and mo.isdigit():
+                    date = f"{y}-{mo.zfill(2)}" + (f"-{dy.zfill(2)}" if dy.isdigit() else "")
+                landing, pdf_url = "", ""
+                ftl = (it.get("fullTextUrlList") or {}).get("fullTextUrl") or []
+                if isinstance(ftl, dict):
+                    ftl = [ftl]
+                for u in ftl:
+                    if not isinstance(u, dict):
+                        continue
+                    style, uval = u.get("documentStyle"), (u.get("url") or "")
+                    if style == "pdf" and not pdf_url:
+                        pdf_url = uval
+                    elif style == "html" and not landing:
+                        landing = uval
+                if not landing:
+                    if doi:
+                        landing = f"https://doi.org/{doi}"
+                    elif kind == "MED":
+                        landing = f"https://pubmed.ncbi.nlm.nih.gov/{rid}/"
+                    elif kind == "PMC":
+                        landing = f"https://www.ncbi.nlm.nih.gov/pmc/articles/{pmcid}/"
+                papers.append({
+                    "title": title,
+                    "authors": "; ".join(authors),
+                    "published_date": date,
+                    "abstract": it.get("abstractText") or "",
+                    "paper_id": pid,
+                    "doi": doi,
+                    "source": "europepmc",
+                    "pdf_url": pdf_url,
+                    "citations": 0,
+                    "url": landing,
+                })
+            return papers
+
+        try:
+            return await anyio.to_thread.run_sync(_fetch)
+        except Exception as e:
+            raise RuntimeError(f"Europe PMC 检索失败: {e}")
+
+    # ---------- CORE 直连 ----------
+    _CORE_API = "https://api.core.ac.uk/v3/search/works"
+
+    def _core_key(self, __user__=None) -> str:
+        uv = __user__.get("valves") if __user__ else None
+        return ((getattr(uv, "core_api_key", "") or "").strip()
+                or (getattr(self.valves, "core_api_key", "") or "").strip())
+
+    async def _core_search(self, query: str, limit: int, __user__=None) -> list:
+        """直连 CORE v3。匿名可用但配额低；配 key 后 401/403 自动降级匿名重试一次。"""
+        def _fetch():
+            key = self._core_key(__user__)
+            params = {"q": query, "limit": min(max(1, int(limit)), 100), "offset": 0}
+            try:
+                data = self._http_get(
+                    self._CORE_API, params, "CORE",
+                    headers={"Authorization": f"Bearer {key}"} if key else None).json()
+            except RuntimeError as e:
+                if key and ("HTTP 401" in str(e) or "HTTP 403" in str(e)):
+                    data = self._http_get(self._CORE_API, params, "CORE").json()
+                else:
+                    raise
+            papers = []
+            for it in (data.get("results") or []):
+                if len(papers) >= limit:
+                    break
+                cid = it.get("id")
+                title = (it.get("title") or "").strip()
+                if not cid or not title:
+                    continue
+                authors = []
+                for a in (it.get("authors") or []):
+                    nm = a.get("name", "") if isinstance(a, dict) else str(a)
+                    if nm:
+                        authors.append(nm)
+                doi = it.get("doi") or ""
+                pdf_url = ""
+                dl = it.get("downloadUrl")
+                if isinstance(dl, str) and dl.lower().endswith(".pdf"):
+                    pdf_url = dl
+                else:
+                    for u in (it.get("fullTextUrls") or []):
+                        if isinstance(u, str) and u.lower().endswith(".pdf"):
+                            pdf_url = u
+                            break
+                papers.append({
+                    "title": title,
+                    "authors": "; ".join(authors),
+                    "published_date": str(it.get("publishedDate") or "")[:10],
+                    "abstract": it.get("abstract") or "",
+                    "paper_id": f"core:{cid}",
+                    "doi": doi,
+                    "source": "core",
+                    "pdf_url": pdf_url,
+                    "citations": 0,
+                    "url": it.get("url") or (f"https://doi.org/{doi}" if doi else ""),
+                })
+            return papers
+
+        try:
+            return await anyio.to_thread.run_sync(_fetch)
+        except Exception as e:
+            raise RuntimeError(f"CORE 检索失败: {e}")
+
+    # ---------- bioRxiv / medRxiv 直连（学科浏览，非关键词检索）----------
+    async def _rxiv_search(self, server: str, category: str, limit: int) -> list:
+        """bioRxiv/medRxiv 直连（两站共用 api.biorxiv.org/details/{server}/...）。
+        注意：这不是关键词检索——API 只支持按学科分类浏览近 30 天新论文；
+        category 为空时返回全学科最新（噪声大，仅显式点名该源时才这么干）。"""
+        from datetime import datetime, timedelta
+        cat = (category or "").strip().lower().replace(" ", "_")
+        end = datetime.now().strftime("%Y-%m-%d")
+        start = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
+
+        def _fetch():
+            data = self._http_get(
+                f"https://api.biorxiv.org/details/{server}/{start}/{end}/0",
+                {"category": cat} if cat else None, server).json()
+            papers = []
+            for it in (data.get("collection") or []):
+                if len(papers) >= limit:
+                    break
+                doi = (it.get("doi") or "").strip()
+                title = re.sub(r"\s+", " ", (it.get("title") or "").strip())
+                if not doi or not title:
+                    continue
+                base = f"https://www.{server}.org/content/{doi}v{it.get('version') or '1'}"
+                papers.append({
+                    "title": title,
+                    "authors": re.sub(r"\s*;\s*", "; ", it.get("authors") or ""),
+                    "published_date": it.get("date") or "",
+                    "abstract": it.get("abstract") or "",
+                    "paper_id": f"{server}:{doi}",
+                    "doi": doi,
+                    "source": server,
+                    "pdf_url": base + ".full.pdf",
+                    "citations": 0,
+                    "url": base,
+                })
+            return papers
+
+        try:
+            return await anyio.to_thread.run_sync(_fetch)
+        except Exception as e:
+            raise RuntimeError(f"{server} 检索失败: {e}")
+
+    # ---------- IACR ePrint 直连（HTML 正则解析，无 JSON API）----------
+    _IACR_API = "https://eprint.iacr.org/search"
+
+    async def _iacr_search(self, query: str, limit: int) -> list:
+        """直连 IACR ePrint 搜索页。页面用 Xapian 把自然语言查询词干化后 AND 组合，
+        结果按 ID 倒序（最新优先）。没有 JSON API，只能解析 HTML——工具依赖只有
+        requests/pymupdf/anyio（不引入 bs4），用正则提取固定 class 标记。"""
+        import html as _html
+
+        def _clean(s: str) -> str:
+            return re.sub(r"\s+", " ",
+                          _html.unescape(re.sub(r"<[^>]+>", " ", s or ""))).strip()
+
+        def _fetch():
+            r = self._http_get(self._IACR_API, {"q": query}, "IACR")
+            papers = []
+            for blk in r.text.split('<div class="mb-4">')[1:]:
+                if len(papers) >= limit:
+                    break
+                m = re.search(r'class="paperlink" href="(/\d+/\d+)"[^>]*>([^<]+)</a>', blk)
+                t = re.search(r"<strong>(.*?)</strong>", blk, re.S)
+                if not m or not t:
+                    continue
+                pid = m.group(2).strip()  # 形如 2026/1892
+                am = re.search(r'<span class="fst-italic">(.*?)</span>', blk, re.S)
+                ab = re.search(r'<p class="mb-0 mt-1 search-abstract">(.*?)</p>', blk, re.S)
+                dt = re.search(r"Last updated:\s*([\d-]+)", blk)
+                authors = "; ".join(a.strip() for a in _clean(am.group(1)).split(",")
+                                    if a.strip()) if am else ""
+                papers.append({
+                    "title": _clean(t.group(1)),
+                    "authors": authors,
+                    "published_date": dt.group(1) if dt else "",
+                    "abstract": _clean(ab.group(1)) if ab else "",
+                    "paper_id": f"iacr:{pid}",
+                    "doi": "",
+                    "source": "iacr",
+                    "pdf_url": f"https://eprint.iacr.org/{pid}.pdf",
+                    "citations": 0,
+                    "url": f"https://eprint.iacr.org/{pid}",
+                })
+            return papers
+
+        try:
+            return await anyio.to_thread.run_sync(_fetch)
+        except Exception as e:
+            raise RuntimeError(f"IACR 检索失败: {e}")
+
     # ---------- web 搜索兜底（tavily 优先，firecrawl 备选；配了 base_url 才启用）----------
     _FC_NET_ERR_MARKERS = (
         "超时", "timed out", "timeout", "ssl", "eof", "connection", "refused",
@@ -1746,6 +2212,16 @@ class Tools:
         want_pubmed = "pubmed" in src_set or all_mode
         want_pmc = "pmc" in src_set or all_mode
         want_arxiv = "arxiv" in src_set or all_mode
+        want_semantic = "semantic" in src_set or all_mode
+        want_openalex = "openalex" in src_set or all_mode
+        want_crossref = "crossref" in src_set or all_mode
+        want_europepmc = "europepmc" in src_set or all_mode
+        want_core = "core" in src_set or all_mode
+        want_iacr = "iacr" in src_set or all_mode
+        # biorxiv/medrxiv 是学科浏览（非关键词检索）：显式点名才启用；
+        # all 模式下不传分类就是全学科噪声，故 all 需带对应 category 才启用
+        want_biorxiv = "biorxiv" in src_set or (all_mode and bool(biorxiv_category))
+        want_medrxiv = "medrxiv" in src_set or (all_mode and bool(medrxiv_category))
         # firecrawl 是独立源：配了 firecrawl_base_url 且在 sources 里才启用
         want_firecrawl = bool(self._firecrawl_base(__user__)) and ("firecrawl" in src_set or all_mode)
         ieee_enabled, ieee_key = self._ieee_enabled_key(__user__)
@@ -1853,6 +2329,30 @@ class Tools:
             # arxiv 字段布尔语法：自然语言整句全词 AND 会 0 命中，用 core 变体
             return await self._arxiv_search(core, max_results_per_source)
 
+        async def _semantic():
+            return await self._semantic_search(original, max_results_per_source, __user__)
+
+        async def _openalex():
+            return await self._openalex_search(original, max_results_per_source)
+
+        async def _crossref():
+            return await self._crossref_search(original, max_results_per_source)
+
+        async def _europepmc():
+            return await self._europepmc_search(original, max_results_per_source)
+
+        async def _core():
+            return await self._core_search(original, max_results_per_source, __user__)
+
+        async def _biorxiv():
+            return await self._rxiv_search("biorxiv", biorxiv_category, max_results_per_source)
+
+        async def _medrxiv():
+            return await self._rxiv_search("medrxiv", medrxiv_category, max_results_per_source)
+
+        async def _iacr():
+            return await self._iacr_search(original, max_results_per_source)
+
         async def _fc():
             # firecrawl 内部有查询处理，但保守起见用 core（去噪声词，保语义不截断）
             return await self._firecrawl_search_papers(core, max_results_per_source, __user__)
@@ -1879,6 +2379,22 @@ class Tools:
             branches["pmc"] = _timed("pmc", _pmc)
         if want_arxiv:
             branches["arxiv"] = _timed("arxiv", _arxiv)
+        if want_semantic:
+            branches["semantic"] = _timed("semantic", _semantic)
+        if want_openalex:
+            branches["openalex"] = _timed("openalex", _openalex)
+        if want_crossref:
+            branches["crossref"] = _timed("crossref", _crossref)
+        if want_europepmc:
+            branches["europepmc"] = _timed("europepmc", _europepmc)
+        if want_core:
+            branches["core"] = _timed("core", _core)
+        if want_biorxiv:
+            branches["biorxiv"] = _timed("biorxiv", _biorxiv)
+        if want_medrxiv:
+            branches["medrxiv"] = _timed("medrxiv", _medrxiv)
+        if want_iacr:
+            branches["iacr"] = _timed("iacr", _iacr)
         if want_firecrawl:
             branches["firecrawl"] = _timed("firecrawl", _fc)
         if want_ieee:
@@ -1899,9 +2415,17 @@ class Tools:
         pubmed_result = outcome.get("pubmed")
         pmc_result = outcome.get("pmc")
         arxiv_result = outcome.get("arxiv")
+        semantic_result = outcome.get("semantic")
+        openalex_result = outcome.get("openalex")
+        crossref_result = outcome.get("crossref")
+        europepmc_result = outcome.get("europepmc")
+        core_result = outcome.get("core")
+        biorxiv_result = outcome.get("biorxiv")
+        medrxiv_result = outcome.get("medrxiv")
+        iacr_result = outcome.get("iacr")
 
         # 后端失败处理：若任一直连源有结果则保留，否则报错
-        direct_ok = [r for r in (zh_result, hal_result, dblp_result, zenodo_result, openaire_result, firecrawl_result, ieee_result, pubmed_result, pmc_result, arxiv_result) if isinstance(r, list) and r]
+        direct_ok = [r for r in (zh_result, hal_result, dblp_result, zenodo_result, openaire_result, firecrawl_result, ieee_result, pubmed_result, pmc_result, arxiv_result, semantic_result, openalex_result, crossref_result, europepmc_result, core_result, biorxiv_result, medrxiv_result, iacr_result) if isinstance(r, list) and r]
         if isinstance(backend_result, Exception):
             if direct_ok:
                 result = {"papers": [], "source_results": {},
@@ -1984,6 +2508,70 @@ class Tools:
                 ap = [self._trim_paper(p) for p in arxiv_result]
                 papers.extend(ap)
                 source_results["arxiv"] = len(ap)
+        if want_semantic:
+            if isinstance(semantic_result, Exception):
+                source_results["semantic"] = 0
+                errors["semantic"] = str(semantic_result)
+            elif semantic_result is not None:
+                sp = [self._trim_paper(p) for p in semantic_result]
+                papers.extend(sp)
+                source_results["semantic"] = len(sp)
+        if want_openalex:
+            if isinstance(openalex_result, Exception):
+                source_results["openalex"] = 0
+                errors["openalex"] = str(openalex_result)
+            elif openalex_result is not None:
+                oap = [self._trim_paper(p) for p in openalex_result]
+                papers.extend(oap)
+                source_results["openalex"] = len(oap)
+        if want_crossref:
+            if isinstance(crossref_result, Exception):
+                source_results["crossref"] = 0
+                errors["crossref"] = str(crossref_result)
+            elif crossref_result is not None:
+                crp = [self._trim_paper(p) for p in crossref_result]
+                papers.extend(crp)
+                source_results["crossref"] = len(crp)
+        if want_europepmc:
+            if isinstance(europepmc_result, Exception):
+                source_results["europepmc"] = 0
+                errors["europepmc"] = str(europepmc_result)
+            elif europepmc_result is not None:
+                eup = [self._trim_paper(p) for p in europepmc_result]
+                papers.extend(eup)
+                source_results["europepmc"] = len(eup)
+        if want_core:
+            if isinstance(core_result, Exception):
+                source_results["core"] = 0
+                errors["core"] = str(core_result)
+            elif core_result is not None:
+                cop = [self._trim_paper(p) for p in core_result]
+                papers.extend(cop)
+                source_results["core"] = len(cop)
+        if want_biorxiv:
+            if isinstance(biorxiv_result, Exception):
+                source_results["biorxiv"] = 0
+                errors["biorxiv"] = str(biorxiv_result)
+            elif biorxiv_result is not None:
+                brp = [self._trim_paper(p) for p in biorxiv_result]
+                papers.extend(brp)
+                source_results["biorxiv"] = len(brp)
+        if want_medrxiv:
+            if isinstance(medrxiv_result, Exception):
+                source_results["medrxiv"] = 0
+                errors["medrxiv"] = str(medrxiv_result)
+            elif medrxiv_result is not None:
+                mrp = [self._trim_paper(p) for p in medrxiv_result]
+                papers.extend(mrp)
+                source_results["medrxiv"] = len(mrp)
+        if want_iacr:
+            if isinstance(iacr_result, Exception):
+                source_results["iacr"] = 0
+                errors["iacr"] = str(iacr_result)
+            elif iacr_result is not None:
+                iap = [self._trim_paper(p) for p in iacr_result]
+                papers.extend(iap)
+                source_results["iacr"] = len(iap)
         if want_firecrawl:
             if isinstance(firecrawl_result, Exception):
                 source_results["firecrawl"] = 0
@@ -2266,9 +2854,16 @@ class Tools:
                     backend_err = f"智慧芽读取失败: {self._redact_zhihuiya_key(e)}"
 
         if backend_tool and paper_id and src != "zhihuiya":
+            # 直连源的 paper_id 带自家前缀（arxiv:1706.03762 / semantic:hash /
+            # biorxiv:10.1101/... / iacr:2026/1892），后端 read 工具只要裸 id
+            call_pid = paper_id
+            if ":" in call_pid:
+                _pfx, _, _rest = call_pid.partition(":")
+                if _pfx.lower() == src and _rest:
+                    call_pid = _rest
             try:
                 text = await anyio.to_thread.run_sync(
-                    self._mcp_call, backend_tool, {"paper_id": paper_id}, 300
+                    self._mcp_call, backend_tool, {"paper_id": call_pid}, 300
                 )
                 if not self._is_unsupported_msg(text):
                     return text[:max_chars] + (

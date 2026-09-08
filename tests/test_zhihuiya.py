@@ -206,7 +206,7 @@ async def test_search_papers_merges_zhihuiya_branch():
     t._mcp_call = lambda *a, **k: backend
     t._zhihuiya_search = fake_zh_search
 
-    out = json.loads(await t.search_papers("q", sources="openalex,zhihuiya",
+    out = json.loads(await t.search_papers("q", sources="google_scholar,zhihuiya",
                                            __user__=_user()))
     assert out["source_results"]["zhihuiya"] == 1
     sources = {p["source"] for p in out["papers"]}
@@ -225,7 +225,7 @@ async def test_search_papers_zhihuiya_failure_isolated():
     t._mcp_call = lambda *a, **k: backend
     t._zhihuiya_search = boom
 
-    out = json.loads(await t.search_papers("q", sources="openalex,zhihuiya",
+    out = json.loads(await t.search_papers("q", sources="google_scholar,zhihuiya",
                                            __user__=_user()))
     assert "zhihuiya" in out["errors"]
     assert out["source_results"]["zhihuiya"] == 0
@@ -326,7 +326,7 @@ async def test_search_papers_keeps_zhihuiya_when_backend_fails():
     t._mcp_call = boom_mcp
     t._zhihuiya_search = fake_zh_search
 
-    out = json.loads(await t.search_papers("q", sources="openalex,zhihuiya",
+    out = json.loads(await t.search_papers("q", sources="google_scholar,zhihuiya",
                                            __user__=_user()))
     assert "backend" in out["errors"]
     assert out["source_results"]["zhihuiya"] == 1
@@ -578,11 +578,11 @@ async def test_search_papers_splits_literal_vs_semantic():
 
     t._mcp_call = fake_mcp
     t._hal_search = fake_hal
-    # doaj(字面) + openalex(语义) + hal(直连) + zhihuiya 未启用
+    # doaj(字面) + google_scholar(语义) + hal(直连) + zhihuiya 未启用
     out = json.loads(await t.search_papers(
         '"early signal drop" glucose sensor OR biosensor',
-        sources="doaj,openalex,hal", __user__=_user()))
-    # core!=original → 后端应被调两次：一次 original(语义 openalex)，一次 core(字面 doaj)
+        sources="doaj,google_scholar,hal", __user__=_user()))
+    # core!=original → 后端应被调两次：一次 original(语义 google_scholar)，一次 core(字面 doaj)
     queries = sorted(c["query"] for c in backend_calls)
     srcs = sorted(c["sources"] for c in backend_calls)
     assert len(backend_calls) == 2
@@ -599,7 +599,7 @@ async def test_search_papers_single_call_when_core_equals_original():
     t.valves = Tools.Valves()
     calls = []
     t._mcp_call = lambda tool, args, timeout=180: (calls.append(dict(args)), {"papers": [], "source_results": {}, "errors": {}})[1]
-    await t.search_papers("glucose biosensor", sources="openalex,doaj", __user__=_user())
+    await t.search_papers("glucose biosensor", sources="google_scholar,doaj", __user__=_user())
     # 无引号/布尔/噪声 → core==original → 只调一次后端
     assert len(calls) == 1
     assert calls[0]["query"] == "glucose biosensor"
@@ -607,13 +607,45 @@ async def test_search_papers_single_call_when_core_equals_original():
 
 @pytest.mark.asyncio
 async def test_search_papers_passes_biorxiv_category():
+    """biorxiv/medrxiv 已直连（v2.9）：category 透传给 _rxiv_search，后端不被调用。"""
     t = Tools()
     t.valves = Tools.Valves()
     calls = []
     t._mcp_call = lambda tool, args, timeout=180: (calls.append(dict(args)), {"papers": [], "source_results": {}, "errors": {}})[1]
-    await t.search_papers("glucose", sources="biorxiv",
-                          biorxiv_category="biochemistry", __user__=_user())
-    assert calls[0].get("biorxiv_category") == "biochemistry"
+    seen = {}
+
+    async def fake_rxiv(server, category, limit):
+        seen[server] = category
+        return []
+    t._rxiv_search = fake_rxiv
+
+    await t.search_papers("glucose", sources="biorxiv,medrxiv",
+                          biorxiv_category="biochemistry",
+                          medrxiv_category="epidemiology", __user__=_user())
+    assert seen == {"biorxiv": "biochemistry", "medrxiv": "epidemiology"}
+    assert calls == []  # 纯直连，不调后端
+
+
+@pytest.mark.asyncio
+async def test_all_mode_rxiv_requires_category():
+    """all 模式下 biorxiv/medrxiv 不传 category 不启用（全学科浏览=噪声）。"""
+    t = Tools()
+    t.valves = Tools.Valves()
+    t._mcp_call = lambda tool, args, timeout=180: {"papers": [], "source_results": {}, "errors": {}}
+    seen = []
+
+    async def fake_rxiv(server, category, limit):
+        seen.append(server)
+        return []
+    t._rxiv_search = fake_rxiv
+
+    def boom(url, params=None, headers=None, timeout=None):
+        raise ConnectionError("no network in test")
+    monkey = pytest.MonkeyPatch()
+    monkey.setattr(tool_mod.requests, "get", boom)
+    await t.search_papers("glucose", sources="all", __user__=_user())
+    monkey.undo()
+    assert seen == []  # 无 category → 两个 rxiv 都不启用
 
 
 @pytest.mark.asyncio
@@ -644,7 +676,13 @@ async def test_search_papers_all_mode_excludes_direct_sources():
     async def fake_hal(q, limit):
         return []
     t._hal_search = fake_hal
+
+    def boom(url, params=None, headers=None, timeout=None):
+        raise ConnectionError("no network in test")
+    monkey = pytest.MonkeyPatch()
+    monkey.setattr(tool_mod.requests, "get", boom)
     await t.search_papers("glucose biosensor", sources="all", __user__=_user())
+    monkey.undo()
     # 后端 sources 不得是裸 "all"（后端 "all" 隐含 hal 等直连源），也不得含直连源
     assert calls, "all_mode 应有后端调用"
     for c in calls:
@@ -660,19 +698,26 @@ async def test_all_mode_split_gives_literal_sources_core():
     t._mcp_call = lambda tool, args, timeout=180: (calls.append(dict(args)), {"papers": [], "source_results": {}, "errors": {}})[1]
     async def fake_hal(q, limit): return []
     t._hal_search = fake_hal
+
+    def boom(url, params=None, headers=None, timeout=None):
+        raise ConnectionError("no network in test")
+    monkey = pytest.MonkeyPatch()
+    monkey.setattr(tool_mod.requests, "get", boom)
     # 长自然语言 → core!=original → all_mode 拆分
     await t.search_papers("what are the latest advances in zero knowledge proof systems",
                           sources="all", __user__=_user())
+    monkey.undo()
     assert len(calls) == 2
     by_q = {c["query"]: c["sources"] for c in calls}
     core_q = [q for q in by_q if "latest" not in q and "what" not in q][0]
     orig_q = [q for q in by_q if q != core_q][0]
-    # 字面组用 core，且只含 doaj（iacr 已移出字面组与默认源）
+    # 字面组用 core，且只含 doaj（后端仅剩的字面源）
     lit_srcs = set(by_q[core_q].split(","))
     assert lit_srcs == {"doaj"}
-    # 语义组用 original，且不含 doaj；iacr 归入语义组
+    # 语义组用 original，且不含 doaj；v2.9 起 semantic/openalex/crossref/
+    # europepmc/core/iacr/biorxiv/medrxiv 均已直连，不进后端
     sem_srcs = set(by_q[orig_q].split(","))
-    assert "doaj" not in sem_srcs and "iacr" in sem_srcs
+    assert sem_srcs == {"google_scholar", "ssrn", "unpaywall", "citeseerx", "base", "acm"}
     assert "hal" not in sem_srcs  # 直连源不进后端
 
 
@@ -745,7 +790,7 @@ async def test_search_papers_adds_query_adapted_hint():
     t2_valves = _user(apikey="k")
     t.valves = Tools.Valves(zhihuiya_apikey="k")
     long_q = "what are the latest advances in initiated chemical vapor deposition iCVD conformal polymer film coating sensor"
-    out = json.loads(await t.search_papers(long_q, sources="zhihuiya,doaj,iacr", __user__=_user()))
+    out = json.loads(await t.search_papers(long_q, sources="zhihuiya,doaj,google_scholar", __user__=_user()))
     assert "query_adapted" in out
     # 字面源的查询应被截断到 ≤5 词
     for s, qq in out["query_adapted"].items():
@@ -878,8 +923,8 @@ async def test_pubmed_not_sent_to_backend():
     t._mcp_call = lambda tool, args, timeout=180: (calls.append(dict(args)), {"papers": [], "source_results": {}, "errors": {}})[1]
     t._pubmed_search = lambda q, n, u=None: _async_ret([_paper_pubmed()])
     t._pmc_search = lambda q, n, u=None: _async_ret([])
-    out = json.loads(await t.search_papers("glucose sensor biofouling", sources="openalex,pubmed,pmc"))
-    assert calls, "openalex 应走后端"
+    out = json.loads(await t.search_papers("glucose sensor biofouling", sources="google_scholar,pubmed,pmc"))
+    assert calls, "google_scholar 应走后端"
     for c in calls:
         assert "pubmed" not in c["sources"] and "pmc" not in c["sources"]
     assert out["source_results"].get("pubmed") == 1
