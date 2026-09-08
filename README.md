@@ -62,18 +62,18 @@
 ## 📊 Supported Data Sources
 
 ### Verified Active Sources
-`default_sources = "arxiv,pubmed,iacr,semantic,crossref,openalex,pmc,core,europepmc,dblp,openaire,doaj,hal,zenodo"`
+`default_sources = "arxiv,pubmed,semantic,crossref,openalex,pmc,core,europepmc,dblp,openaire,doaj,hal,zenodo,google_scholar,zhihuiya,ieee,firecrawl"`
 
 | Platform | Search | Read Tool | Native Download | Notes |
 |---|---|---|---|---|
-| **arXiv** | ✅ | `read_arxiv_paper` | ✅ | Open PDF, fast & reliable |
+| **arXiv** | ✅ (direct) | `read_arxiv_paper` | ✅ | Open PDF, fast & reliable |
 | **PubMed** | ✅ | ⚠️ metadata only | ❌ | Requires `NCBI_API_KEY` for rate limits |
-| **Semantic Scholar** | ✅ | `read_semantic_paper` | ✅ (OA) | Supports `SEMANTIC_SCHOLAR_API_KEY` |
-| **Crossref** | ✅ | ⚠️ metadata only | ❌ | Citation & DOI backbone |
-| **OpenAlex** | ✅ | ⚠️ metadata only | ❌ | Open metadata backbone |
+| **Semantic Scholar** | ✅ (direct) | `read_semantic_paper` | ✅ (OA) | Optional `semantic_api_key` valve (anonymous shared pool 429s often) |
+| **Crossref** | ✅ (direct) | ⚠️ metadata only | ❌ | Citation & DOI backbone |
+| **OpenAlex** | ✅ (direct) | ⚠️ metadata only | ❌ | Open metadata backbone |
 | **PMC / Europe PMC** | ✅ | ⚠️ Fallback to PDF | ✅ (OA) | High-quality biomedical full-text |
-| **CORE** | ✅ | ⚠️ Fallback to PDF | ✅ (OA) | Global repository aggregator |
-| **IACR** | ✅ | `read_iacr_paper` | ✅ | Cryptography ePrints |
+| **CORE** | ✅ (direct) | ⚠️ Fallback to PDF | ✅ (OA) | Global repository aggregator; optional `core_api_key` valve |
+| **IACR** | ✅ (direct) | `read_iacr_paper` | ✅ | Cryptography ePrints; direct HTML parsing (no JSON API exists) |
 | **HAL** | ✅ (direct) | ⚠️ Fallback to PDF | ✅ (OA) | Direct-connected (bypasses a backend date bug) |
 | **OpenAIRE / DOAJ** | ✅ | Varies / Fallback | Record-dependent | Domain repositories |
 | **dblp** | ✅ (direct) | ⚠️ ee/DOI → OA fallback | Record-dependent | CS bibliography (CS papers only); direct-connected (bypasses backend concurrency bug) |
@@ -107,9 +107,9 @@ Different sources have very different query tolerances. `search_papers` automati
 
 | Source class | Sources | Query sent |
 |---|---|---|
-| **Semantic / tokenizing** | openalex, semantic, crossref, pmc, europepmc, pubmed, arxiv, openaire, core, patsnap | Your **original** full natural-language query (semantics preserved) |
-| **Literal keyword** | zhihuiya, doaj, iacr | A **cleaned core-keyword** variant — quotes, bare `OR/AND/NOT`, and filler words stripped, then distilled to ≤5 high-specificity terms |
-| **Direct (bypasses backend)** | hal, zhihuiya, patsnap, dblp, zenodo, ieee | hal uses core; zhihuiya uses distilled; dblp/zenodo/ieee use original |
+| **Semantic / tokenizing** | openalex, semantic, crossref, pmc, europepmc, pubmed, openaire, core, patsnap | Your **original** full natural-language query (semantics preserved) |
+| **Literal keyword** | zhihuiya, doaj | A **cleaned core-keyword** variant — quotes, bare `OR/AND/NOT`, and filler words stripped, then distilled to ≤5 high-specificity terms |
+| **Direct (bypasses backend)** | hal, zhihuiya, patsnap, dblp, zenodo, ieee, pubmed, pmc, arxiv, semantic, openalex, crossref, europepmc, core, biorxiv, medrxiv, iacr | hal/arxiv use core; zhihuiya uses distilled; the rest use original. Backend mcpo now only serves doaj/google_scholar/ssrn/unpaywall/citeseerx/base/acm as a safety net |
 
 > `bioRxiv` / `medRxiv` are **not keyword search** — they return the latest ~30 days of papers in a subject category, so they're **excluded from `default_sources`** (a keyword query would inject irrelevant results). To browse a subject's new papers, call explicitly: `sources="biorxiv"` + `biorxiv_category="biochemistry"` (or `medrxiv_category="cardiovascular_medicine"`).
 
