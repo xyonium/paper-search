@@ -31,7 +31,7 @@
         │
         ├── OpenWebUI Native Python Tool (Bridge & Interceptor Layer)
                  │
-                 ├── search_papers()  ──┬─► POST http://mcp:8000/papers/search_papers
+                 ├── search_papers()  ──┬─► POST http://mcpo:8000/papers/search_papers
                  │                      │    (16+ open platforms via paper-search-mcp)
                  │                      └─► zhihuiya MCP (direct, streamable-http, apikey)
                  │                           search_literature + literature_bibliography
@@ -118,13 +118,13 @@ Different sources have very different query tolerances. `search_papers` automati
 ## 🚀 Setup & Installation
 
 ### 1. Docker Compose Integration
-Mount the shared volume `paper-downloads` at `/downloads` between the `mcp` (`mcpo`) and `open-webui` containers:
+Mount the shared volume `paper-downloads` at `/downloads` between the `mcpo` and `open-webui` containers:
 
 ```yaml
 version: '3.8'
 
 services:
-  mcp:
+  mcpo:
     image: ghcr.io/open-webui/mcpo:main
     command: --port 8000 --api-key "YOUR_MCPO_API_KEY" --config /config/config.json --hot-reload
     volumes:

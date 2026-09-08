@@ -150,7 +150,7 @@ def _distill_core_terms(text: str, max_terms: int = 5) -> str:
 class Tools:
     class Valves(BaseModel):
         mcpo_url: str = Field(
-            default="http://mcp:8000/papers",
+            default="http://mcpo:8000/papers",
             description="mcpo base URL（含 config.json 里 mcpServers 的 key 名）",
         )
         mcpo_api_key: str = Field(default="", description="mcpo --api-key")
@@ -182,7 +182,7 @@ class Tools:
         )
         firecrawl_base_url: str = Field(
             default="",
-            description="mcpo firecrawl 服务 base URL（如 http://mcp:8000/firecrawl）。两个用途：(a) 独立源——需在 default_sources 含 firecrawl；(b) 二级 web 兜底——tavily 未配/失败时自动用。留空则两者都不启用",
+            description="mcpo firecrawl 服务 base URL（如 http://mcpo:8000/firecrawl）。两个用途：(a) 独立源——需在 default_sources 含 firecrawl；(b) 二级 web 兜底——tavily 未配/失败时自动用。留空则两者都不启用",
         )
         tavily_base_url: str = Field(
             default="",
