@@ -202,9 +202,10 @@ class Tools:
         )
         download_fallback_url: str = Field(
             default="http://papers-service:3200/papers/download_with_fallback",
-            description="download_paper_to_knowledge 路径2 的 OA 下载链端点（自托管 "
-            "papers-service，含 OA 仓储链+Unpaywall+可选 Sci-Hub+标题身份闸）。一般与 "
-            "papers_service_url 同主机，留空回退 papers_service_url 的 download_with_fallback",
+            description="download_paper_to_knowledge 的 OA 下载链端点：papers-service 在 "
+            "HTTP 响应体里直接回 PDF 字节（内存流转，不落盘）。链=native→OA 仓储→Unpaywall"
+            "→可选 Sci-Hub，每步过标题身份闸。留空仅剩历史兼容场景（旧落盘模式，"
+            "paper-search-mcp 已退役，实际不可用），保持默认即可",
         )
         openwebui_url: str = Field(
             default="http://open-webui:8080", description="OpenWebUI 容器名:端口"
@@ -214,8 +215,8 @@ class Tools:
         )
         shared_download_dir: str = Field(
             default="/downloads",
-            description="（仅 download_fallback_url 留空走落盘回退时才需要；papers-service "
-            "字节直传不落盘，docker 共享卷 mcp-downloads 已可删除）",
+            description="（历史遗留，当前架构用不到）旧 mcpo/paper-search-mcp 落盘模式需要 "
+            "open-webui 与后端挂同一共享卷才能读回 PDF；papers-service 字节直传后无需任何共享卷",
         )
         zhihuiya_apikey: str = Field(
             default="",
