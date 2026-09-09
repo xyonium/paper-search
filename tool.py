@@ -17,8 +17,9 @@ description: 学术论文搜索、全文阅读、PDF 下载入 Knowledge（RAG�
     自动逐级砍尾词放宽；dblp 反爬拦截页（200+HTML）明确报错不再误报 JSON 解析失败
   · v2.9.3：dblp 被 Anubis 拦截时走 firecrawl（headless 浏览器自动解 JS 质询）兜底；
     配 apify_rotator_base_url 后 google_scholar 改走 Apify actor（绕 Google CAPTCHA）
-  · v2.9.4：google_scholar 三级链——firecrawl 抓搜索页首选（官方云 stealth 出口
-    稳定穿透）→ Apify actor 兜底 → 两个都没配才走后端
+  · v2.9.4/2.9.5：google_scholar 直连链——firecrawl 抓搜索页首选（官方云 stealth
+    出口稳定穿透）→ tavily extract(advanced) 次选 → Apify actor 兜底
+    → 三个都没配才走后端
 
   【查询适配】search_papers 按源自动分发查询变体（不损语义，LLM 无需处理）：
   · 大多数源用原始完整查询；zhihuiya/doaj 对长自然语言会 0 命中，
@@ -36,7 +37,7 @@ description: 学术论文搜索、全文阅读、PDF 下载入 Knowledge（RAG�
   5. read_patent(patent_number) → 读专利全文 markdown（权利要求+说明书+法律状态）
 author: openags-bridge
 requirements: requests, pymupdf, anyio
-version: 2.9.4
+version: 2.9.5
 license: MIT
 """
 
@@ -225,7 +226,7 @@ class Tools:
         )
         tavily_base_url: str = Field(
             default="",
-            description="tavily 代理 base URL（如 http://api-key-rotator:8788/tavily；配了才启用 tavily 兜底——其他源出现连接/超时错误时用 include_domains 限定学术站检索补位）。留空则不启用",
+            description="tavily 代理 base URL（如 http://api-key-rotator:8788/tavily）。两个用途：(a) 二级 web 兜底——其他源出现连接/超时错误时用 include_domains 限定学术站检索补位；(b) google_scholar 直连链第二级——firecrawl 失败时用 /extract(advanced) 抓 scholar 搜索页。留空则两者都不启用",
         )
         jina_api_key: str = Field(
             default="",
@@ -242,10 +243,10 @@ class Tools:
         apify_rotator_base_url: str = Field(
             default="",
             description="api-key-rotator 的 Apify 转发基址（管理员级，可选），如 http://api-key-rotator:8788"
-            "（转发 /v2/acts → api.apify.com，key 池自动轮转）。google_scholar 的兜底通路："
-            "首选 firecrawl_base_url 抓搜索页（官方云 stealth 稳定穿透 CAPTCHA），失败时落"
-            " Apify actor（johnvc/google-scholar-api，PAY_PER_EVENT，免费层可用但结果数受限）；"
-            "两个都没配则 google_scholar 仍走后端",
+            "（转发 /v2/acts → api.apify.com，key 池自动轮转）。google_scholar 的最终兜底通路："
+            "首选 firecrawl_base_url 抓搜索页，次选 tavily_base_url 的 extract(advanced)，"
+            "最后才落 Apify actor（johnvc/google-scholar-api，PAY_PER_EVENT 付费按次计费）；"
+            "三个都没配则 google_scholar 仍走后端",
         )
 
     class UserValves(BaseModel):
@@ -1806,16 +1807,23 @@ class Tools:
         return (getattr(self.valves, "apify_rotator_base_url", "") or "").strip().rstrip("/")
 
     @staticmethod
+    def _clean_md_text(s: str) -> str:
+        """清 scholar markdown 文本：bold 标记换成空格再折叠（tavily 会吃掉 ** 两侧的
+        原有空格，如 "models**with" → 若直接删 ** 会变 "modelswith"）。"""
+        return re.sub(r"\s+", " ", re.sub(r"\*+", " ", s or "")).strip()
+
+    @staticmethod
     def _parse_scholar_markdown(md: str, limit: int) -> list:
-        """解析 firecrawl 抓回的 scholar 搜索页 markdown（2026-09 实测结构）：
-        每条结果一个 ### [title](url) 块；标题下首个含 " - " + 年份的行为出版信息行
+        """解析 firecrawl/tavily 抓回的 scholar 搜索页 markdown（2026-09 实测结构）：
+        每条结果一个 ### [title](url) 块；标题下首个含年份+分隔符的行为出版信息行
         （作者部分两种形态：citations 用户链接 或 纯文本，逗号分隔）；之后到
         Save/Cited by 行动线之间是 snippet（可多行）；[Cited by N]、cluster= 版本链接、
-        [\\[PDF\\] domain](pdf) 可选。被拦（unusual traffic CAPTCHA 页）抛
-        _AntiBotBlocked；解析不到条目返回 []。"""
+        [\\[PDF\\] domain](pdf)（tavily 形态 [[PDF] domain]）可选。
+        被拦（unusual traffic CAPTCHA 页）抛 _AntiBotBlocked；解析不到条目返回 []。"""
         if "unusual traffic" in (md or "").lower():
             raise _AntiBotBlocked("scholar 返回 unusual traffic 验证页（IP 被 Google 标记）")
-        # scholar HTML 的分隔符带 NBSP（"作者…\xa0- 期刊, 2024 - 域名"），归一化再解析
+        # 分隔符变体多：firecrawl 带 NBSP（"作者…\xa0- 期刊"）、tavily 无空格（"作者…- 期刊"），
+        # NBSP 归一化后统一用 \s*[-–]\s 类正则切
         md = (md or "").replace("\xa0", " ")
         papers = []
         for blk in re.split(r"\n###\s+", "\n" + md)[1:]:
@@ -1825,7 +1833,7 @@ class Tools:
             m = re.match(r"\s*(?:\\?\[(?:PDF|HTML)\\?\]\s*)*\[([^\]]+)\]\((https?://[^)\s]+)\)", blk)
             if not m:
                 continue
-            title = re.sub(r"\*+", "", m.group(1)).strip()
+            title = Tools._clean_md_text(m.group(1))
             url = m.group(2)
             if not title or "scholar.google.com" in url:
                 continue  # 页眉/页脚导航块
@@ -1836,14 +1844,16 @@ class Tools:
                 if not line:
                     continue
                 if not info_seen:
-                    if " - " in line and re.search(r"\b(?:19|20)\d{2}\b", line):
+                    if re.search(r"[-–]", line) and re.search(r"\b(?:19|20)\d{2}\b", line):
                         info_seen = True
-                        a = line.split(" - ", 1)[0]
-                        a = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", a)  # 链接取文本
-                        a = re.sub(r"\*+", "", a).strip().rstrip("…").strip()
+                        # 切首个 dash 分隔（两侧空格可有可元）：authors - venue, year - domain
+                        parts = re.split(r"\s*[-–]\s+|\s+[-–]\s*", line, maxsplit=1)
+                        a = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", parts[0])  # 链接取文本
+                        a = Tools._clean_md_text(a).rstrip("…").strip()
                         authors = "; ".join(x.strip().rstrip(",")
                                             for x in a.split(",") if x.strip())
-                        ym = re.search(r"\b(?:19|20)\d{2}\b", line)
+                        rest = parts[1] if len(parts) > 1 else line
+                        ym = re.search(r"\b(?:19|20)\d{2}\b", rest)
                         year = ym.group(0) if ym else ""
                     continue
                 if re.match(r"\[?Save|\[Cited by", line):
@@ -1856,7 +1866,7 @@ class Tools:
                 "title": title,
                 "authors": authors,
                 "published_date": year,
-                "abstract": re.sub(r"\s+", " ", re.sub(r"\*+", "", " ".join(snip_lines))).strip(),
+                "abstract": Tools._clean_md_text(" ".join(snip_lines)),
                 "paper_id": f"scholar:{cl.group(1)}" if cl else "",
                 "doi": "",
                 "source": "google_scholar",
@@ -1878,6 +1888,38 @@ class Tools:
             self._mcp_call_service_url, base, "firecrawl_scrape",
             {"url": url, "formats": ["markdown"], "onlyMainContent": False}, 90)
         return self._parse_scholar_markdown((raw or {}).get("markdown", ""), limit)
+
+    async def _google_scholar_tavily_search(self, query: str, limit: int, __user__=None) -> list:
+        """tavily /extract（extract_depth=advanced）抓 scholar 搜索页（v2.9.5 实测：
+        basic 只出标题+链接，advanced 出完整结构；便宜但会吃掉 ** 两侧空格，
+        由 _parse_scholar_markdown 的 _clean_md_text 修复）。"""
+        base = self._tavily_base(__user__)
+        if not base:
+            raise RuntimeError("未配 tavily_base_url")
+        from urllib.parse import urlencode
+        url = f"https://scholar.google.com/scholar?{urlencode({'q': query, 'hl': 'en', 'num': max(1, min(int(limit), 20))})}"
+
+        def _extract():
+            try:
+                resp = requests.post(f"{base}/extract",
+                                     json={"urls": [url], "extract_depth": "advanced",
+                                           "format": "markdown"},
+                                     headers={"Content-Type": "application/json"},
+                                     timeout=90)
+                resp.raise_for_status()
+                return resp.json()
+            except requests.exceptions.Timeout:
+                raise RuntimeError("tavily extract 超时 (90s)")
+            except requests.exceptions.RequestException as e:
+                raise RuntimeError(f"tavily extract 失败: {e}")
+
+        data = await anyio.to_thread.run_sync(_extract)
+        results = (data or {}).get("results") or []
+        if not results:
+            fr = (data or {}).get("failed_results") or []
+            why = (fr[0].get("error") if fr and isinstance(fr[0], dict) else "") or "无结果"
+            raise RuntimeError(f"tavily extract 未取到内容: {why}")
+        return self._parse_scholar_markdown(str(results[0].get("raw_content") or ""), limit)
 
     async def _google_scholar_actor_search(self, query: str, limit: int) -> list:
         """经 api-key-rotator 转发调 Apify google-scholar actor（PAY_PER_EVENT；
@@ -2456,13 +2498,15 @@ class Tools:
         want_firecrawl = bool(self._firecrawl_base(__user__)) and ("firecrawl" in src_set or all_mode)
         ieee_enabled, ieee_key = self._ieee_enabled_key(__user__)
         want_ieee = ieee_enabled and ("ieee" in src_set or all_mode)
-        # google_scholar 直连三级链（v2.9.4）：firecrawl 首选（官方云 stealth 出口，
-        # 实测稳定穿透 CAPTCHA）→ Apify actor 兜底 → 两个都没配才保持后端
-        # （后端 google_scholar.py 靠 GOOGLE_SCHOLAR_PROXY_URL 撞运气）
+        # google_scholar 直连链（v2.9.5）：firecrawl 首选（官方云 stealth 出口，
+        # 实测稳定穿透 CAPTCHA）→ tavily extract(advanced) 次选（便宜但会吃 ** 两侧
+        # 空格，解析器已兼容）→ Apify actor 兜底（PAY_PER_EVENT 付费，放最后）→
+        # 三个都没配才保持后端（后端 google_scholar.py 靠 GOOGLE_SCHOLAR_PROXY_URL 撞运气）
         _scholar_req = "google_scholar" in src_set or all_mode
         want_scholar_actor = bool(self._apify_rotator_base()) and _scholar_req
         want_scholar_fc = bool(self._firecrawl_base(__user__)) and _scholar_req
-        want_scholar_direct = want_scholar_fc or want_scholar_actor
+        want_scholar_tav = bool(self._tavily_base(__user__)) and _scholar_req
+        want_scholar_direct = want_scholar_fc or want_scholar_tav or want_scholar_actor
 
         # 直连源不进后端 sources；scholar 有任一直接通路时也从后端剔除
         backend_set = src_set - DIRECT_SOURCES
@@ -2606,18 +2650,29 @@ class Tools:
             return await self._ieee_search(original, max_results_per_source, ieee_key)
 
         async def _gscholar():
-            # firecrawl 首选；被拦/失败/解析为空且配了 actor 时落 actor（v2.9.4）
+            # 链式尝试（v2.9.5）：firecrawl → tavily(advanced) → Apify actor；
+            # 前级被拦/失败/解析为空且有后级时自动下落；全失败抛最后一个异常
+            attempts = []
             if want_scholar_fc:
+                attempts.append(lambda: self._google_scholar_firecrawl_search(
+                    original, max_results_per_source, __user__))
+            if want_scholar_tav:
+                attempts.append(lambda: self._google_scholar_tavily_search(
+                    original, max_results_per_source, __user__))
+            if want_scholar_actor:
+                attempts.append(lambda: self._google_scholar_actor_search(
+                    original, max_results_per_source))
+            last_exc = None
+            for i, fn in enumerate(attempts):
                 try:
-                    papers = await self._google_scholar_firecrawl_search(
-                        original, max_results_per_source, __user__)
-                    if papers or not want_scholar_actor:
+                    papers = await fn()
+                    if papers or i == len(attempts) - 1:
                         return papers
-                except Exception:
-                    if not want_scholar_actor:
-                        raise
-                    # firecrawl 被拦/失败 → 落 Apify actor
-            return await self._google_scholar_actor_search(original, max_results_per_source)
+                except Exception as e:
+                    last_exc = e
+            if last_exc is not None:
+                raise last_exc
+            return []
 
         # 组装并发分支（每个分支计时，写入 _timings）
         branches = {}

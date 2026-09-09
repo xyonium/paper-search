@@ -36,21 +36,31 @@ def _mk():
     v.zhihuiya_apikey = os.environ.get("ZHIHUIYA_APIKEY", "")
     v.ncbi_api_key = os.environ.get("NCBI_API_KEY", "")
     v.firecrawl_base_url = os.environ.get("FIRECRAWL_BASE_URL", "")
+    v.tavily_base_url = os.environ.get("TAVILY_BASE_URL", "")
     v.apify_rotator_base_url = os.environ.get("APIFY_ROTATOR_BASE_URL", "")
     return t
 
 
 async def _scholar_live(t):
-    """镜像 search_papers 的 scholar 三级链：firecrawl 首选，actor 兜底。"""
+    """镜像 search_papers 的 scholar 链：firecrawl → tavily(advanced) → actor。"""
+    attempts = []
     if t.valves.firecrawl_base_url:
+        attempts.append(lambda: t._google_scholar_firecrawl_search("graph neural network", 3))
+    if t.valves.tavily_base_url:
+        attempts.append(lambda: t._google_scholar_tavily_search("graph neural network", 3))
+    if t.valves.apify_rotator_base_url:
+        attempts.append(lambda: t._google_scholar_actor_search("graph neural network", 3))
+    last_exc = None
+    for i, fn in enumerate(attempts):
         try:
-            papers = await t._google_scholar_firecrawl_search("graph neural network", 3)
-            if papers or not t.valves.apify_rotator_base_url:
+            papers = await fn()
+            if papers or i == len(attempts) - 1:
                 return papers
-        except Exception:
-            if not t.valves.apify_rotator_base_url:
-                raise
-    return await t._google_scholar_actor_search("graph neural network", 3)
+        except Exception as e:
+            last_exc = e
+    if last_exc is not None:
+        raise last_exc
+    return []
 
 
 # (源名, 协程工厂(t)->list, 是否需要 key)
@@ -86,6 +96,7 @@ async def run_one(name, factory):
         key_map = {"ieee": t.valves.ieee_apikey,
                    "zhihuiya": t.valves.zhihuiya_apikey,
                    "google_scholar": (t.valves.firecrawl_base_url
+                                      or t.valves.tavily_base_url
                                       or t.valves.apify_rotator_base_url)}
         if not key_map.get(name):
             return (name, "SKIP", 0, 0.0, "未配置 key（设环境变量后重跑）")

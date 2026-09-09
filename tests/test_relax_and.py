@@ -510,11 +510,12 @@ async def test_scholar_firecrawl_only_failure_records_error(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_scholar_stays_backend_without_either_valve(monkeypatch):
-    """两个 valve 都没配：google_scholar 保持后端路径（v2.9.4 回归保护）。"""
+    """三个直连 valve 都没配：google_scholar 保持后端路径（v2.9.5 回归保护）。"""
     import json as _json
     t = make_tool()
     t.valves.firecrawl_base_url = ""
     t.valves.apify_rotator_base_url = ""
+    t.valves.tavily_base_url = ""
     backend_calls = []
 
     def fake_mcp(tool, args, timeout=180):
@@ -530,3 +531,116 @@ async def test_scholar_stays_backend_without_either_valve(monkeypatch):
                                             sources="google_scholar"))
     assert out["source_results"]["google_scholar"] == 1
     assert backend_calls and "google_scholar" in backend_calls[0]["sources"]
+
+
+# ---------- tavily advanced 第二级（v2.9.5） ----------
+
+# 2026-09-09 实测 tavily /extract(extract_depth=advanced) 抓回的 scholar 页结构：
+# ** 两侧空格被吃掉、作者行分隔符无空格（"…- Nature"）、PDF 链接不转义（[[PDF] x]）
+_TAVILY_MD = r"""
+Page chrome
+
+### [Enhancing efficiency of **protein language models**with minimal wet-lab data through few-shot learning](https://www.nature.com/articles/s41467-024-49798-6)
+
+Z Zhou, L Zhang, Y Yu, B Wu, M Li, L Hong…- Nature…, 2024 - nature.com
+
+… effectively optimize **protein****language****models** under extreme data scarcity for **fitness****prediction**.
+
+[Save](javascript:void(0))[Cite](javascript:void(0))[Cited by 115](https://scholar.google.com/scholar?cites=15969236384704429555&hl=en)[All 13 versions](https://scholar.google.com/scholar?cluster=15969236384704429555&hl=en)
+
+[[PDF] iclr.cc](https://proceedings.iclr.cc/paper_files/paper/2026/file/6198-Paper-Conference.pdf)
+
+### [Pseudo-perplexity in one fell swoop for **protein fitness**predictions](https://journals.aps.org/prxlife/xxx)
+
+P Kantroo, GP Wagner, BB Machta- PRX Life…, 2025 - journals.aps.org
+
+Some snippet.
+
+SaveCite [Cited by 14](https://scholar.google.com/scholar?cites=222&hl=en) [All 2 versions](https://scholar.google.com/scholar?cluster=222&hl=en)
+"""
+
+
+def test_parse_scholar_markdown_tavily_form():
+    """tavily advanced 形态：被吃掉的空格要补回、无空格分隔符要正确切、
+    不转义 [[PDF] x] 链接要识别、连字符结尾作者名（Machta-）不当分隔符。"""
+    papers = tool_mod.Tools._parse_scholar_markdown(_TAVILY_MD, 10)
+    assert len(papers) == 2
+    p = papers[0]
+    assert "protein language models with minimal" in p["title"]  # 空格补回
+    assert p["authors"] == "Z Zhou; L Zhang; Y Yu; B Wu; M Li; L Hong"
+    assert p["published_date"] == "2024"
+    assert p["citations"] == 115
+    assert p["pdf_url"].endswith("6198-Paper-Conference.pdf")
+    assert "protein language models under extreme" in p["abstract"]
+    p2 = papers[1]
+    assert p2["authors"] == "P Kantroo; GP Wagner; BB Machta"  # Machta- 是分隔符
+    assert p2["published_date"] == "2025"
+    assert p2["pdf_url"] == ""
+
+
+@pytest.mark.asyncio
+async def test_scholar_dispatch_tavily_second_tier(monkeypatch):
+    """firecrawl 失败 + 配了 tavily → 走 tavily extract，actor 不调。"""
+    import json as _json
+    t = make_tool()
+    t.valves.firecrawl_base_url = "http://mcpo:8000/firecrawl"
+    t.valves.tavily_base_url = "http://rotator:8788/tavily"
+    t.valves.apify_rotator_base_url = "http://rotator:8788"
+    monkeypatch.setattr(t, "_mcp_call",
+                        lambda tool, args, timeout=180:
+                        {"papers": [], "source_results": {}, "errors": {}})
+
+    def boom(base, tool, args, timeout):
+        raise RuntimeError("firecrawl down")
+
+    monkeypatch.setattr(t, "_mcp_call_service_url", boom)
+    post_urls = []
+
+    def fake_post(url, json=None, **kw):
+        post_urls.append(url)
+        assert "/extract" in url  # 链上只能走到 tavily
+        r = MagicMock()
+        r.status_code = 200
+        r.json.return_value = {"results": [{"raw_content": _TAVILY_MD}]}
+        return r
+
+    monkeypatch.setattr(tool_mod.requests, "post", fake_post)
+    out = _json.loads(await t.search_papers("protein language model",
+                                            sources="google_scholar"))
+    assert out["source_results"]["google_scholar"] == 2
+    assert all("/extract" in u for u in post_urls)
+
+
+@pytest.mark.asyncio
+async def test_scholar_dispatch_actor_last_tier(monkeypatch):
+    """firecrawl + tavily 都失败 → 落 Apify actor。"""
+    import json as _json
+    t = make_tool()
+    t.valves.firecrawl_base_url = "http://mcpo:8000/firecrawl"
+    t.valves.tavily_base_url = "http://rotator:8788/tavily"
+    t.valves.apify_rotator_base_url = "http://rotator:8788"
+    monkeypatch.setattr(t, "_mcp_call",
+                        lambda tool, args, timeout=180:
+                        {"papers": [], "source_results": {}, "errors": {}})
+
+    def boom(base, tool, args, timeout):
+        raise RuntimeError("firecrawl down")
+
+    monkeypatch.setattr(t, "_mcp_call_service_url", boom)
+
+    def fake_post(url, json=None, **kw):
+        r = MagicMock()
+        if "/extract" in url:
+            r.status_code = 200
+            r.json.return_value = {"results": [],
+                                   "failed_results": [{"error": "blocked"}]}
+        else:  # /v2/acts/...
+            r.status_code = 201
+            r.json.return_value = _SCHOLAR_ITEMS
+        return r
+
+    monkeypatch.setattr(tool_mod.requests, "post", fake_post)
+    out = _json.loads(await t.search_papers("graph neural network",
+                                            sources="google_scholar"))
+    assert out["source_results"]["google_scholar"] == 1
+    assert out["papers"][0]["paper_id"] == "scholar:bfJWK1lrry4J"
