@@ -40,6 +40,19 @@ def _mk():
     return t
 
 
+async def _scholar_live(t):
+    """镜像 search_papers 的 scholar 三级链：firecrawl 首选，actor 兜底。"""
+    if t.valves.firecrawl_base_url:
+        try:
+            papers = await t._google_scholar_firecrawl_search("graph neural network", 3)
+            if papers or not t.valves.apify_rotator_base_url:
+                return papers
+        except Exception:
+            if not t.valves.apify_rotator_base_url:
+                raise
+    return await t._google_scholar_actor_search("graph neural network", 3)
+
+
 # (源名, 协程工厂(t)->list, 是否需要 key)
 CASES = {
     # --- 免 key ---
@@ -61,8 +74,8 @@ CASES = {
     # --- 需 key（未配置则 SKIP） ---
     "ieee":      (lambda t: t._ieee_search("neural network", 3, t.valves.ieee_apikey), True),
     "zhihuiya":  (lambda t: t._zhihuiya_search("葡萄糖 传感器", 3, t.valves.zhihuiya_apikey), True),
-    # google_scholar 走 Apify actor（需 APIFY_ROTATOR_BASE_URL 指向 api-key-rotator）
-    "google_scholar": (lambda t: t._google_scholar_actor_search("graph neural network", 3), True),
+    # google_scholar 三级链（v2.9.4）：FIRECRAWL_BASE_URL 首选 → APIFY_ROTATOR_BASE_URL 兜底
+    "google_scholar": (_scholar_live, True),
 }
 
 
@@ -72,7 +85,8 @@ async def run_one(name, factory):
     if needs_key:
         key_map = {"ieee": t.valves.ieee_apikey,
                    "zhihuiya": t.valves.zhihuiya_apikey,
-                   "google_scholar": t.valves.apify_rotator_base_url}
+                   "google_scholar": (t.valves.firecrawl_base_url
+                                      or t.valves.apify_rotator_base_url)}
         if not key_map.get(name):
             return (name, "SKIP", 0, 0.0, "未配置 key（设环境变量后重跑）")
     start = time.monotonic()

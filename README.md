@@ -86,14 +86,14 @@
 | **zhihuiya (智慧芽)** | ✅ `search_literature` | ⚠️ metadata via `literature_bibliography` | Scientific-literature MCP, direct streamable-http. Enabled when `zhihuiya_apikey` (admin or user) is non-empty; skipped silently when no key |
 | **patsnap (智慧芽专利)** | ✅ `patsnap_search` | ✅ full text via `patsnap_fetch` | Patent MCP (same key as zhihuiya). `read_patent` returns **claims + description + legal status** as Markdown |
 | **IEEE Xplore** | ✅ REST API | ⚠️ pdf_url (OA only) | Direct REST API. Enabled when `ieee_apikey` is non-empty; skipped silently when no key. Metadata-level (abstract+bibliographic); OA papers have pdf_url |
-| **Google Scholar (Apify actor)** | ✅ via api-key-rotator | ❌ (use url) | Enabled when `apify_rotator_base_url` points at your api-key-rotator (e.g. `http://api-key-rotator:8788`). Runs the `johnvc/google-scholar-api` actor through the rotator's key pool — bypasses Google's CAPTCHA. PAY_PER_EVENT pricing; free Apify tier works with reduced counts. Without it, scholar stays on the backend (anti-bot prone) |
+| **Google Scholar (3-tier chain)** | ✅ firecrawl → Apify actor | ❌ (use url) | Tier 1: set `firecrawl_base_url` (e.g. mcpo → official firecrawl cloud) — scrapes the Scholar result page through a stealth cloud egress, parses titles/authors/year/citations/PDF links from markdown. Tier 2: on CAPTCHA/failure/empty, falls back to the `johnvc/google-scholar-api` Apify actor when `apify_rotator_base_url` points at your api-key-rotator (PAY_PER_EVENT; free tier works with reduced counts). Neither configured → scholar stays on the backend (anti-bot prone) |
 
 ### Sources NOT in default (grouped by keyword-search capability)
 
 | Source | Keyword search | Why not default |
 |---|---|---|
 | **bioRxiv / medRxiv** | ❌ (subject-category browse) | Return latest ~30 days in a subject, **not** keyword search — would inject irrelevant results. Use explicitly via `sources="biorxiv"` + `biorxiv_category` |
-| **Google Scholar** | ✅ | Anti-bot 403 without proxy — or set `apify_rotator_base_url` to route via Apify actor (see Key-gated Sources) |
+| **Google Scholar** | ✅ | Anti-bot 403 without help — set `firecrawl_base_url` (tier 1) and/or `apify_rotator_base_url` (tier 2 fallback); see Key-gated Sources |
 | **SSRN** | ✅ | Cloudflare 403 |
 | **BASE** | ✅ | IP blocked (403 Access denied) |
 | **CiteSeerX** | ✅ (code) | Endpoint dead (redirects to archive.org 404) |

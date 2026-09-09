@@ -17,6 +17,8 @@ description: 学术论文搜索、全文阅读、PDF 下载入 Knowledge（RAG�
     自动逐级砍尾词放宽；dblp 反爬拦截页（200+HTML）明确报错不再误报 JSON 解析失败
   · v2.9.3：dblp 被 Anubis 拦截时走 firecrawl（headless 浏览器自动解 JS 质询）兜底；
     配 apify_rotator_base_url 后 google_scholar 改走 Apify actor（绕 Google CAPTCHA）
+  · v2.9.4：google_scholar 三级链——firecrawl 抓搜索页首选（官方云 stealth 出口
+    稳定穿透）→ Apify actor 兜底 → 两个都没配才走后端
 
   【查询适配】search_papers 按源自动分发查询变体（不损语义，LLM 无需处理）：
   · 大多数源用原始完整查询；zhihuiya/doaj 对长自然语言会 0 命中，
@@ -34,7 +36,7 @@ description: 学术论文搜索、全文阅读、PDF 下载入 Knowledge（RAG�
   5. read_patent(patent_number) → 读专利全文 markdown（权利要求+说明书+法律状态）
 author: openags-bridge
 requirements: requests, pymupdf, anyio
-version: 2.9.3
+version: 2.9.4
 license: MIT
 """
 
@@ -240,9 +242,10 @@ class Tools:
         apify_rotator_base_url: str = Field(
             default="",
             description="api-key-rotator 的 Apify 转发基址（管理员级，可选），如 http://api-key-rotator:8788"
-            "（转发 /v2/acts → api.apify.com，key 池自动轮转）。配了之后 google_scholar 改走"
-            " Apify actor（johnvc/google-scholar-api，PAY_PER_EVENT，免费层可用但结果数受限），"
-            "绕开 Google 反爬 CAPTCHA；留空则 google_scholar 仍走后端",
+            "（转发 /v2/acts → api.apify.com，key 池自动轮转）。google_scholar 的兜底通路："
+            "首选 firecrawl_base_url 抓搜索页（官方云 stealth 稳定穿透 CAPTCHA），失败时落"
+            " Apify actor（johnvc/google-scholar-api，PAY_PER_EVENT，免费层可用但结果数受限）；"
+            "两个都没配则 google_scholar 仍走后端",
         )
 
     class UserValves(BaseModel):
@@ -1796,11 +1799,85 @@ class Tools:
         except Exception as e:
             raise RuntimeError(f"IACR 检索失败: {e}")
 
-    # ---------- Google Scholar 经 Apify actor（v2.9.3，绕 Google CAPTCHA）----------
+    # ---------- Google Scholar 直连（v2.9.4）：firecrawl 首选 → Apify actor 兜底 ----------
     _SCHOLAR_ACTOR = "johnvc~google-scholar-api"
 
     def _apify_rotator_base(self) -> str:
         return (getattr(self.valves, "apify_rotator_base_url", "") or "").strip().rstrip("/")
+
+    @staticmethod
+    def _parse_scholar_markdown(md: str, limit: int) -> list:
+        """解析 firecrawl 抓回的 scholar 搜索页 markdown（2026-09 实测结构）：
+        每条结果一个 ### [title](url) 块；标题下首个含 " - " + 年份的行为出版信息行
+        （作者部分两种形态：citations 用户链接 或 纯文本，逗号分隔）；之后到
+        Save/Cited by 行动线之间是 snippet（可多行）；[Cited by N]、cluster= 版本链接、
+        [\\[PDF\\] domain](pdf) 可选。被拦（unusual traffic CAPTCHA 页）抛
+        _AntiBotBlocked；解析不到条目返回 []。"""
+        if "unusual traffic" in (md or "").lower():
+            raise _AntiBotBlocked("scholar 返回 unusual traffic 验证页（IP 被 Google 标记）")
+        # scholar HTML 的分隔符带 NBSP（"作者…\xa0- 期刊, 2024 - 域名"），归一化再解析
+        md = (md or "").replace("\xa0", " ")
+        papers = []
+        for blk in re.split(r"\n###\s+", "\n" + md)[1:]:
+            if len(papers) >= limit:
+                break
+            # 标题链接：行首可带 [PDF]/[HTML] 字面标签（转义形式 \[HTML\]）
+            m = re.match(r"\s*(?:\\?\[(?:PDF|HTML)\\?\]\s*)*\[([^\]]+)\]\((https?://[^)\s]+)\)", blk)
+            if not m:
+                continue
+            title = re.sub(r"\*+", "", m.group(1)).strip()
+            url = m.group(2)
+            if not title or "scholar.google.com" in url:
+                continue  # 页眉/页脚导航块
+            authors = year = ""
+            snip_lines = []
+            info_seen = False
+            for line in (l.strip() for l in blk.split("\n")[1:]):
+                if not line:
+                    continue
+                if not info_seen:
+                    if " - " in line and re.search(r"\b(?:19|20)\d{2}\b", line):
+                        info_seen = True
+                        a = line.split(" - ", 1)[0]
+                        a = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", a)  # 链接取文本
+                        a = re.sub(r"\*+", "", a).strip().rstrip("…").strip()
+                        authors = "; ".join(x.strip().rstrip(",")
+                                            for x in a.split(",") if x.strip())
+                        ym = re.search(r"\b(?:19|20)\d{2}\b", line)
+                        year = ym.group(0) if ym else ""
+                    continue
+                if re.match(r"\[?Save|\[Cited by", line):
+                    break  # 行动线：SaveCite / [Save](..) [Cite](..) [Cited by N](..)
+                snip_lines.append(line)
+            cm = re.search(r"Cited by (\d+)", blk)
+            cl = re.search(r"scholar\?cluster=(\d+)", blk)
+            pm = re.search(r"\[\\?\[\\?PDF\\?\][^\]]*\]\((https?://[^)\s]+)\)", blk)
+            papers.append({
+                "title": title,
+                "authors": authors,
+                "published_date": year,
+                "abstract": re.sub(r"\s+", " ", re.sub(r"\*+", "", " ".join(snip_lines))).strip(),
+                "paper_id": f"scholar:{cl.group(1)}" if cl else "",
+                "doi": "",
+                "source": "google_scholar",
+                "pdf_url": pm.group(1) if pm else "",
+                "citations": int(cm.group(1)) if cm else 0,
+                "url": url,
+            })
+        return papers
+
+    async def _google_scholar_firecrawl_search(self, query: str, limit: int, __user__=None) -> list:
+        """firecrawl 抓 scholar 搜索页（官方云 stealth 出口，2026-09 实测 2.3s 穿透
+        无 CAPTCHA；自托管实例看服务器 IP 运气）。CAPTCHA 页抛 _AntiBotBlocked 交外层落 actor。"""
+        base = self._firecrawl_base(__user__)
+        if not base:
+            raise RuntimeError("未配 firecrawl_base_url")
+        from urllib.parse import urlencode
+        url = f"https://scholar.google.com/scholar?{urlencode({'q': query, 'hl': 'en', 'num': max(1, min(int(limit), 20))})}"
+        raw = await anyio.to_thread.run_sync(
+            self._mcp_call_service_url, base, "firecrawl_scrape",
+            {"url": url, "formats": ["markdown"], "onlyMainContent": False}, 90)
+        return self._parse_scholar_markdown((raw or {}).get("markdown", ""), limit)
 
     async def _google_scholar_actor_search(self, query: str, limit: int) -> list:
         """经 api-key-rotator 转发调 Apify google-scholar actor（PAY_PER_EVENT；
@@ -2379,14 +2456,17 @@ class Tools:
         want_firecrawl = bool(self._firecrawl_base(__user__)) and ("firecrawl" in src_set or all_mode)
         ieee_enabled, ieee_key = self._ieee_enabled_key(__user__)
         want_ieee = ieee_enabled and ("ieee" in src_set or all_mode)
-        # google_scholar 改走 Apify actor（v2.9.3）：配了 apify_rotator_base_url 才直连，
-        # 否则保持后端（后端 google_scholar.py 靠 GOOGLE_SCHOLAR_PROXY_URL 撞运气）
-        want_scholar_actor = (bool(self._apify_rotator_base())
-                              and ("google_scholar" in src_set or all_mode))
+        # google_scholar 直连三级链（v2.9.4）：firecrawl 首选（官方云 stealth 出口，
+        # 实测稳定穿透 CAPTCHA）→ Apify actor 兜底 → 两个都没配才保持后端
+        # （后端 google_scholar.py 靠 GOOGLE_SCHOLAR_PROXY_URL 撞运气）
+        _scholar_req = "google_scholar" in src_set or all_mode
+        want_scholar_actor = bool(self._apify_rotator_base()) and _scholar_req
+        want_scholar_fc = bool(self._firecrawl_base(__user__)) and _scholar_req
+        want_scholar_direct = want_scholar_fc or want_scholar_actor
 
-        # 直连源不进后端 sources；scholar 走 actor 时也从后端剔除
+        # 直连源不进后端 sources；scholar 有任一直接通路时也从后端剔除
         backend_set = src_set - DIRECT_SOURCES
-        if want_scholar_actor:
+        if want_scholar_direct:
             backend_set = backend_set - {"google_scholar"}
         if all_mode:
             backend_set = None  # None 表示后端用 _BACKEND_ALL_SOURCES（不含直连源）
@@ -2401,11 +2481,11 @@ class Tools:
         # 字面源（doaj/zhihuiya）长术语查询需进一步按区分度截断到 5 词，否则 0 命中
         literal_query = _distill_core_terms(core, max_terms=5)
 
-        # all_mode 下后端常量源列表：scholar 走 actor 时剔除
+        # all_mode 下后端常量源列表：scholar 有直接通路时剔除
         _bk_all = ",".join(s for s in _BACKEND_ALL_SOURCES.split(",")
-                           if not (want_scholar_actor and s == "google_scholar"))
+                           if not (want_scholar_direct and s == "google_scholar"))
         _sem_all = ",".join(s for s in _SEMANTIC_ALL_SOURCES.split(",")
-                            if not (want_scholar_actor and s == "google_scholar"))
+                            if not (want_scholar_direct and s == "google_scholar"))
 
         async def _backend_all():
             # core==original 或无需拆分时，一次调用（含全部后端源）
@@ -2526,6 +2606,17 @@ class Tools:
             return await self._ieee_search(original, max_results_per_source, ieee_key)
 
         async def _gscholar():
+            # firecrawl 首选；被拦/失败/解析为空且配了 actor 时落 actor（v2.9.4）
+            if want_scholar_fc:
+                try:
+                    papers = await self._google_scholar_firecrawl_search(
+                        original, max_results_per_source, __user__)
+                    if papers or not want_scholar_actor:
+                        return papers
+                except Exception:
+                    if not want_scholar_actor:
+                        raise
+                    # firecrawl 被拦/失败 → 落 Apify actor
             return await self._google_scholar_actor_search(original, max_results_per_source)
 
         # 组装并发分支（每个分支计时，写入 _timings）
@@ -2567,7 +2658,7 @@ class Tools:
             branches["firecrawl"] = _timed("firecrawl", _fc)
         if want_ieee:
             branches["ieee"] = _timed("ieee", _ieee)
-        if want_scholar_actor:
+        if want_scholar_direct:
             branches["google_scholar"] = _timed("google_scholar", _gscholar)
 
         keys = list(branches)
@@ -2759,8 +2850,8 @@ class Tools:
                 ip = [self._trim_paper(p) for p in ieee_result]
                 papers.extend(ip)
                 source_results["ieee"] = len(ip)
-        if want_scholar_actor:
-            # actor 直连时覆盖后端同名字段（后端本轮未请 scholar）
+        if want_scholar_direct:
+            # 直接通路（firecrawl/actor）时覆盖后端同名字段（后端本轮未请 scholar）
             if isinstance(gscholar_result, Exception):
                 source_results["google_scholar"] = 0
                 errors["google_scholar"] = str(gscholar_result)

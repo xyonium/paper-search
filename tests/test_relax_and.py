@@ -367,3 +367,166 @@ async def test_scholar_stays_backend_without_rotator(monkeypatch):
                                             sources="google_scholar"))
     assert out["source_results"]["google_scholar"] == 1
     assert backend_calls and "google_scholar" in backend_calls[0]["sources"]
+
+
+# ---------- Google Scholar firecrawl 首选链（v2.9.4） ----------
+
+# 2026-09-09 实测 firecrawl（mcpo→rotator→官方云）抓回的 scholar 搜索页结构
+_SCHOLAR_MD = r"""
+Page chrome header text
+
+### [**Graph neural networks**](https://www.nature.com/articles/s43586-024-00294-7)
+
+[G Corso](https://scholar.google.com/citations?user=abc), [H Stark](https://scholar.google.com/citations?user=def)… - Nature Reviews …, 2024 - nature.com
+
+**Graphs** are flexible mathematical objects with a rich history ...
+
+[Save](javascript:void(0)) [Cite](javascript:void(0)) [Cited by 691](https://scholar.google.com/scholar?cites=3364025477392429677&hl=en) [All 3 versions](https://scholar.google.com/scholar?cluster=3364025477392429677&hl=en)
+
+[\[PDF\] arxiv.org](https://arxiv.org/pdf/1901.00596)
+
+### \[HTML\]\[HTML\] [**Second paper title**](https://www.sciencedirect.com/science/article/pii/xxx)
+
+[J Doe](https://scholar.google.com/citations?user=ghi) - Science, 2023 - sciencedirect.com
+
+Another snippet line here.
+
+[Save](javascript:void(0)) [Cited by 12](https://scholar.google.com/scholar?cites=111&hl=en) [All 2 versions](https://scholar.google.com/scholar?cluster=111&hl=en)
+
+### [One **protein** is all you need](https://proceedings.iclr.cc/paper_files/paper/2026/hash/6198-Abstract-Conference.html)
+
+A Bushuiev, R Bushuiev, O Pimenova… - International …, 2026 - proceedings.iclr.cc
+
+… of **protein** **language** **models** to one target **protein** at a time, on …
+with well-established **models**, … in **protein** **fitness** **prediction** …
+
+SaveCite [Cited by 6](https://scholar.google.com/scholar?cites=9619944207348205917&hl=en) [All 4 versions](https://scholar.google.com/scholar?cluster=9619944207348205917&hl=en)
+"""
+
+
+def test_parse_scholar_markdown_extracts_entries():
+    papers = tool_mod.Tools._parse_scholar_markdown(_SCHOLAR_MD, 10)
+    assert len(papers) == 3
+    p = papers[0]
+    assert p["title"] == "Graph neural networks"
+    assert p["authors"] == "G Corso; H Stark"
+    assert p["published_date"] == "2024"
+    assert p["citations"] == 691
+    assert p["pdf_url"] == "https://arxiv.org/pdf/1901.00596"
+    assert p["paper_id"] == "scholar:3364025477392429677"
+    assert p["source"] == "google_scholar"
+    p2 = papers[1]  # 带 \[HTML\] 字面前缀的块也要能解析
+    assert p2["title"] == "Second paper title"
+    assert p2["published_date"] == "2023"
+    assert p2["pdf_url"] == ""
+    p3 = papers[2]  # 纯文本作者 + SaveCite 行动线 + 多行 snippet（另一种实测形态）
+    assert p3["title"] == "One protein is all you need"
+    assert p3["authors"] == "A Bushuiev; R Bushuiev; O Pimenova"
+    assert p3["published_date"] == "2026"
+    assert p3["citations"] == 6
+    assert "protein language models" in p3["abstract"]
+    assert "fitness prediction" in p3["abstract"]
+
+
+def test_parse_scholar_markdown_captcha_raises():
+    with pytest.raises(tool_mod._AntiBotBlocked):
+        tool_mod.Tools._parse_scholar_markdown(
+            "Our systems have detected unusual traffic from your computer network", 5)
+
+
+def test_parse_scholar_markdown_limit_respected():
+    papers = tool_mod.Tools._parse_scholar_markdown(_SCHOLAR_MD, 1)
+    assert len(papers) == 1
+
+
+@pytest.mark.asyncio
+async def test_scholar_dispatch_firecrawl_first_no_actor_call(monkeypatch):
+    """两个通路都配了：firecrawl 出结果 → actor（requests.post）完全不调。"""
+    import json as _json
+    t = make_tool()
+    t.valves.firecrawl_base_url = "http://mcpo:8000/firecrawl"
+    t.valves.apify_rotator_base_url = "http://rotator:8788"
+    monkeypatch.setattr(t, "_mcp_call",
+                        lambda tool, args, timeout=180:
+                        {"papers": [], "source_results": {}, "errors": {}})
+    monkeypatch.setattr(t, "_mcp_call_service_url",
+                        lambda base, tool, args, timeout: {"markdown": _SCHOLAR_MD})
+    post_calls = []
+    monkeypatch.setattr(tool_mod.requests, "post",
+                        lambda url, **kw: post_calls.append(url))
+    out = _json.loads(await t.search_papers("graph neural network",
+                                            sources="google_scholar"))
+    assert out["source_results"]["google_scholar"] == 3
+    assert post_calls == []
+
+
+@pytest.mark.asyncio
+async def test_scholar_dispatch_falls_back_to_actor_on_captcha(monkeypatch):
+    """firecrawl 抓到 CAPTCHA 页 → 自动落 Apify actor。"""
+    import json as _json
+    t = make_tool()
+    t.valves.firecrawl_base_url = "http://mcpo:8000/firecrawl"
+    t.valves.apify_rotator_base_url = "http://rotator:8788"
+    monkeypatch.setattr(t, "_mcp_call",
+                        lambda tool, args, timeout=180:
+                        {"papers": [], "source_results": {}, "errors": {}})
+    monkeypatch.setattr(
+        t, "_mcp_call_service_url",
+        lambda base, tool, args, timeout:
+        {"markdown": "Our systems have detected unusual traffic from your computer network"})
+
+    def fake_post(url, json=None, **kw):
+        r = MagicMock()
+        r.status_code = 201
+        r.json.return_value = _SCHOLAR_ITEMS
+        return r
+
+    monkeypatch.setattr(tool_mod.requests, "post", fake_post)
+    out = _json.loads(await t.search_papers("graph neural network",
+                                            sources="google_scholar"))
+    assert out["source_results"]["google_scholar"] == 1
+    assert out["papers"][0]["paper_id"] == "scholar:bfJWK1lrry4J"
+
+
+@pytest.mark.asyncio
+async def test_scholar_firecrawl_only_failure_records_error(monkeypatch):
+    """只配 firecrawl 且它失败（无 actor 兜底）→ errors 里有明确报错。"""
+    import json as _json
+    t = make_tool()
+    t.valves.firecrawl_base_url = "http://mcpo:8000/firecrawl"
+    monkeypatch.setattr(t, "_mcp_call",
+                        lambda tool, args, timeout=180:
+                        {"papers": [], "source_results": {}, "errors": {}})
+
+    def boom(base, tool, args, timeout):
+        raise RuntimeError("firecrawl down")
+
+    monkeypatch.setattr(t, "_mcp_call_service_url", boom)
+    out = _json.loads(await t.search_papers("graph neural network",
+                                            sources="google_scholar"))
+    assert out["source_results"]["google_scholar"] == 0
+    assert "firecrawl down" in out["errors"]["google_scholar"]
+
+
+@pytest.mark.asyncio
+async def test_scholar_stays_backend_without_either_valve(monkeypatch):
+    """两个 valve 都没配：google_scholar 保持后端路径（v2.9.4 回归保护）。"""
+    import json as _json
+    t = make_tool()
+    t.valves.firecrawl_base_url = ""
+    t.valves.apify_rotator_base_url = ""
+    backend_calls = []
+
+    def fake_mcp(tool, args, timeout=180):
+        backend_calls.append(dict(args))
+        return {"papers": [{"title": "S", "authors": "", "published_date": "",
+                            "abstract": "", "paper_id": "gs_1", "doi": "",
+                            "source": "google_scholar", "pdf_url": "",
+                            "citations": 0, "url": ""}],
+                "source_results": {"google_scholar": 1}, "errors": {}}
+
+    monkeypatch.setattr(t, "_mcp_call", fake_mcp)
+    out = _json.loads(await t.search_papers("graph neural network",
+                                            sources="google_scholar"))
+    assert out["source_results"]["google_scholar"] == 1
+    assert backend_calls and "google_scholar" in backend_calls[0]["sources"]
