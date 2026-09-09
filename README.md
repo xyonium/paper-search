@@ -1,11 +1,11 @@
 # 📚 OpenWebUI Academic Paper Search & Knowledge Base Integration
 
 > **One prompt → 18+ academic databases → full text → your RAG Knowledge Base.**
-> Multi-source academic paper search, full-text reading, and automatic PDF ingestion into **OpenWebUI Knowledge Base** (RAG) — powered by `mcpo` + `paper-search-mcp`, with direct **zhihuiya (智慧芽)** literature/patent and **IEEE Xplore** integration.
+> Multi-source academic paper search, full-text reading, and automatic PDF ingestion into **OpenWebUI Knowledge Base** (RAG) — powered by the self-hosted **papers-service** (`papers_service_url` valve), with direct **zhihuiya (智慧芽)** literature/patent and **IEEE Xplore** integration.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 [![OpenWebUI](https://img.shields.io/badge/OpenWebUI-Tool-blue)](https://github.com/open-webui/open-webui)
-[![MCP](https://img.shields.io/badge/MCP-mcpo-green)](https://github.com/open-webui/mcpo)
+[![Backend](https://img.shields.io/badge/Backend-papers--service-blue)](#-architecture-v298)
 
 ---
 
@@ -24,7 +24,7 @@
 
 ---
 
-## 🏛 Architecture (v2.9.5)
+## 🏛 Architecture (v2.9.8)
 
 ```
 [User / OpenWebUI UI]
@@ -45,22 +45,27 @@
                  │     │      → Apify actor (johnvc/google-scholar-api) → backend (last resort)
                  │     │    · dblp Anubis anti-bot fallback → firecrawl (headless solves JS PoW)
                  │     │
-                 │     └─► Backend mcpo/paper-search-mcp (safety net only):
-                 │          doaj (live); ssrn/base/citeseerx (degraded/blocked, off by default);
-                 │          unpaywall (DOI lookup for downloads); acm (not implemented)
+                 │     └─► papers-service (self-hosted FastAPI, papers_service_url valve;
+                 │          mirrors the retired mcpo/paper-search-mcp endpoint shapes):
+                 │          search safety net (doaj, scholar chain backend);
+                 │          ssrn/base/citeseerx/acm unimplemented (off by default)
                  │
-                 ├── read_paper() ──► backend read tools (fast lane, arxiv/semantic/hal/doaj/…)
-                 │                     → unsupported → pdf_url direct → jina reader fallback
+                 ├── read_paper() ──► papers-service read tools (fast lane: 12 sources —
+                 │                     arxiv/semantic/hal/pubmed/crossref/biorxiv full text…)
+                 │                     → 404 → pdf_url direct → jina reader fallback
                  │
                  ├── search_patents() / read_patent() ──► patsnap MCP (direct, streamable-http)
                  │
                  └── download_paper_to_knowledge()
-                        ├─► [1] direct pdf_url download
-                        └─► [2] backend download_with_fallback (OA chain + optional Sci-Hub)
-                                  → shared Docker volume /downloads → OWUI /api/v1/files → RAG
+                        ├─► [1] direct pdf_url download (+ title identity gate)
+                        └─► [2] papers-service download_with_fallback (in-memory bytes):
+                                  native (arxiv/iacr/biorxiv) → OA repos (openaire/core/
+                                  europepmc/pmc) → Unpaywall → optional Sci-Hub,
+                                  every step title-gated → OWUI /api/v1/files → RAG
+                                  (no shared volume needed since v2.9.7)
 ```
 
-**Why the backend is only a safety net**: every source with a healthy public API was moved to direct connect (v2.9 series) — the backend's synchronous `requests` without timeouts once hung whole search batches, its scholar/ssrn/base adapters hit anti-bot walls, and its OR-query semantics returned irrelevant papers. What remains on the backend is either fine (doaj), special-purpose (unpaywall DOI lookup), or broken upstream (ssrn/base/citeseerx/acm).
+**Why the papers backend is only a safety net**: every source with a healthy public API was moved to direct connect (v2.9 series) — the original paper-search-mcp's synchronous `requests` without timeouts once hung whole search batches, its scholar/ssrn/base adapters hit anti-bot walls, and its OR-query semantics returned irrelevant papers. papers-service keeps the same valve-driven safety net (doaj, the scholar chain's last resort) plus a real full-text read lane (12 sources) and the OA download chain; ssrn/base/citeseerx/acm remain unimplemented upstream.
 
 ---
 
@@ -115,7 +120,7 @@ Different sources have very different query tolerances. `search_papers` automati
 |---|---|---|
 | **Semantic / tokenizing** | openalex, semantic, crossref, pmc, europepmc, pubmed, openaire, core, patsnap | Your **original** full natural-language query (semantics preserved) |
 | **Literal keyword** | zhihuiya, doaj | A **cleaned core-keyword** variant — quotes, bare `OR/AND/NOT`, and filler words stripped, then distilled to ≤5 high-specificity terms |
-| **Direct (bypasses backend)** | hal, zhihuiya, patsnap, dblp, zenodo, ieee, pubmed, pmc, arxiv, semantic, openalex, crossref, europepmc, core, biorxiv, medrxiv, iacr (+ google_scholar when any of firecrawl/tavily/apify valves set) | hal/arxiv use core; zhihuiya uses distilled; the rest use original. Backend mcpo now only serves doaj/google_scholar/ssrn/unpaywall/citeseerx/base/acm as a safety net |
+| **Direct (bypasses backend)** | hal, zhihuiya, patsnap, dblp, zenodo, ieee, pubmed, pmc, arxiv, semantic, openalex, crossref, europepmc, core, biorxiv, medrxiv, iacr (+ google_scholar when any of firecrawl/tavily/apify valves set) | hal/arxiv use core; zhihuiya uses distilled; the rest use original. The papers-service backend serves the search safety net (doaj, google_scholar chain) — paper-search-mcp is retired |
 
 > `bioRxiv` / `medRxiv` are **not keyword search** — they return the latest ~30 days of papers in a subject category, so they're **excluded from `default_sources`** (a keyword query would inject irrelevant results). To browse a subject's new papers, call explicitly: `sources="biorxiv"` + `biorxiv_category="biochemistry"` (or `medrxiv_category="cardiovascular_medicine"`).
 
@@ -123,64 +128,39 @@ Different sources have very different query tolerances. `search_papers` automati
 
 ## 🚀 Setup & Installation
 
-### 1. Docker Compose Integration
-Mount the shared volume `paper-downloads` at `/downloads` between the `mcpo` and `open-webui` containers:
+### 1. Backend: papers-service
+
+The retired `mcpo` + `paper-search-mcp` backend is replaced by a self-hosted
+**papers-service** (FastAPI, port 3200) that mirrors the same endpoint shapes
+(`search_{source}` / `read_{source}_paper` / `download_with_fallback`). Reference
+deployment lives in the
+[firecrawl-portainer](https://github.com/xyonium/firecrawl/tree/portainer-stack/papers-service)
+branch (source + GH Actions image build + digest-pinned compose). Point the tool at it:
 
 ```yaml
-version: '3.8'
-
 services:
-  mcpo:
-    image: ghcr.io/open-webui/mcpo:main
-    command: --port 8000 --api-key "YOUR_MCPO_API_KEY" --config /config/config.json --hot-reload
-    volumes:
-      - ./config.json:/config/config.json
-      - paper-downloads:/downloads
-
-  open-webui:
-    image: ghcr.io/open-webui/open-webui:main
+  papers-service:
+    image: ghcr.io/xyonium/firecrawl-papers-service  # digest-pinned in production
     environment:
-      - OPENWEBUI_URL=http://open-webui:8080
-    volumes:
-      - open-webui-data:/app/backend/data
-      - paper-downloads:/downloads
-
-volumes:
-  paper-downloads:
-  open-webui-data:
+      SEMANTIC_SCHOLAR_API_KEY: "s2k-xxx"   # optional, higher S2 quota
+      UNPAYWALL_EMAIL: "your_email@example.com"
+    networks: [open-webui]
 ```
 
-### 2. mcpo Server Configuration (`config.json`)
-Configure your `config.json` file for `mcpo`:
+Since v2.9.7 downloads are streamed as **in-memory bytes** — no shared Docker
+volume between the backend and open-webui is needed anymore.
 
-```json
-{
-  "mcpServers": {
-    "papers": {
-      "command": "uvx",
-      "args": ["paper-search-mcp"],
-      "env": {
-        "PAPER_SEARCH_MCP_UNPAYWALL_EMAIL": "your_email@example.com",
-        "PAPER_SEARCH_MCP_SEMANTIC_SCHOLAR_API_KEY": "s2k-xxx",
-        "PAPER_SEARCH_MCP_DOAJ_API_KEY": "xxx",
-        "PAPER_SEARCH_MCP_ZENODO_ACCESS_TOKEN": "xxx",
-        "NCBI_API_KEY": "xxx",
-        "PAPER_SEARCH_MCP_GOOGLE_SCHOLAR_PROXY_URL": "http://your_proxy:port"
-      }
-    }
-  }
-}
-```
-
-### 3. OpenWebUI Tool Configuration
+### 2. OpenWebUI Tool Configuration
 1. Open **OpenWebUI** -> **Workspace** -> **Tools**.
 2. Create a new Tool and copy the contents of [`tool.py`](./tool.py).
 3. Save the tool and optionally configure the **Valves** / **UserValves**:
+   - `papers_service_url`: papers-service base URL (default `http://papers-service:3200/papers`).
+   - `download_fallback_url`: OA download chain endpoint (default `http://papers-service:3200/papers/download_with_fallback`).
    - `knowledge_id`: Default Knowledge Base ID to automatically store downloaded papers.
    - `allow_scihub`: Set to `True` / `False` for Sci-Hub fallback.
    - `scihub_url`: Custom Sci-Hub mirror URL (e.g. `https://sci-hub.ee`).
 
-### 4. (Optional) Enable Key-gated Sources
+### 3. (Optional) Enable Key-gated Sources
 
 Key-gated sources are **enabled automatically when their key is set** and **skipped silently when not** — no need to add them to `default_sources`.
 
@@ -242,8 +222,8 @@ Each source is queried with a known-stable term; the report shows PASS/FAIL/EMPT
 
 Special thanks to the open-source projects that make this integration possible:
 
-- **[paper-search-mcp](https://github.com/openags/paper-search-mcp)**: The underlying Model Context Protocol (MCP) server providing multi-platform academic search and paper retrieval capabilities.
-- **[mcpo](https://github.com/open-webui/mcpo)**: The OpenAPI-to-MCP bridge by OpenWebUI for exposing MCP servers over HTTP.
+- **[paper-search-mcp](https://github.com/openags/paper-search-mcp)**: The original MCP backend (now retired from this stack); its OA download chain design lives on in papers-service `download_with_fallback`.
+- **[mcpo](https://github.com/open-webui/mcpo)**: The OpenAPI-to-MCP bridge — still hosting the firecrawl gateway in this stack.
 - **[OpenWebUI](https://github.com/open-webui/open-webui)**: The open-source AI user interface and RAG ecosystem.
 - **[zhihuiya (智慧芽)](https://www.zhihuiya.com/)**: Premium scientific-literature data, connected via its streamable-http MCP endpoint.
 

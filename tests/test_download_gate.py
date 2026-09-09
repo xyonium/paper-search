@@ -209,7 +209,7 @@ class TestVerifyGate:
             assert tool == "download_with_fallback"
             return str(local)
 
-        t._mcp_call = _fake_call
+        t._papers_call = _fake_call
         out = asyncio.run(t.download_paper_to_knowledge(
             title="Another Sensor Paper",
             source="crossref",
@@ -230,7 +230,7 @@ class TestVerifyGate:
         local.write_bytes(_pdf("Deep learning for protein folding network. " * 30))
         uploaded = []
         t._upload_pdf = lambda *a, **k: uploaded.append(a) or "✅ ok"
-        t._mcp_call = lambda tool, args, timeout=180, _retried=False: str(local)
+        t._papers_call = lambda tool, args, timeout=180, _retried=False: str(local)
         out = asyncio.run(t.download_paper_to_knowledge(
             title="Deep Learning for Protein Folding",
             source="crossref", paper_id="10.1/x", doi="10.1/x",

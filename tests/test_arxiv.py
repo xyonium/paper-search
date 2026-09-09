@@ -102,7 +102,7 @@ async def test_arxiv_not_sent_to_backend():
     """arxiv 是直连源：不进后端 sources，后端批次不含它。"""
     t = Tools(); t.valves = Tools.Valves()
     calls = []
-    t._mcp_call = lambda tool, args, timeout=180: (
+    t._papers_call = lambda tool, args, timeout=180: (
         calls.append(dict(args)),
         {"papers": [], "source_results": {}, "errors": {}},
     )[1]
@@ -119,7 +119,7 @@ async def test_arxiv_not_sent_to_backend():
 async def test_arxiv_error_surfaces_in_errors_not_crash():
     """直连失败进 errors 字段，source_results 记 0，不影响其他源。"""
     t = Tools(); t.valves = Tools.Valves()
-    t._mcp_call = lambda tool, args, timeout=180: {"papers": [], "source_results": {}, "errors": {}}
+    t._papers_call = lambda tool, args, timeout=180: {"papers": [], "source_results": {}, "errors": {}}
 
     def boom(url, params=None, headers=None, timeout=None, **_):
         raise ConnectionError("connection reset")

@@ -457,7 +457,7 @@ async def test_new_direct_sources_not_sent_to_backend():
     """8 个新直连源全部不进后端 sources；纯直连请求时后端不被调用。"""
     t = _mk()
     calls = []
-    t._mcp_call = lambda tool, args, timeout=180: (
+    t._papers_call = lambda tool, args, timeout=180: (
         calls.append(dict(args)),
         {"papers": [], "source_results": {}, "errors": {}},
     )[1]
@@ -497,7 +497,7 @@ async def test_new_direct_sources_not_sent_to_backend():
 async def test_direct_error_isolated_in_errors():
     """单一直连源失败进 errors，不影响其他源。"""
     t = _mk()
-    t._mcp_call = lambda tool, args, timeout=180: {"papers": [], "source_results": {}, "errors": {}}
+    t._papers_call = lambda tool, args, timeout=180: {"papers": [], "source_results": {}, "errors": {}}
 
     def fake_get(url, params=None, headers=None, timeout=None, **_):
         if "api.crossref.org" in url:
@@ -526,7 +526,7 @@ async def test_read_paper_strips_own_source_prefix_for_backend():
         seen["paper_id"] = args.get("paper_id")
         return "x" * 5000  # 超过 _is_unsupported_msg 的 3000 阈值，视为真实全文
 
-    t._mcp_call = fake_mcp
+    t._papers_call = fake_mcp
     out = await t.read_paper(source="semantic", paper_id="semantic:abc123hash")
     assert seen["tool"] == "read_semantic_paper"
     assert seen["paper_id"] == "abc123hash"  # 前缀已剥

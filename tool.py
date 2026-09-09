@@ -11,15 +11,17 @@ description: 学术论文搜索、全文阅读、PDF 下载入 Knowledge（RAG�
   · 学科新论文浏览（非关键词检索，需 sources+biorxiv_category 显式用）: biorxiv, medrxiv
   · 不稳定（可能 403/超时，失败自动降级）: google_scholar, ssrn, base, citeseerx
   · 不可用: acm（未实现）, unpaywall（仅DOI查询，用于下载 fallback）
-  · v2.9 起 semantic/openalex/crossref/europepmc/core/biorxiv/medrxiv/iacr 转直连，
-    后端 mcpo 仅剩 doaj/google_scholar/ssrn/unpaywall/citeseerx/base/acm 作安全网
+  · v2.9 起 semantic/openalex/crossref/europepmc/core/biorxiv/medrxiv/iacr 转直连
   · v2.9.1：AND 语义源（hal/pubmed/pmc/europepmc/openaire/ieee）长查询 0 命中时
     自动逐级砍尾词放宽；dblp 反爬拦截页（200+HTML）明确报错不再误报 JSON 解析失败
   · v2.9.3：dblp 被 Anubis 拦截时走 firecrawl（headless 浏览器自动解 JS 质询）兜底；
     配 apify_rotator_base_url 后 google_scholar 改走 Apify actor（绕 Google CAPTCHA）
   · v2.9.4/2.9.5：google_scholar 直连链——firecrawl 抓搜索页首选（官方云 stealth
     出口稳定穿透）→ tavily extract(advanced) 次选 → Apify actor 兜底
-    → 三个都没配才走后端
+    → 三个都没配才走 papers 服务
+  · v2.9.8：后端全面切自托管 papers-service（papers_service_url valve）——
+    paper-search-mcp/mcpo papers 服务退役；搜索安全网与 read 快车道同形状迁移；
+    download 走 papers-service 的 download_with_fallback（OA 链+身份闸字节直传）
 
   【查询适配】search_papers 按源自动分发查询变体（不损语义，LLM 无需处理）：
   · 大多数源用原始完整查询；zhihuiya/doaj 对长自然语言会 0 命中，
@@ -37,7 +39,7 @@ description: 学术论文搜索、全文阅读、PDF 下载入 Knowledge（RAG�
   5. read_patent(patent_number) → 读专利全文 markdown（权利要求+说明书+法律状态）
 author: openags-bridge
 requirements: requests, pymupdf, anyio
-version: 2.9.7
+version: 2.9.8
 license: MIT
 """
 
@@ -76,13 +78,13 @@ _QUERY_PREFIXES = (
 )
 
 LITERAL_SOURCES = frozenset({"zhihuiya", "doaj"})
-# 直连源（绕后端 mcpo）。pubmed/pmc 直连原因（2026-08 实测）：后端 pubmed.py 走 HTTPS 且
+# 直连源（绕 papers 服务）。pubmed/pmc 直连原因（2026-08 实测）：旧后端 pubmed.py 走 HTTPS 且
 # requests.get 无 timeout，境外出口对突发并发 TLS 不稳（SSL EOF）时会无限挂起，asyncio.gather
 # 等齐所有源 → 整批 180s 超时，首批尤甚（DNS/连接冷 + 并发突发）；改走 HTTP + timeout=20 + 3次退避。
 # arxiv 直连原因（v2.8）：去 paper-search-mcp 依赖的第一步——后端适配器同步无超时是共同风险，
 # arxiv 是搜索量最大的源，先接管。注意 arxiv 走 https（http 会 301），与 NCBI 相反。
 # v2.9：semantic/openalex/crossref/europepmc/core/biorxiv/medrxiv/iacr 全部转直连
-# （后端 mcpo 仅剩 doaj/google_scholar/ssrn/unpaywall/citeseerx/base/acm 作安全网）。
+# v2.9.8 起安全网/快车道后端是自托管 papers-service（papers_service_url）。
 DIRECT_SOURCES = frozenset({
     "arxiv", "zhihuiya", "hal", "patsnap", "dblp", "zenodo", "ieee", "openaire",
     "firecrawl", "pubmed", "pmc",
@@ -189,16 +191,20 @@ class _AntiBotBlocked(RuntimeError):
 
 class Tools:
     class Valves(BaseModel):
-        mcpo_url: str = Field(
-            default="http://mcpo:8000/papers",
-            description="mcpo base URL（含 config.json 里 mcpServers 的 key 名）",
+        papers_service_url: str = Field(
+            default="http://papers-service:3200/papers",
+            description="papers 服务 base URL（自托管 papers-service：search_*/read_*/*_paper/"
+            "download_with_fallback 端点，同网络容器名直连）。检索 19 源 + read 12 源 + OA 下载链都在这",
         )
-        mcpo_api_key: str = Field(default="", description="mcpo --api-key")
+        mcpo_api_key: str = Field(
+            default="",
+            description="mcpo --api-key（papers-service 内网直连一般不需要；仅当 papers-service 前面挂了带 key 的网关时填）",
+        )
         download_fallback_url: str = Field(
             default="http://papers-service:3200/papers/download_with_fallback",
             description="download_paper_to_knowledge 路径2 的 OA 下载链端点（自托管 "
-            "papers-service，含 OA 仓储链+Unpaywall+可选 Sci-Hub+标题身份闸）。留空回退 "
-            "mcpo_url 的 download_with_fallback（paper-search-mcp，退役后不可用）",
+            "papers-service，含 OA 仓储链+Unpaywall+可选 Sci-Hub+标题身份闸）。一般与 "
+            "papers_service_url 同主机，留空回退 papers_service_url 的 download_with_fallback",
         )
         openwebui_url: str = Field(
             default="http://open-webui:8080", description="OpenWebUI 容器名:端口"
@@ -208,7 +214,8 @@ class Tools:
         )
         shared_download_dir: str = Field(
             default="/downloads",
-            description="mcpo 与 openwebui 共享 volume 的挂载路径（两容器内需一致）",
+            description="（仅 download_fallback_url 留空走落盘回退时才需要；papers-service "
+            "字节直传不落盘，docker 共享卷 mcp-downloads 已可删除）",
         )
         zhihuiya_apikey: str = Field(
             default="",
@@ -1304,7 +1311,7 @@ class Tools:
         except Exception as e:
             raise RuntimeError(f"PMC 检索失败: {e}")
 
-    # ---------- arXiv 直连（v2.8：替代后端 mcpo arxiv 源）----------
+    # ---------- arXiv 直连（v2.8：替代旧后端 paper-search-mcp 的 arxiv 源）----------
     _ARXIV_API = "https://export.arxiv.org/api/query"
     _ARXIV_NS = {"atom": "http://www.w3.org/2005/Atom",
                  "arxiv": "http://arxiv.org/schemas/atom"}
@@ -2209,11 +2216,19 @@ class Tools:
             return f"biorxiv:{m.group(1)}"
         return f"web:{url[-60:]}"
 
+    def _papers_base(self) -> str:
+        """papers 服务 base URL（papers_service_url，缺省 http://papers-service:3200/papers）。
+        顺带兼容旧 valve 值仍指向 mcpo 的情况（mcpo_url 时代遗留配置）。"""
+        return (getattr(self.valves, "papers_service_url", "") or "").strip().rstrip("/")
+
     def _mcp_call_service(self, service: str, tool: str, args: dict, timeout: int = 90):
-        """调 mcpo 上非 papers 的服务。mcpo_url 为 .../papers 时替换尾段。"""
-        base = self.valves.mcpo_url.rstrip("/")
-        if base.endswith("/papers"):
-            base = base[: -len("/papers")]
+        """调 mcpo 上非 papers 的服务（firecrawl 网关）。base 从 firecrawl_base_url 取。"""
+        base = self._firecrawl_base()
+        if not base:
+            raise RuntimeError("未配 firecrawl_base_url")
+        base = base.rstrip("/")
+        if base.endswith("/firecrawl"):
+            base = base[: -len("/firecrawl")]
         return self._mcp_call_service_url(f"{base}/{service}", tool, args, timeout)
 
     def _mcp_call_service_url(self, base_url: str, tool: str, args: dict, timeout: int = 90):
@@ -2340,13 +2355,13 @@ class Tools:
             })
         return papers
 
-    def _mcp_call(self, tool: str, args: dict, timeout: int = 180, _retried: bool = False):
+    def _papers_call(self, tool: str, args: dict, timeout: int = 180, _retried: bool = False):
         headers = {}
         if self.valves.mcpo_api_key:
             headers["Authorization"] = f"Bearer {self.valves.mcpo_api_key}"
         try:
             resp = requests.post(
-                f"{self.valves.mcpo_url.rstrip('/')}/{tool}",
+                f"{self._papers_base()}/{tool}",
                 json=args,
                 headers=headers,
                 timeout=timeout,
@@ -2364,12 +2379,12 @@ class Tools:
             # 偶发触发 180s 超时；同请求立即重试通常成功 → 超时才重试 1 次。
             # search_papers 幂等（只读检索），重试安全。
             if _retried:
-                raise RuntimeError(f"后端 mcpo 调用超时 ({timeout}s，已重试1次)")
+                raise RuntimeError(f"papers 服务调用超时 ({timeout}s，已重试1次)")
             import time
             time.sleep(3)
-            return self._mcp_call(tool, args, timeout, _retried=True)
+            return self._papers_call(tool, args, timeout, _retried=True)
         except requests.exceptions.RequestException as e:
-            raise RuntimeError(f"后端 mcpo 请求失败: {e}")
+            raise RuntimeError(f"papers 服务请求失败: {e}")
 
     def _owui_headers(self, __request__=None) -> dict:
         headers = {}
@@ -2606,7 +2621,7 @@ class Tools:
                     args["biorxiv_category"] = biorxiv_category
                 if medrxiv_category:
                     args["medrxiv_category"] = medrxiv_category
-                return await anyio.to_thread.run_sync(self._mcp_call, "search_papers", args)
+                return await anyio.to_thread.run_sync(self._papers_call, "search_papers", args)
             finally:
                 _timings["backend_sem"] = round(_time.monotonic() - t, 1)
 
@@ -2624,7 +2639,7 @@ class Tools:
                                 "sources": (_sem_all if all_mode else ",".join(sorted(sem_set)))}
                         if biorxiv_category: args["biorxiv_category"] = biorxiv_category
                         if medrxiv_category: args["medrxiv_category"] = medrxiv_category
-                        return await anyio.to_thread.run_sync(self._mcp_call, "search_papers", args)
+                        return await anyio.to_thread.run_sync(self._papers_call, "search_papers", args)
                     finally:
                         _timings["backend_sem"] = round(_time.monotonic() - t, 1)
                 tasks.append(_sem()); labels.append("sem")
@@ -2633,7 +2648,7 @@ class Tools:
                     t = _time.monotonic()
                     try:
                         return await anyio.to_thread.run_sync(
-                            self._mcp_call, "search_papers",
+                            self._papers_call, "search_papers",
                             {"query": literal_query,
                              "max_results_per_source": max_results_per_source,
                              "sources": ",".join(sorted(backend_literal))})
@@ -3248,7 +3263,7 @@ class Tools:
                     call_pid = _rest
             try:
                 text = await anyio.to_thread.run_sync(
-                    self._mcp_call, backend_tool, {"paper_id": call_pid}, 300
+                    self._papers_call, backend_tool, {"paper_id": call_pid}, 300
                 )
                 if not self._is_unsupported_msg(text):
                     return text[:max_chars] + (
@@ -3582,7 +3597,7 @@ class Tools:
 
         # 路径2: OA 下载链端点（v2.9.7 默认自托管 papers-service：
         # native→仓储 openaire/core/europepmc/pmc→Unpaywall→可选Sci-Hub，
-        # 服务端已过标题身份闸；留空回退 mcpo 的 paper-search-mcp 落盘共享卷模式）
+        # 服务端已过标题身份闸；留空回退 papers_service_url 的落盘共享卷模式）
         if not (source and paper_id) and not doi:
             return json.dumps(
                 {
@@ -3658,11 +3673,11 @@ class Tools:
 
     async def _download_via_backend(self, source, paper_id, doi, title,
                                     use_scihub, scihub_url):
-        """回退路径：mcpo 上 paper-search-mcp 的 download_with_fallback（落盘共享卷读回）。
-        paper-search-mcp 退役后此路不可用；仅当 download_fallback_url 留空时走。"""
+        """回退路径（download_fallback_url 留空时）：papers 服务的 download_with_fallback
+        落盘共享卷模式（旧 mcpo/paper-search-mcp 形态；papers-service 字节直传不走此路）。"""
         try:
             result = await anyio.to_thread.run_sync(
-                self._mcp_call,
+                self._papers_call,
                 "download_with_fallback",
                 {
                     "source": source
@@ -3692,7 +3707,7 @@ class Tools:
             try:
                 with open(local_path, "rb") as f:
                     data = f.read()
-                # v2.9.6 身份闸：mcpo 路径服务端无闸，本地补一道
+                # v2.9.6 身份闸：落盘回退路径服务端无闸，本地补一道
                 self._verify_downloaded_pdf(data, title, f"fallback 链({os.path.basename(local_path)})")
                 try:
                     os.remove(local_path)  # 读回后清理，避免共享卷膨胀

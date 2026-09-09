@@ -330,7 +330,7 @@ async def test_scholar_actor_replaces_backend_in_dispatch(monkeypatch):
     t = make_tool()
     t.valves.apify_rotator_base_url = "http://rotator:8788"
     backend_calls = []
-    monkeypatch.setattr(t, "_mcp_call",
+    monkeypatch.setattr(t, "_papers_call",
                         lambda tool, args, timeout=180: backend_calls.append(args)
                         or {"papers": [], "source_results": {}, "errors": {}})
 
@@ -362,7 +362,7 @@ async def test_scholar_stays_backend_without_rotator(monkeypatch):
                             "citations": 0, "url": ""}],
                 "source_results": {"google_scholar": 1}, "errors": {}}
 
-    monkeypatch.setattr(t, "_mcp_call", fake_mcp)
+    monkeypatch.setattr(t, "_papers_call", fake_mcp)
     out = _json.loads(await t.search_papers("graph neural network",
                                             sources="google_scholar"))
     assert out["source_results"]["google_scholar"] == 1
@@ -446,7 +446,7 @@ async def test_scholar_dispatch_firecrawl_first_no_actor_call(monkeypatch):
     t = make_tool()
     t.valves.firecrawl_base_url = "http://mcpo:8000/firecrawl"
     t.valves.apify_rotator_base_url = "http://rotator:8788"
-    monkeypatch.setattr(t, "_mcp_call",
+    monkeypatch.setattr(t, "_papers_call",
                         lambda tool, args, timeout=180:
                         {"papers": [], "source_results": {}, "errors": {}})
     monkeypatch.setattr(t, "_mcp_call_service_url",
@@ -467,7 +467,7 @@ async def test_scholar_dispatch_falls_back_to_actor_on_captcha(monkeypatch):
     t = make_tool()
     t.valves.firecrawl_base_url = "http://mcpo:8000/firecrawl"
     t.valves.apify_rotator_base_url = "http://rotator:8788"
-    monkeypatch.setattr(t, "_mcp_call",
+    monkeypatch.setattr(t, "_papers_call",
                         lambda tool, args, timeout=180:
                         {"papers": [], "source_results": {}, "errors": {}})
     monkeypatch.setattr(
@@ -494,7 +494,7 @@ async def test_scholar_firecrawl_only_failure_records_error(monkeypatch):
     import json as _json
     t = make_tool()
     t.valves.firecrawl_base_url = "http://mcpo:8000/firecrawl"
-    monkeypatch.setattr(t, "_mcp_call",
+    monkeypatch.setattr(t, "_papers_call",
                         lambda tool, args, timeout=180:
                         {"papers": [], "source_results": {}, "errors": {}})
 
@@ -526,7 +526,7 @@ async def test_scholar_stays_backend_without_either_valve(monkeypatch):
                             "citations": 0, "url": ""}],
                 "source_results": {"google_scholar": 1}, "errors": {}}
 
-    monkeypatch.setattr(t, "_mcp_call", fake_mcp)
+    monkeypatch.setattr(t, "_papers_call", fake_mcp)
     out = _json.loads(await t.search_papers("graph neural network",
                                             sources="google_scholar"))
     assert out["source_results"]["google_scholar"] == 1
@@ -586,7 +586,7 @@ async def test_scholar_dispatch_tavily_second_tier(monkeypatch):
     t.valves.firecrawl_base_url = "http://mcpo:8000/firecrawl"
     t.valves.tavily_base_url = "http://rotator:8788/tavily"
     t.valves.apify_rotator_base_url = "http://rotator:8788"
-    monkeypatch.setattr(t, "_mcp_call",
+    monkeypatch.setattr(t, "_papers_call",
                         lambda tool, args, timeout=180:
                         {"papers": [], "source_results": {}, "errors": {}})
 
@@ -619,7 +619,7 @@ async def test_scholar_dispatch_actor_last_tier(monkeypatch):
     t.valves.firecrawl_base_url = "http://mcpo:8000/firecrawl"
     t.valves.tavily_base_url = "http://rotator:8788/tavily"
     t.valves.apify_rotator_base_url = "http://rotator:8788"
-    monkeypatch.setattr(t, "_mcp_call",
+    monkeypatch.setattr(t, "_papers_call",
                         lambda tool, args, timeout=180:
                         {"papers": [], "source_results": {}, "errors": {}})
 

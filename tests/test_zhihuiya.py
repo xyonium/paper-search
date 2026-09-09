@@ -203,7 +203,7 @@ async def test_search_papers_merges_zhihuiya_branch():
                  "abstract": "zz", "paper_id": "zp", "doi": "10.1/z",
                  "source": "zhihuiya", "pdf_url": "", "citations": 0, "url": ""}]
 
-    t._mcp_call = lambda *a, **k: backend
+    t._papers_call = lambda *a, **k: backend
     t._zhihuiya_search = fake_zh_search
 
     out = json.loads(await t.search_papers("q", sources="google_scholar,zhihuiya",
@@ -222,7 +222,7 @@ async def test_search_papers_zhihuiya_failure_isolated():
     async def boom(query, limit, key):
         raise RuntimeError("智慧芽连接失败: 401")
 
-    t._mcp_call = lambda *a, **k: backend
+    t._papers_call = lambda *a, **k: backend
     t._zhihuiya_search = boom
 
     out = json.loads(await t.search_papers("q", sources="google_scholar,zhihuiya",
@@ -241,7 +241,7 @@ async def test_search_papers_zhihuiya_not_called_when_disabled():
         called.append(1)
         return []
 
-    t._mcp_call = lambda *a, **k: {"papers": [], "source_results": {}, "errors": {}}
+    t._papers_call = lambda *a, **k: {"papers": [], "source_results": {}, "errors": {}}
     t._zhihuiya_search = fake_zh_search
 
     out = json.loads(await t.search_papers("q", sources="zhihuiya", __user__=_user()))
@@ -290,7 +290,7 @@ async def test_read_paper_zhihuiya_noabstract_keeps_specific_error():
         raise AssertionError("mcpo must not be called for zhihuiya")
 
     t._zhihuiya_call = fake_call
-    t._mcp_call = boom_mcp  # prove no wasted backend call
+    t._papers_call = boom_mcp  # prove no wasted backend call
     out = json.loads(await t.read_paper(source="zhihuiya", paper_id="p1",
                                         __user__=_user()))
     assert "智慧芽无可用 abstract" in out.get("error", "")
@@ -323,7 +323,7 @@ async def test_search_papers_keeps_zhihuiya_when_backend_fails():
                  "abstract": "zz", "paper_id": "zp", "doi": "10.1/z",
                  "source": "zhihuiya", "pdf_url": "", "citations": 0, "url": ""}]
 
-    t._mcp_call = boom_mcp
+    t._papers_call = boom_mcp
     t._zhihuiya_search = fake_zh_search
 
     out = json.loads(await t.search_papers("q", sources="google_scholar,zhihuiya",
@@ -576,7 +576,7 @@ async def test_search_papers_splits_literal_vs_semantic():
                  "abstract": "", "paper_id": "hal:1", "doi": "",
                  "source": "hal", "pdf_url": "", "citations": 0, "url": ""}]
 
-    t._mcp_call = fake_mcp
+    t._papers_call = fake_mcp
     t._hal_search = fake_hal
     # doaj(字面) + google_scholar(语义) + hal(直连) + zhihuiya 未启用
     out = json.loads(await t.search_papers(
@@ -598,7 +598,7 @@ async def test_search_papers_single_call_when_core_equals_original():
     t = Tools()
     t.valves = Tools.Valves()
     calls = []
-    t._mcp_call = lambda tool, args, timeout=180: (calls.append(dict(args)), {"papers": [], "source_results": {}, "errors": {}})[1]
+    t._papers_call = lambda tool, args, timeout=180: (calls.append(dict(args)), {"papers": [], "source_results": {}, "errors": {}})[1]
     await t.search_papers("glucose biosensor", sources="google_scholar,doaj", __user__=_user())
     # 无引号/布尔/噪声 → core==original → 只调一次后端
     assert len(calls) == 1
@@ -611,7 +611,7 @@ async def test_search_papers_passes_biorxiv_category():
     t = Tools()
     t.valves = Tools.Valves()
     calls = []
-    t._mcp_call = lambda tool, args, timeout=180: (calls.append(dict(args)), {"papers": [], "source_results": {}, "errors": {}})[1]
+    t._papers_call = lambda tool, args, timeout=180: (calls.append(dict(args)), {"papers": [], "source_results": {}, "errors": {}})[1]
     seen = {}
 
     async def fake_rxiv(server, category, limit):
@@ -631,7 +631,7 @@ async def test_all_mode_rxiv_requires_category():
     """all 模式下 biorxiv/medrxiv 不传 category 不启用（全学科浏览=噪声）。"""
     t = Tools()
     t.valves = Tools.Valves()
-    t._mcp_call = lambda tool, args, timeout=180: {"papers": [], "source_results": {}, "errors": {}}
+    t._papers_call = lambda tool, args, timeout=180: {"papers": [], "source_results": {}, "errors": {}}
     seen = []
 
     async def fake_rxiv(server, category, limit):
@@ -672,7 +672,7 @@ async def test_search_papers_all_mode_excludes_direct_sources():
     t = Tools()
     t.valves = Tools.Valves()
     calls = []
-    t._mcp_call = lambda tool, args, timeout=180: (calls.append(dict(args)), {"papers": [], "source_results": {}, "errors": {}})[1]
+    t._papers_call = lambda tool, args, timeout=180: (calls.append(dict(args)), {"papers": [], "source_results": {}, "errors": {}})[1]
     async def fake_hal(q, limit):
         return []
     t._hal_search = fake_hal
@@ -695,7 +695,7 @@ async def test_search_papers_all_mode_excludes_direct_sources():
 async def test_all_mode_split_gives_literal_sources_core():
     t = Tools(); t.valves = Tools.Valves()
     calls = []
-    t._mcp_call = lambda tool, args, timeout=180: (calls.append(dict(args)), {"papers": [], "source_results": {}, "errors": {}})[1]
+    t._papers_call = lambda tool, args, timeout=180: (calls.append(dict(args)), {"papers": [], "source_results": {}, "errors": {}})[1]
     async def fake_hal(q, limit): return []
     t._hal_search = fake_hal
 
@@ -725,7 +725,7 @@ async def test_all_mode_split_gives_literal_sources_core():
 async def test_direct_only_sources_skip_backend():
     t = Tools(); t.valves = Tools.Valves()
     calls = []
-    t._mcp_call = lambda tool, args, timeout=180: (calls.append(dict(args)), {"papers": [], "source_results": {}, "errors": {}})[1]
+    t._papers_call = lambda tool, args, timeout=180: (calls.append(dict(args)), {"papers": [], "source_results": {}, "errors": {}})[1]
     async def fake_hal(q, limit): return []
     t._hal_search = fake_hal
     await t.search_papers("glucose biosensor", sources="hal", __user__=_user())
@@ -783,7 +783,7 @@ def test_distill_preserves_order_and_no_dup():
 @pytest.mark.asyncio
 async def test_search_papers_adds_query_adapted_hint():
     t = Tools(); t.valves = Tools.Valves()
-    t._mcp_call = lambda tool, args, timeout=180: {"papers": [], "source_results": {}, "errors": {}}
+    t._papers_call = lambda tool, args, timeout=180: {"papers": [], "source_results": {}, "errors": {}}
     async def fake_zh(q, limit, key):
         return []
     t._zhihuiya_search = fake_zh
@@ -920,7 +920,7 @@ async def test_pubmed_not_sent_to_backend():
     """pubmed/pmc 是直连源：不进后端 sources，后端批次不含它们。"""
     t = Tools(); t.valves = Tools.Valves()
     calls = []
-    t._mcp_call = lambda tool, args, timeout=180: (calls.append(dict(args)), {"papers": [], "source_results": {}, "errors": {}})[1]
+    t._papers_call = lambda tool, args, timeout=180: (calls.append(dict(args)), {"papers": [], "source_results": {}, "errors": {}})[1]
     t._pubmed_search = lambda q, n, u=None: _async_ret([_paper_pubmed()])
     t._pmc_search = lambda q, n, u=None: _async_ret([])
     out = json.loads(await t.search_papers("glucose sensor biofouling", sources="google_scholar,pubmed,pmc"))
@@ -991,7 +991,7 @@ async def test_read_paper_pubmed_falls_back_to_jina():
     """pubmed 后端仅元数据提示 → 必须降级到网页抓取，不返回提示文本。"""
     t = Tools(); t.valves = Tools.Valves()
     # 后端 read_pubmed_paper 返回"不支持"提示
-    t._mcp_call = lambda *a, **k: ("PubMed papers cannot be read directly through this tool. "
+    t._papers_call = lambda *a, **k: ("PubMed papers cannot be read directly through this tool. "
                                    "Only metadata and abstracts are available through PubMed's API. "
                                    "Please use the paper's DOI or URL to access the full text online.")
     async def fake_web(url, u=None):
@@ -1007,7 +1007,7 @@ async def test_read_paper_pubmed_falls_back_to_jina():
 async def test_read_paper_crossref_doi_uses_unpaywall_then_web():
     """crossref（DOI）无 pdf_url：Unpaywall OA 链接非 PDF 时回退网页抓取 OA 链接。"""
     t = Tools(); t.valves = Tools.Valves()
-    t._mcp_call = lambda *a, **k: ("CrossRef papers cannot be read directly through this tool. "
+    t._papers_call = lambda *a, **k: ("CrossRef papers cannot be read directly through this tool. "
                                    "Only metadata and abstracts are available.")
     t._resolve_oa_pdf = lambda doi: _async_ret("https://www.sciencedirect.com/science/article/pii/X/pdf")
     # OA PDF 下载失败（非 PDF）
