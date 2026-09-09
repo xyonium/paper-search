@@ -37,7 +37,7 @@ description: 学术论文搜索、全文阅读、PDF 下载入 Knowledge（RAG�
   5. read_patent(patent_number) → 读专利全文 markdown（权利要求+说明书+法律状态）
 author: openags-bridge
 requirements: requests, pymupdf, anyio
-version: 2.9.6
+version: 2.9.7
 license: MIT
 """
 
@@ -194,6 +194,12 @@ class Tools:
             description="mcpo base URL（含 config.json 里 mcpServers 的 key 名）",
         )
         mcpo_api_key: str = Field(default="", description="mcpo --api-key")
+        download_fallback_url: str = Field(
+            default="http://papers-service:3200/papers/download_with_fallback",
+            description="download_paper_to_knowledge 路径2 的 OA 下载链端点（自托管 "
+            "papers-service，含 OA 仓储链+Unpaywall+可选 Sci-Hub+标题身份闸）。留空回退 "
+            "mcpo_url 的 download_with_fallback（paper-search-mcp，退役后不可用）",
+        )
         openwebui_url: str = Field(
             default="http://open-webui:8080", description="OpenWebUI 容器名:端口"
         )
@@ -3574,7 +3580,9 @@ class Tools:
                     )
                 pass  # 其他错误静默落入 fallback 链
 
-        # 路径2: 后端 download_with_fallback（OA链 + 可选Sci-Hub），落盘共享卷后读回
+        # 路径2: OA 下载链端点（v2.9.7 默认自托管 papers-service：
+        # native→仓储 openaire/core/europepmc/pmc→Unpaywall→可选Sci-Hub，
+        # 服务端已过标题身份闸；留空回退 mcpo 的 paper-search-mcp 落盘共享卷模式）
         if not (source and paper_id) and not doi:
             return json.dumps(
                 {
@@ -3584,6 +3592,74 @@ class Tools:
                 ensure_ascii=False,
             )
 
+        dl_endpoint = (self.valves.download_fallback_url or "").strip()
+        if dl_endpoint:
+            data, via = await self._download_via_endpoint(
+                dl_endpoint, source, paper_id, doi, title, allow_scihub, scihub_url
+            )
+        else:
+            data, via = await self._download_via_backend(
+                source, paper_id, doi, title, allow_scihub, scihub_url
+            )
+        if data is None:
+            return json.dumps(
+                {
+                    "error": "完整 fallback 链均未获取到 PDF",
+                    "detail": (via or "")[:500],
+                    "hint": "该文可能无 OA 版本；可告知用户手动获取，或检查 Sci-Hub 镜像可用性（也可在 Valves 设置 scihub_url 为可用镜像）",
+                },
+                ensure_ascii=False,
+            )
+        try:
+            msg = await anyio.to_thread.run_sync(
+                self._upload_pdf, data, title, knowledge_id, __request__
+            )
+            if "scihub" in via.lower():
+                msg += "（来源：Sci-Hub fallback）"
+            return msg
+        except Exception as e:
+            return json.dumps(
+                {"error": "下载成功但上传到 OpenWebUI 失败", "detail": str(e)},
+                ensure_ascii=False,
+            )
+
+    async def _download_via_endpoint(self, endpoint, source, paper_id, doi, title,
+                                     use_scihub, scihub_url):
+        """POST 自托管 papers-service /papers/download_with_fallback，返回 (bytes|None, via|错误串)。
+        服务端身份闸已拦错文档（404 + attempts），这里不重复校验。"""
+        def _f():
+            headers = {}
+            if self.valves.mcpo_api_key:
+                headers["Authorization"] = f"Bearer {self.valves.mcpo_api_key}"
+            resp = requests.post(
+                endpoint,
+                json={
+                    "source": source or "crossref",
+                    "paper_id": paper_id or doi or title,
+                    "doi": doi,
+                    "title": title,
+                    "use_scihub": use_scihub,
+                    "scihub_base_url": scihub_url,
+                },
+                headers=headers,
+                timeout=180,
+            )
+            if resp.status_code == 200 and resp.content.startswith(b"%PDF"):
+                return resp.content, resp.headers.get("X-Download-Via", "papers-service")
+            try:
+                detail = resp.json()
+            except ValueError:
+                detail = resp.text[:300]
+            return None, f"http {resp.status_code}: {json.dumps(detail, ensure_ascii=False)[:400]}"
+        try:
+            return await anyio.to_thread.run_sync(_f)
+        except Exception as e:
+            return None, f"下载请求异常: {e}"
+
+    async def _download_via_backend(self, source, paper_id, doi, title,
+                                    use_scihub, scihub_url):
+        """回退路径：mcpo 上 paper-search-mcp 的 download_with_fallback（落盘共享卷读回）。
+        paper-search-mcp 退役后此路不可用；仅当 download_fallback_url 留空时走。"""
         try:
             result = await anyio.to_thread.run_sync(
                 self._mcp_call,
@@ -3595,20 +3671,13 @@ class Tools:
                     "doi": doi,
                     "title": title,
                     "save_path": self.valves.shared_download_dir,
-                    "use_scihub": allow_scihub,
+                    "use_scihub": use_scihub,
                     "scihub_base_url": scihub_url,
                 },
                 600,
             )
         except Exception as e:
-            return json.dumps(
-                {
-                    "error": "下载请求异常/超时",
-                    "detail": str(e),
-                    "hint": "可检查后端日志或手动确认该论文 DOI 是否在 Open Access 仓储中可用",
-                },
-                ensure_ascii=False,
-            )
+            return None, f"下载请求异常/超时: {e}"
 
         if isinstance(result, str) and result.endswith(".pdf"):
             local_path = result
@@ -3619,54 +3688,22 @@ class Tools:
                 if os.path.exists(candidate):
                     local_path = candidate
                 else:
-                    return json.dumps(
-                        {
-                            "error": "后端报告下载成功但共享卷中找不到文件",
-                            "backend_path": result,
-                            "hint": "检查 mcpo 与 openwebui 容器的共享 volume 挂载路径是否一致",
-                        },
-                        ensure_ascii=False,
-                    )
+                    return None, f"后端报告下载成功但共享卷中找不到文件: {result}"
             try:
-                def _read_and_upload():
-                    with open(local_path, "rb") as f:
-                        data = f.read()
-                    # v2.9.6 身份闸：核对全文与标题匹配，防 OA 链/Sci-Hub 下错文档
-                    self._verify_downloaded_pdf(data, title, f"fallback 链({os.path.basename(local_path)})")
-                    try:
-                        os.remove(local_path)  # 上传后清理，避免共享卷膨胀
-                    except OSError:
-                        pass
-                    return self._upload_pdf(data, title, knowledge_id, __request__)
-
-                msg = await anyio.to_thread.run_sync(_read_and_upload)
-                if "scihub" in result.lower() or "sci-hub" in result.lower():
-                    msg += "（来源：Sci-Hub fallback）"
-                return msg
+                with open(local_path, "rb") as f:
+                    data = f.read()
+                # v2.9.6 身份闸：mcpo 路径服务端无闸，本地补一道
+                self._verify_downloaded_pdf(data, title, f"fallback 链({os.path.basename(local_path)})")
+                try:
+                    os.remove(local_path)  # 读回后清理，避免共享卷膨胀
+                except OSError:
+                    pass
+                return data, result
             except Exception as e:
                 if "身份校验未通过" in str(e):
                     try:
                         os.remove(local_path)  # 拒收的文档也不留落盘
                     except OSError:
                         pass
-                    return json.dumps(
-                        {"error": str(e),
-                         "hint": "可改用 read_paper 先读摘要确认论文身份，或手动获取"},
-                        ensure_ascii=False,
-                    )
-                return json.dumps(
-                    {
-                        "error": "读取落盘 PDF 并上传到 OpenWebUI 失败",
-                        "detail": str(e),
-                    },
-                    ensure_ascii=False,
-                )
-
-        return json.dumps(
-            {
-                "error": "完整 fallback 链均未获取到 PDF",
-                "detail": str(result)[:500],
-                "hint": "该文可能无 OA 版本；可告知用户手动获取，或检查 Sci-Hub 镜像可用性（也可在 Valves 设置 scihub_url 为可用镜像）",
-            },
-            ensure_ascii=False,
-        )
+                return None, str(e)
+        return None, str(result)[:500]

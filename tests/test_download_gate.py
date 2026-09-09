@@ -136,25 +136,77 @@ class TestVerifyGate:
         finally:
             rq.get = orig
         assert "身份校验未通过" in out
-        assert "落" not in out.split("error")[0][:5]  # 确认走的是闸错误分支
 
-    def test_path2_gates_before_upload(self, tmp_path):
-        """路径2（后端落盘读回）在 _upload_pdf 前过闸；被拦时文件已清理。"""
+    def test_path2_endpoint_success(self):
+        """v2.9.7 路径2 默认走 papers-service 端点：200 PDF → 上传。"""
         import asyncio
 
         t = self._tools()
+        uploaded = []
+        t._upload_pdf = lambda *a, **k: uploaded.append(a) or "✅ ok"
+
+        class _R:
+            status_code = 200
+            content = _pdf("Glucose sensor wireless implantable paper " * 30)
+            headers = {"X-Download-Via": "unpaywall"}
+
+            def json(self):
+                raise ValueError("binary")
+
+        import requests as rq
+        orig = rq.post
+        rq.post = lambda url, **k: _R()
+        try:
+            out = asyncio.run(t.download_paper_to_knowledge(
+                title="A Wireless Glucose Sensor",
+                source="crossref", paper_id="10.1/x", doi="10.1/x",
+            ))
+        finally:
+            rq.post = orig
+        assert "✅ ok" in out
+        assert len(uploaded) == 1
+
+    def test_path2_endpoint_gate_reject_returns_detail(self):
+        """papers-service 服务端闸拒（404+attempts）→ 结构化 error 带 attempts。"""
+        import asyncio
+
+        t = self._tools()
+
+        class _R:
+            status_code = 404
+            headers = {}
+
+            def json(self):
+                return {"detail": "no PDF obtained", "attempts": ["unpaywall: no OA URL"]}
+
+        import requests as rq
+        orig = rq.post
+        rq.post = lambda url, **k: _R()
+        try:
+            out = asyncio.run(t.download_paper_to_knowledge(
+                title="Another Sensor Paper",
+                source="crossref", paper_id="10.1/x", doi="10.1/x",
+            ))
+        finally:
+            rq.post = orig
+        assert "完整 fallback 链均未获取到 PDF" in out
+        assert "unpaywall" in out
+
+    def test_path2_backend_fallback_when_valve_empty(self, tmp_path):
+        """download_fallback_url 留空 → 回退 mcpo 落盘共享卷模式（含本地身份闸）。"""
+        import asyncio
+
+        t = self._tools()
+        t.valves.download_fallback_url = ""
         t.valves.shared_download_dir = str(tmp_path)
-        # 不依赖后端：直接构造 _mcp_call 返回落盘路径
         local = tmp_path / "downloaded.pdf"
         local.write_bytes(_pdf("Unrelated proceedings volume. " * 50))
 
         uploaded = []
         t._upload_pdf = lambda *a, **k: uploaded.append(a) or "uploaded"
 
-        calls = {}
-
         def _fake_call(tool, args, timeout=180, _retried=False):
-            calls["tool"] = tool
+            assert tool == "download_with_fallback"
             return str(local)
 
         t._mcp_call = _fake_call
@@ -167,4 +219,21 @@ class TestVerifyGate:
         assert "身份校验未通过" in out
         assert not uploaded  # 没有上传
         assert not local.exists()  # 拒收文件已清理
-        assert calls["tool"] == "download_with_fallback"
+
+    def test_path2_backend_fallback_success_uploads(self, tmp_path):
+        import asyncio
+
+        t = self._tools()
+        t.valves.download_fallback_url = ""
+        t.valves.shared_download_dir = str(tmp_path)
+        local = tmp_path / "downloaded.pdf"
+        local.write_bytes(_pdf("Deep learning for protein folding network. " * 30))
+        uploaded = []
+        t._upload_pdf = lambda *a, **k: uploaded.append(a) or "✅ ok"
+        t._mcp_call = lambda tool, args, timeout=180, _retried=False: str(local)
+        out = asyncio.run(t.download_paper_to_knowledge(
+            title="Deep Learning for Protein Folding",
+            source="crossref", paper_id="10.1/x", doi="10.1/x",
+        ))
+        assert "✅ ok" in out
+        assert len(uploaded) == 1
