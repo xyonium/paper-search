@@ -116,7 +116,6 @@ class TestVerifyGate:
         import asyncio
 
         t = self._tools()
-        t.valves.shared_download_dir = "/tmp"
 
         class _R:
             content = _pdf("Unrelated clinical dataset appendix. " * 50)
@@ -192,48 +191,38 @@ class TestVerifyGate:
         assert "完整 fallback 链均未获取到 PDF" in out
         assert "unpaywall" in out
 
-    def test_path2_backend_fallback_when_valve_empty(self, tmp_path):
-        """download_fallback_url 留空 → 回退 mcpo 落盘共享卷模式（含本地身份闸）。"""
+    def test_path2_hits_papers_service_endpoint(self):
+        """v2.9.9 落盘回退已删：路径2 固定 POST papers-service 端点（无 valve 可配）。"""
         import asyncio
 
         t = self._tools()
-        t.valves.download_fallback_url = ""
-        t.valves.shared_download_dir = str(tmp_path)
-        local = tmp_path / "downloaded.pdf"
-        local.write_bytes(_pdf("Unrelated proceedings volume. " * 50))
+        t._upload_pdf = lambda *a, **k: "✅ ok"
+        seen = {}
 
-        uploaded = []
-        t._upload_pdf = lambda *a, **k: uploaded.append(a) or "uploaded"
+        class _R:
+            status_code = 200
+            content = _pdf("Glucose sensor paper full text " * 30)
+            headers = {"X-Download-Via": "repository:openaire"}
 
-        def _fake_call(tool, args, timeout=180, _retried=False):
-            assert tool == "download_with_fallback"
-            return str(local)
+            def json(self):
+                raise ValueError("binary")
 
-        t._papers_call = _fake_call
-        out = asyncio.run(t.download_paper_to_knowledge(
-            title="Another Sensor Paper",
-            source="crossref",
-            paper_id="10.1/x",
-            doi="10.1/x",
-        ))
-        assert "身份校验未通过" in out
-        assert not uploaded  # 没有上传
-        assert not local.exists()  # 拒收文件已清理
+        import requests as rq
+        orig = rq.post
 
-    def test_path2_backend_fallback_success_uploads(self, tmp_path):
-        import asyncio
+        def fake_post(url, **k):
+            seen["url"] = url
+            seen["body"] = k.get("json")
+            return _R()
 
-        t = self._tools()
-        t.valves.download_fallback_url = ""
-        t.valves.shared_download_dir = str(tmp_path)
-        local = tmp_path / "downloaded.pdf"
-        local.write_bytes(_pdf("Deep learning for protein folding network. " * 30))
-        uploaded = []
-        t._upload_pdf = lambda *a, **k: uploaded.append(a) or "✅ ok"
-        t._papers_call = lambda tool, args, timeout=180, _retried=False: str(local)
-        out = asyncio.run(t.download_paper_to_knowledge(
-            title="Deep Learning for Protein Folding",
-            source="crossref", paper_id="10.1/x", doi="10.1/x",
-        ))
+        rq.post = fake_post
+        try:
+            out = asyncio.run(t.download_paper_to_knowledge(
+                title="A Wireless Glucose Sensor",
+                source="crossref", paper_id="10.1/x", doi="10.1/x",
+            ))
+        finally:
+            rq.post = orig
+        assert seen["url"] == "http://papers-service:3200/papers/download_with_fallback"
+        assert seen["body"]["source"] == "crossref"
         assert "✅ ok" in out
-        assert len(uploaded) == 1

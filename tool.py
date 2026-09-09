@@ -39,13 +39,12 @@ description: 学术论文搜索、全文阅读、PDF 下载入 Knowledge（RAG�
   5. read_patent(patent_number) → 读专利全文 markdown（权利要求+说明书+法律状态）
 author: openags-bridge
 requirements: requests, pymupdf, anyio
-version: 2.9.8
+version: 2.9.9
 license: MIT
 """
 
 import asyncio
 import json
-import os
 import re
 import anyio
 import requests
@@ -200,23 +199,11 @@ class Tools:
             default="",
             description="mcpo --api-key（papers-service 内网直连一般不需要；仅当 papers-service 前面挂了带 key 的网关时填）",
         )
-        download_fallback_url: str = Field(
-            default="http://papers-service:3200/papers/download_with_fallback",
-            description="download_paper_to_knowledge 的 OA 下载链端点：papers-service 在 "
-            "HTTP 响应体里直接回 PDF 字节（内存流转，不落盘）。链=native→OA 仓储→Unpaywall"
-            "→可选 Sci-Hub，每步过标题身份闸。留空仅剩历史兼容场景（旧落盘模式，"
-            "paper-search-mcp 已退役，实际不可用），保持默认即可",
-        )
         openwebui_url: str = Field(
             default="http://open-webui:8080", description="OpenWebUI 容器名:端口"
         )
         owui_api_key: str = Field(
             default="", description="fallback key（一般用不到，自动透传用户token）"
-        )
-        shared_download_dir: str = Field(
-            default="/downloads",
-            description="（历史遗留，当前架构用不到）旧 mcpo/paper-search-mcp 落盘模式需要 "
-            "open-webui 与后端挂同一共享卷才能读回 PDF；papers-service 字节直传后无需任何共享卷",
         )
         zhihuiya_apikey: str = Field(
             default="",
@@ -3596,9 +3583,9 @@ class Tools:
                     )
                 pass  # 其他错误静默落入 fallback 链
 
-        # 路径2: OA 下载链端点（v2.9.7 默认自托管 papers-service：
+        # 路径2: OA 下载链（v2.9.7 起自托管 papers-service：
         # native→仓储 openaire/core/europepmc/pmc→Unpaywall→可选Sci-Hub，
-        # 服务端已过标题身份闸；留空回退 papers_service_url 的落盘共享卷模式）
+        # HTTP 响应体直接回 PDF 字节，内存流转不落盘，服务端已过标题身份闸）
         if not (source and paper_id) and not doi:
             return json.dumps(
                 {
@@ -3608,15 +3595,10 @@ class Tools:
                 ensure_ascii=False,
             )
 
-        dl_endpoint = (self.valves.download_fallback_url or "").strip()
-        if dl_endpoint:
-            data, via = await self._download_via_endpoint(
-                dl_endpoint, source, paper_id, doi, title, allow_scihub, scihub_url
-            )
-        else:
-            data, via = await self._download_via_backend(
-                source, paper_id, doi, title, allow_scihub, scihub_url
-            )
+        data, via = await self._download_via_endpoint(
+            "http://papers-service:3200/papers/download_with_fallback",
+            source, paper_id, doi, title, allow_scihub, scihub_url,
+        )
         if data is None:
             return json.dumps(
                 {
@@ -3641,8 +3623,9 @@ class Tools:
 
     async def _download_via_endpoint(self, endpoint, source, paper_id, doi, title,
                                      use_scihub, scihub_url):
-        """POST 自托管 papers-service /papers/download_with_fallback，返回 (bytes|None, via|错误串)。
-        服务端身份闸已拦错文档（404 + attempts），这里不重复校验。"""
+        """POST papers-service /papers/download_with_fallback，返回 (bytes|None, via|错误串)。
+        HTTP 响应体直接回 PDF 字节（内存流转不落盘）；服务端身份闸已拦错文档
+        （404 + attempts），这里不重复校验。"""
         def _f():
             headers = {}
             if self.valves.mcpo_api_key:
@@ -3671,55 +3654,3 @@ class Tools:
             return await anyio.to_thread.run_sync(_f)
         except Exception as e:
             return None, f"下载请求异常: {e}"
-
-    async def _download_via_backend(self, source, paper_id, doi, title,
-                                    use_scihub, scihub_url):
-        """回退路径（download_fallback_url 留空时）：papers 服务的 download_with_fallback
-        落盘共享卷模式（旧 mcpo/paper-search-mcp 形态；papers-service 字节直传不走此路）。"""
-        try:
-            result = await anyio.to_thread.run_sync(
-                self._papers_call,
-                "download_with_fallback",
-                {
-                    "source": source
-                    or "crossref",  # crossref 必失败 → 直接进 OA fallback 链（有意为之）
-                    "paper_id": paper_id or doi or title,
-                    "doi": doi,
-                    "title": title,
-                    "save_path": self.valves.shared_download_dir,
-                    "use_scihub": use_scihub,
-                    "scihub_base_url": scihub_url,
-                },
-                600,
-            )
-        except Exception as e:
-            return None, f"下载请求异常/超时: {e}"
-
-        if isinstance(result, str) and result.endswith(".pdf"):
-            local_path = result
-            if not os.path.exists(local_path):
-                candidate = os.path.join(
-                    self.valves.shared_download_dir, os.path.basename(local_path)
-                )
-                if os.path.exists(candidate):
-                    local_path = candidate
-                else:
-                    return None, f"后端报告下载成功但共享卷中找不到文件: {result}"
-            try:
-                with open(local_path, "rb") as f:
-                    data = f.read()
-                # v2.9.6 身份闸：落盘回退路径服务端无闸，本地补一道
-                self._verify_downloaded_pdf(data, title, f"fallback 链({os.path.basename(local_path)})")
-                try:
-                    os.remove(local_path)  # 读回后清理，避免共享卷膨胀
-                except OSError:
-                    pass
-                return data, result
-            except Exception as e:
-                if "身份校验未通过" in str(e):
-                    try:
-                        os.remove(local_path)  # 拒收的文档也不留落盘
-                    except OSError:
-                        pass
-                return None, str(e)
-        return None, str(result)[:500]

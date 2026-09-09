@@ -155,7 +155,6 @@ volume between the backend and open-webui is needed anymore.
 2. Create a new Tool and copy the contents of [`tool.py`](./tool.py).
 3. Save the tool and optionally configure the **Valves** / **UserValves**:
    - `papers_service_url`: papers-service base URL (default `http://papers-service:3200/papers`).
-   - `download_fallback_url`: OA download chain endpoint (default `http://papers-service:3200/papers/download_with_fallback`).
    - `knowledge_id`: Default Knowledge Base ID to automatically store downloaded papers.
    - `allow_scihub`: Set to `True` / `False` for Sci-Hub fallback.
    - `scihub_url`: Custom Sci-Hub mirror URL (e.g. `https://sci-hub.ee`).
