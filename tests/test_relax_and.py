@@ -182,7 +182,7 @@ async def test_dblp_json_200_still_works(monkeypatch):
     assert papers[0]["source"] == "dblp"
 
 
-# ---------- 反爬 → 住宅代理一次性重试（v2.9.2） ----------
+# ---------- 反爬 → firecrawl 浏览器兜底（v2.9.3） ----------
 
 def _antibot_page():
     r = MagicMock()
@@ -192,66 +192,178 @@ def _antibot_page():
     return r
 
 
-def test_antibot_proxies_helper():
-    t = make_tool()
-    assert t._antibot_proxies() == {}  # 未配 → 空
-    t.valves.antibot_proxy_url = "http://groups-RESIDENTIAL:pw@proxy.apify.com:8000"
-    px = t._antibot_proxies()
-    assert px["http"].startswith("http://groups-RESIDENTIAL")
-    assert px["https"] == px["http"]
+_DBLP_JSON = {"result": {"hits": {"hit": [{
+    "info": {"title": "Via Firecrawl", "year": "2024",
+             "authors": {"author": [{"text": "Bob"}]},
+             "doi": "10.1/fc", "url": "https://dblp/y"},
+}]}}}
+
+
+def _wrap_pre(payload: dict) -> str:
+    import json as _json
+    return f'<html><body><pre>{_json.dumps(payload)}</pre></body></html>'
 
 
 @pytest.mark.asyncio
-async def test_dblp_antibot_retries_via_proxy_when_configured(monkeypatch):
-    """直连被拦 + 配了代理 → 换代理（带浏览器 UA）重试一次并成功。"""
+async def test_dblp_antibot_falls_back_to_firecrawl(monkeypatch):
+    """直连被 Anubis 拦 + 配了 firecrawl_base_url → scrape 的 <pre> JSON 被解析返回。"""
     t = make_tool()
-    t.valves.antibot_proxy_url = "http://u:p@proxy.example:8000"
-    seen = []
-
-    def fake_get(url, params=None, headers=None, proxies=None, **kw):
-        seen.append({"proxies": proxies, "ua": (headers or {}).get("User-Agent", "")})
-        if not proxies:
-            return _antibot_page()  # 直连被拦
-        r = MagicMock()  # 代理出口干净 → 正常 JSON
-        r.status_code = 200
-        r.headers = {"content-type": "application/json"}
-        r.json.return_value = {"result": {"hits": {"hit": [{
-            "info": {"title": "Via Proxy", "year": "2024"},
-        }]}}}
-        return r
-
-    monkeypatch.setattr(tool_mod.requests, "get", fake_get)
-    papers = await t._dblp_search("zero knowledge proof", 5)
-    assert len(papers) == 1 and papers[0]["title"] == "Via Proxy"
-    assert seen[0]["proxies"] is None            # 第一次直连
-    assert seen[1]["proxies"]["https"].startswith("http://u:p@")  # 第二次走代理
-    assert "Mozilla" in seen[1]["ua"]            # 代理重试换浏览器 UA
-    assert len(seen) == 2                        # 代理只重试一轮
-
-
-@pytest.mark.asyncio
-async def test_dblp_antibot_proxy_still_blocked(monkeypatch):
-    """代理重试仍被拦 → 明确报错，不无限重试。"""
-    t = make_tool()
-    t.valves.antibot_proxy_url = "http://u:p@proxy.example:8000"
+    t.valves.firecrawl_base_url = "http://mcpo:8000/firecrawl"
     calls = []
 
-    def fake_get(url, **kw):
-        calls.append(kw.get("proxies"))
-        return _antibot_page()
+    monkeypatch.setattr(tool_mod.requests, "get", lambda url, **kw: _antibot_page())
 
-    monkeypatch.setattr(tool_mod.requests, "get", fake_get)
-    with pytest.raises(RuntimeError) as ei:
-        await t._dblp_search("zero knowledge proof", 5)
-    assert "代理重试仍被反爬拦截" in str(ei.value)
-    assert len(calls) == 2  # 直连 1 + 代理 1，仅此而已
+    def fake_mcp(base, tool, args, timeout):
+        calls.append({"tool": tool, "args": args})
+        assert tool == "firecrawl_scrape"
+        assert "dblp.org/search/publ/api" in args["url"]
+        assert args["formats"] == ["rawHtml"]
+        return {"rawHtml": _wrap_pre(_DBLP_JSON)}
+
+    monkeypatch.setattr(t, "_mcp_call_service_url", fake_mcp)
+    papers = await t._dblp_search("zero knowledge proof", 5)
+    assert len(papers) == 1
+    assert papers[0]["title"] == "Via Firecrawl"
+    assert papers[0]["authors"] == "Bob"
+    assert len(calls) == 1  # 兜底只调一次
 
 
 @pytest.mark.asyncio
-async def test_dblp_antibot_no_proxy_suggests_valve(monkeypatch):
-    """未配代理时错误信息应引导配置 antibot_proxy_url。"""
+async def test_dblp_antibot_no_firecrawl_suggests_valve(monkeypatch):
+    """未配 firecrawl_base_url 时错误信息应引导配置。"""
     t = make_tool()
+    t.valves.firecrawl_base_url = ""
     monkeypatch.setattr(tool_mod.requests, "get", lambda url, **kw: _antibot_page())
     with pytest.raises(RuntimeError) as ei:
         await t._dblp_search("zero knowledge proof", 5)
-    assert "antibot_proxy_url" in str(ei.value)
+    assert "firecrawl_base_url" in str(ei.value)
+    assert "反爬" in str(ei.value)
+
+
+@pytest.mark.asyncio
+async def test_dblp_antibot_firecrawl_also_fails(monkeypatch):
+    """firecrawl 兜底也拿不到 JSON（质询未解）→ 明确报错。"""
+    t = make_tool()
+    t.valves.firecrawl_base_url = "http://mcpo:8000/firecrawl"
+    monkeypatch.setattr(tool_mod.requests, "get", lambda url, **kw: _antibot_page())
+    monkeypatch.setattr(t, "_mcp_call_service_url",
+                        lambda base, tool, args, timeout: {"rawHtml": "<html>challenge</html>"})
+    with pytest.raises(RuntimeError) as ei:
+        await t._dblp_search("zero knowledge proof", 5)
+    assert "兜底未取到 JSON" in str(ei.value)
+
+
+@pytest.mark.asyncio
+async def test_dblp_antibot_firecrawl_raw_json_passthrough(monkeypatch):
+    """Content-Type=application/json 时 firecrawl 原样透传 body（mcpo 侧实测形态），
+    无 <pre> 包装也要能解析。"""
+    import json as _json
+    t = make_tool()
+    t.valves.firecrawl_base_url = "http://mcpo:8000/firecrawl"
+    monkeypatch.setattr(tool_mod.requests, "get", lambda url, **kw: _antibot_page())
+    monkeypatch.setattr(
+        t, "_mcp_call_service_url",
+        lambda base, tool, args, timeout: {"rawHtml": _json.dumps(_DBLP_JSON)})
+    papers = await t._dblp_search("zero knowledge proof", 5)
+    assert len(papers) == 1 and papers[0]["title"] == "Via Firecrawl"
+
+
+# ---------- Google Scholar Apify actor 源（v2.9.3） ----------
+
+_SCHOLAR_ITEMS = [{
+    "paper_title": "Graph neural networks",
+    "link": "https://www.nature.com/articles/s43586-024-00294-7",
+    "snippet": "Graphs are flexible mathematical objects ...",
+    "result_id": "bfJWK1lrry4J",
+    "publication_info": {
+        "summary": "G Corso, H Stark - Nature Reviews, 2024 - nature.com",
+        "authors": [{"name": "G Corso"}, {"name": "H Stark"}],
+    },
+    "inline_links": {"cited_by_total": 691},
+}, {
+    "error": True, "error_message": "some mode error",  # 错误项应跳过
+}]
+
+
+@pytest.mark.asyncio
+async def test_scholar_actor_parses_items(monkeypatch):
+    t = make_tool()
+    t.valves.apify_rotator_base_url = "http://api-key-rotator:8788"
+    seen = {}
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        seen["url"] = url
+        seen["body"] = json
+        r = MagicMock()
+        r.status_code = 201
+        r.json.return_value = _SCHOLAR_ITEMS
+        return r
+
+    monkeypatch.setattr(tool_mod.requests, "post", fake_post)
+    papers = await t._google_scholar_actor_search("graph neural network", 5)
+    assert seen["url"].endswith("/v2/acts/johnvc~google-scholar-api/run-sync-get-dataset-items")
+    assert seen["body"]["q"] == "graph neural network"
+    assert len(papers) == 1  # error 项被跳过
+    p = papers[0]
+    assert p["title"] == "Graph neural networks"
+    assert p["authors"] == "G Corso; H Stark"
+    assert p["published_date"] == "2024"  # 从 summary 提取年份
+    assert p["citations"] == 691
+    assert p["source"] == "google_scholar"
+    assert p["paper_id"] == "scholar:bfJWK1lrry4J"
+    assert p["url"].startswith("https://www.nature.com")
+
+
+@pytest.mark.asyncio
+async def test_scholar_actor_requires_base_url():
+    t = make_tool()
+    t.valves.apify_rotator_base_url = ""
+    with pytest.raises(RuntimeError) as ei:
+        await t._google_scholar_actor_search("q", 3)
+    assert "apify_rotator_base_url" in str(ei.value)
+
+
+@pytest.mark.asyncio
+async def test_scholar_actor_replaces_backend_in_dispatch(monkeypatch):
+    """配了 rotator base 后：sources=google_scholar 走 actor 直连，后端完全不调。"""
+    import json as _json
+    t = make_tool()
+    t.valves.apify_rotator_base_url = "http://rotator:8788"
+    backend_calls = []
+    monkeypatch.setattr(t, "_mcp_call",
+                        lambda tool, args, timeout=180: backend_calls.append(args)
+                        or {"papers": [], "source_results": {}, "errors": {}})
+
+    def fake_post(url, json=None, **kw):
+        r = MagicMock()
+        r.status_code = 201
+        r.json.return_value = _SCHOLAR_ITEMS
+        return r
+
+    monkeypatch.setattr(tool_mod.requests, "post", fake_post)
+    out = _json.loads(await t.search_papers("graph neural network",
+                                            sources="google_scholar"))
+    assert out["source_results"]["google_scholar"] == 1
+    assert backend_calls == []  # 唯一请求的源走 actor，后端零调用
+
+
+@pytest.mark.asyncio
+async def test_scholar_stays_backend_without_rotator(monkeypatch):
+    """未配 rotator base：google_scholar 保持后端路径（回归保护）。"""
+    import json as _json
+    t = make_tool()
+    backend_calls = []
+
+    def fake_mcp(tool, args, timeout=180):
+        backend_calls.append(dict(args))
+        return {"papers": [{"title": "S", "authors": "", "published_date": "",
+                            "abstract": "", "paper_id": "gs_1", "doi": "",
+                            "source": "google_scholar", "pdf_url": "",
+                            "citations": 0, "url": ""}],
+                "source_results": {"google_scholar": 1}, "errors": {}}
+
+    monkeypatch.setattr(t, "_mcp_call", fake_mcp)
+    out = _json.loads(await t.search_papers("graph neural network",
+                                            sources="google_scholar"))
+    assert out["source_results"]["google_scholar"] == 1
+    assert backend_calls and "google_scholar" in backend_calls[0]["sources"]

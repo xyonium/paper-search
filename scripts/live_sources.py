@@ -35,7 +35,8 @@ def _mk():
     v.zenodo_access_token = os.environ.get("ZENODO_ACCESS_TOKEN", "")
     v.zhihuiya_apikey = os.environ.get("ZHIHUIYA_APIKEY", "")
     v.ncbi_api_key = os.environ.get("NCBI_API_KEY", "")
-    v.antibot_proxy_url = os.environ.get("ANTIBOT_PROXY_URL", "")
+    v.firecrawl_base_url = os.environ.get("FIRECRAWL_BASE_URL", "")
+    v.apify_rotator_base_url = os.environ.get("APIFY_ROTATOR_BASE_URL", "")
     return t
 
 
@@ -60,6 +61,8 @@ CASES = {
     # --- 需 key（未配置则 SKIP） ---
     "ieee":      (lambda t: t._ieee_search("neural network", 3, t.valves.ieee_apikey), True),
     "zhihuiya":  (lambda t: t._zhihuiya_search("葡萄糖 传感器", 3, t.valves.zhihuiya_apikey), True),
+    # google_scholar 走 Apify actor（需 APIFY_ROTATOR_BASE_URL 指向 api-key-rotator）
+    "google_scholar": (lambda t: t._google_scholar_actor_search("graph neural network", 3), True),
 }
 
 
@@ -67,7 +70,9 @@ async def run_one(name, factory):
     t = _mk()
     fn, needs_key = CASES[name]
     if needs_key:
-        key_map = {"ieee": t.valves.ieee_apikey, "zhihuiya": t.valves.zhihuiya_apikey}
+        key_map = {"ieee": t.valves.ieee_apikey,
+                   "zhihuiya": t.valves.zhihuiya_apikey,
+                   "google_scholar": t.valves.apify_rotator_base_url}
         if not key_map.get(name):
             return (name, "SKIP", 0, 0.0, "未配置 key（设环境变量后重跑）")
     start = time.monotonic()

@@ -15,8 +15,8 @@ description: 学术论文搜索、全文阅读、PDF 下载入 Knowledge（RAG�
     后端 mcpo 仅剩 doaj/google_scholar/ssrn/unpaywall/citeseerx/base/acm 作安全网
   · v2.9.1：AND 语义源（hal/pubmed/pmc/europepmc/openaire/ieee）长查询 0 命中时
     自动逐级砍尾词放宽；dblp 反爬拦截页（200+HTML）明确报错不再误报 JSON 解析失败
-  · v2.9.2：检出反爬拦截（_AntiBotBlocked，当前 dblp/Anubis）且配了
-    antibot_proxy_url 时，自动换住宅代理+浏览器 UA 重试一次（代理额度有限，仅此场景用）
+  · v2.9.3：dblp 被 Anubis 拦截时走 firecrawl（headless 浏览器自动解 JS 质询）兜底；
+    配 apify_rotator_base_url 后 google_scholar 改走 Apify actor（绕 Google CAPTCHA）
 
   【查询适配】search_papers 按源自动分发查询变体（不损语义，LLM 无需处理）：
   · 大多数源用原始完整查询；zhihuiya/doaj 对长自然语言会 0 命中，
@@ -34,7 +34,7 @@ description: 学术论文搜索、全文阅读、PDF 下载入 Knowledge（RAG�
   5. read_patent(patent_number) → 读专利全文 markdown（权利要求+说明书+法律状态）
 author: openags-bridge
 requirements: requests, pymupdf, anyio
-version: 2.9.2
+version: 2.9.3
 license: MIT
 """
 
@@ -181,7 +181,7 @@ def _relax_and(query: str, try_fn, max_terms: int = 6):
 
 class _AntiBotBlocked(RuntimeError):
     """源明确返回反爬拦截页（如 Anubis 质询、人机验证）。
-    区别于普通网络错误：触发 antibot_proxy_url 住宅代理的一次性重试（额度有限）。"""
+    区别于普通网络错误：触发 firecrawl（headless 浏览器自动解 JS 质询）兜底重试一次。"""
 
 
 class Tools:
@@ -237,12 +237,12 @@ class Tools:
             default="",
             description="CORE API key（管理员级，可选）。用于 core 直连检索：留空走匿名（配额低），401/403 时自动降级匿名重试一次",
         )
-        antibot_proxy_url: str = Field(
+        apify_rotator_base_url: str = Field(
             default="",
-            description="反爬兜底住宅代理（管理员级，可选，仅明确检出反爬拦截时用一次，省月度额度）。"
-            "完整代理 URL，如 http://groups-RESIDENTIAL:<proxy密码>@proxy.apify.com:8000。"
-            "注意 Apify 密码是控制台 Proxy 页的独立 proxy password，不是 API token（token 会 407）。"
-            "留空则反爬拦截直接报错。当前仅 dblp（Anubis 质询页）接入",
+            description="api-key-rotator 的 Apify 转发基址（管理员级，可选），如 http://api-key-rotator:8788"
+            "（转发 /v2/acts → api.apify.com，key 池自动轮转）。配了之后 google_scholar 改走"
+            " Apify actor（johnvc/google-scholar-api，PAY_PER_EVENT，免费层可用但结果数受限），"
+            "绕开 Google 反爬 CAPTCHA；留空则 google_scholar 仍走后端",
         )
 
     class UserValves(BaseModel):
@@ -583,23 +583,20 @@ class Tools:
     _DBLP_SEARCH_URL = "https://dblp.org/search/publ/api"
     _UNPAYWALL_API = "https://api.unpaywall.org/v2"
 
-    async def _dblp_search(self, query: str, limit: int) -> list:
+    async def _dblp_search(self, query: str, limit: int, __user__=None) -> list:
         """直连 dblp JSON API，绕后端 dblp.py 的并发 ConnectionError + 无退避重试。
         退避策略：429/5xx/连接错误最多重试3次，间隔 2s/4s/8s。
-        反爬（v2.9.2）：200 但非 JSON = Anubis 质询页 → _AntiBotBlocked，
-        配了 antibot_proxy_url 则换住宅代理+浏览器 UA 重试一次（额度有限，仅此场景用）。
+        反爬（v2.9.3）：200 但非 JSON = Anubis 质询页 → _AntiBotBlocked，配了
+        firecrawl_base_url 则走 firecrawl（headless Chrome 自动解 JS PoW，
+        2026-09 实测穿透，返回完整 JSON）兜底重试一次。
         注意：dblp 是 CS 书目库，仅收录计算机科学文献，非 CS 查询返回空属正常。"""
         max_attempts = 3
         backoff = [2, 4, 8]
 
-        def _fetch(proxies: dict = None):
+        def _fetch():
             last_exc = None
             for attempt in range(max_attempts):
                 try:
-                    # 走住宅代理时换浏览器 UA（Anubis 按 IP 信誉+UA 加权判定）
-                    ua = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                          "(KHTML, like Gecko) Chrome/126.0 Safari/537.36") if proxies else \
-                         "paper-search-tool/2.5 (OpenWebUI academic search)"
                     r = requests.get(
                         self._DBLP_SEARCH_URL,
                         params={
@@ -608,16 +605,15 @@ class Tools:
                             "h": max(1, min(int(limit), 100)),
                         },
                         headers={
-                            "User-Agent": ua,
+                            "User-Agent": "paper-search-tool/2.5 (OpenWebUI academic search)",
                             "Accept": "application/json",
                         },
                         timeout=30,
-                        proxies=proxies,
                     )
                     if r.status_code == 200:
                         # 200 但非 JSON = 反爬拦截页（2026-09 实测 dblp 上 Anubis
                         # "Making sure you're not a bot" 质询页，requests 解不了 PoW）
-                        # —— 持续性拦截，同一路径重试无意义，抛 _AntiBotBlocked 交外层
+                        # —— 同一路径重试无意义，抛 _AntiBotBlocked 交外层走浏览器兜底
                         ct = r.headers.get("content-type", "")
                         if "json" not in ct:
                             raise _AntiBotBlocked(
@@ -639,17 +635,11 @@ class Tools:
         try:
             data = await anyio.to_thread.run_sync(_fetch)
         except _AntiBotBlocked as ab:
-            proxies = self._antibot_proxies()
-            if not proxies:
+            if not self._firecrawl_base(__user__):
                 raise RuntimeError(
-                    f"dblp 检索失败: {ab}，当前 IP 暂时无法直连；"
-                    "可在 Valves 配 antibot_proxy_url（住宅代理）自动兜底重试")
-            try:
-                data = await anyio.to_thread.run_sync(lambda: _fetch(proxies))
-            except _AntiBotBlocked:
-                raise RuntimeError("dblp 检索失败: 住宅代理重试仍被反爬拦截（Anubis）")
-            except Exception as e2:
-                raise RuntimeError(f"dblp 检索失败: 住宅代理重试出错: {e2}")
+                    f"dblp 检索失败: {ab}，当前 IP 无法直连；"
+                    "配 firecrawl_base_url 可用浏览器引擎自动解质询兜底")
+            data = await self._dblp_via_firecrawl(query, limit, __user__)
         except Exception as e:
             raise RuntimeError(f"dblp 检索失败: {e}")
 
@@ -698,6 +688,27 @@ class Tools:
                 "url": dblp_url,
             })
         return papers
+
+    async def _dblp_via_firecrawl(self, query: str, limit: int, __user__=None) -> dict:
+        """Anubis 拦截时走 firecrawl 兜底：headless Chrome 自动解 JS PoW
+        （2026-09 实测穿透，rawHtml 的 <pre> 里是完整 JSON）。返回解析后的 dict。"""
+        from urllib.parse import urlencode
+        api_url = f"{self._DBLP_SEARCH_URL}?{urlencode({'q': query, 'format': 'json', 'h': max(1, min(int(limit), 100))})}"
+        base = self._firecrawl_base(__user__)
+        raw = await anyio.to_thread.run_sync(
+            self._mcp_call_service_url, base, "firecrawl_scrape",
+            {"url": api_url, "formats": ["rawHtml"], "waitFor": 8000,
+             "onlyMainContent": False}, 90)
+        html_text = (raw or {}).get("rawHtml") or ""
+        # 两种形态：HTML 包装（Chrome 把 JSON 塞进 <pre>，hosted 侧实测）或
+        # 直接返回 JSON body（Content-Type=application/json 时 firecrawl 原样透传，mcpo 侧实测）
+        m = re.search(r"<pre[^>]*>(.*?)</pre>", html_text, re.S)
+        cand = m.group(1) if m else html_text.strip()
+        try:
+            import html as _html
+            return json.loads(_html.unescape(cand))
+        except Exception as e:
+            raise RuntimeError(f"firecrawl 兜底未取到 JSON（可能质询未解开）: {e}")
 
     _IEEE_SEARCH_URL = "https://ieeexploreapi.ieee.org/api/v1/search/articles"
 
@@ -1339,11 +1350,10 @@ class Tools:
     # 全部用 original 查询变体（这些 API 原生支持自然语言/全文检索，不需要 arxiv 式字段布尔）。
 
     def _http_get(self, url: str, params: dict, name: str, headers: dict = None,
-                  honor_retry_after: bool = False, proxies: dict = None):
+                  honor_retry_after: bool = False):
         """JSON/HTML API GET，3 次退避；429/5xx 重试，其余 4xx 立即失败（RuntimeError
         含 "HTTP <code>"，供调用方识别 401/403 做降级）。honor_retry_after=True 时
-        429 优先遵守 Retry-After 头（上限 10s）。proxies 用于反爬兜底代理（v2.9.2）。
-        返回 response 对象。"""
+        429 优先遵守 Retry-After 头（上限 10s）。返回 response 对象。"""
         import time
         last_exc = None
         for attempt in range(3):
@@ -1354,7 +1364,6 @@ class Tools:
                     headers={"User-Agent": "paper-search-tool/2.9 (OpenWebUI academic search)",
                              **(headers or {})},
                     timeout=20,
-                    proxies=proxies,
                 )
                 if r.status_code == 200:
                     return r
@@ -1379,12 +1388,6 @@ class Tools:
     _S2_API = "https://api.semanticscholar.org/graph/v1/paper/search"
     _S2_FIELDS = ("title,abstract,year,citationCount,authors,url,"
                   "publicationDate,externalIds,openAccessPdf")
-
-    def _antibot_proxies(self) -> dict:
-        """反爬兜底代理（v2.9.2）。配了 antibot_proxy_url 才返回非空。
-        仅在源明确检出反爬拦截页（_AntiBotBlocked）时用一次——住宅代理月度额度有限。"""
-        url = (getattr(self.valves, "antibot_proxy_url", "") or "").strip()
-        return {"http": url, "https": url} if url else {}
 
     def _semantic_key(self, __user__=None) -> str:
         uv = __user__.get("valves") if __user__ else None
@@ -1792,6 +1795,68 @@ class Tools:
             return await anyio.to_thread.run_sync(_fetch)
         except Exception as e:
             raise RuntimeError(f"IACR 检索失败: {e}")
+
+    # ---------- Google Scholar 经 Apify actor（v2.9.3，绕 Google CAPTCHA）----------
+    _SCHOLAR_ACTOR = "johnvc~google-scholar-api"
+
+    def _apify_rotator_base(self) -> str:
+        return (getattr(self.valves, "apify_rotator_base_url", "") or "").strip().rstrip("/")
+
+    async def _google_scholar_actor_search(self, query: str, limit: int) -> list:
+        """经 api-key-rotator 转发调 Apify google-scholar actor（PAY_PER_EVENT；
+        免费层可用但结果数/字段受限，见返回项 _tier_notice）。Scholar 的 CAPTCHA/IP
+        封锁由 actor 侧解决。同步端点 run-sync-get-dataset-items，最坏 ~120s。"""
+        base = self._apify_rotator_base()
+        if not base:
+            raise RuntimeError("未配 apify_rotator_base_url")
+
+        def _fetch():
+            r = requests.post(
+                f"{base}/v2/acts/{self._SCHOLAR_ACTOR}/run-sync-get-dataset-items",
+                json={"q": query, "maxResults": max(1, min(int(limit), 20)),
+                      "mode": "search"},
+                headers={"Content-Type": "application/json"},
+                timeout=150,
+            )
+            if r.status_code not in (200, 201):
+                raise RuntimeError(f"scholar actor HTTP {r.status_code}")
+            return r.json()
+
+        try:
+            items = await anyio.to_thread.run_sync(_fetch)
+        except Exception as e:
+            raise RuntimeError(f"Google Scholar(actor) 检索失败: {e}")
+
+        papers = []
+        for it in (items or []):
+            if not isinstance(it, dict) or it.get("error"):
+                continue
+            title = str(it.get("paper_title") or "").strip()
+            if not title:
+                continue
+            pub = it.get("publication_info") or {}
+            authors = "; ".join(str(a.get("name") or "").strip()
+                                for a in (pub.get("authors") or [])
+                                if isinstance(a, dict) and a.get("name"))
+            summary = str(pub.get("summary") or "")
+            ym = re.search(r"\b(19|20)\d{2}\b", summary)
+            links = it.get("inline_links") or {}
+            rid = str(it.get("result_id") or "")
+            papers.append({
+                "title": title,
+                "authors": authors,
+                "published_date": ym.group(0) if ym else "",
+                "abstract": str(it.get("snippet") or "").strip(),
+                "paper_id": f"scholar:{rid}" if rid else "",
+                "doi": "",
+                "source": "google_scholar",
+                "pdf_url": "",
+                "citations": int(links.get("cited_by_total") or 0),
+                "url": str(it.get("link") or ""),
+            })
+            if len(papers) >= limit:
+                break
+        return papers
 
     # ---------- web 搜索兜底（tavily 优先，firecrawl 备选；配了 base_url 才启用）----------
     _FC_NET_ERR_MARKERS = (
@@ -2314,9 +2379,15 @@ class Tools:
         want_firecrawl = bool(self._firecrawl_base(__user__)) and ("firecrawl" in src_set or all_mode)
         ieee_enabled, ieee_key = self._ieee_enabled_key(__user__)
         want_ieee = ieee_enabled and ("ieee" in src_set or all_mode)
+        # google_scholar 改走 Apify actor（v2.9.3）：配了 apify_rotator_base_url 才直连，
+        # 否则保持后端（后端 google_scholar.py 靠 GOOGLE_SCHOLAR_PROXY_URL 撞运气）
+        want_scholar_actor = (bool(self._apify_rotator_base())
+                              and ("google_scholar" in src_set or all_mode))
 
-        # 直连源不进后端 sources
+        # 直连源不进后端 sources；scholar 走 actor 时也从后端剔除
         backend_set = src_set - DIRECT_SOURCES
+        if want_scholar_actor:
+            backend_set = backend_set - {"google_scholar"}
         if all_mode:
             backend_set = None  # None 表示后端用 _BACKEND_ALL_SOURCES（不含直连源）
 
@@ -2330,6 +2401,12 @@ class Tools:
         # 字面源（doaj/zhihuiya）长术语查询需进一步按区分度截断到 5 词，否则 0 命中
         literal_query = _distill_core_terms(core, max_terms=5)
 
+        # all_mode 下后端常量源列表：scholar 走 actor 时剔除
+        _bk_all = ",".join(s for s in _BACKEND_ALL_SOURCES.split(",")
+                           if not (want_scholar_actor and s == "google_scholar"))
+        _sem_all = ",".join(s for s in _SEMANTIC_ALL_SOURCES.split(",")
+                            if not (want_scholar_actor and s == "google_scholar"))
+
         async def _backend_all():
             # core==original 或无需拆分时，一次调用（含全部后端源）
             if not all_mode and not backend_set:
@@ -2340,7 +2417,7 @@ class Tools:
                 args = {
                     "query": original,
                     "max_results_per_source": max_results_per_source,
-                    "sources": (_BACKEND_ALL_SOURCES if all_mode else ",".join(sorted(backend_set))),
+                    "sources": (_bk_all if all_mode else ",".join(sorted(backend_set))),
                 }
                 if biorxiv_category:
                     args["biorxiv_category"] = biorxiv_category
@@ -2361,7 +2438,7 @@ class Tools:
                     try:
                         args = {"query": original,
                                 "max_results_per_source": max_results_per_source,
-                                "sources": (_SEMANTIC_ALL_SOURCES if all_mode else ",".join(sorted(sem_set)))}
+                                "sources": (_sem_all if all_mode else ",".join(sorted(sem_set)))}
                         if biorxiv_category: args["biorxiv_category"] = biorxiv_category
                         if medrxiv_category: args["medrxiv_category"] = medrxiv_category
                         return await anyio.to_thread.run_sync(self._mcp_call, "search_papers", args)
@@ -2399,7 +2476,7 @@ class Tools:
             return await self._hal_search(literal_query, max_results_per_source)
 
         async def _dblp():
-            return await self._dblp_search(original, max_results_per_source)
+            return await self._dblp_search(original, max_results_per_source, __user__)
 
         async def _zenodo():
             return await self._zenodo_search(original, max_results_per_source, __user__)
@@ -2448,6 +2525,9 @@ class Tools:
         async def _ieee():
             return await self._ieee_search(original, max_results_per_source, ieee_key)
 
+        async def _gscholar():
+            return await self._google_scholar_actor_search(original, max_results_per_source)
+
         # 组装并发分支（每个分支计时，写入 _timings）
         branches = {}
         branches["backend"] = _timed("backend", _backend_split if core != original else _backend_all)
@@ -2487,6 +2567,8 @@ class Tools:
             branches["firecrawl"] = _timed("firecrawl", _fc)
         if want_ieee:
             branches["ieee"] = _timed("ieee", _ieee)
+        if want_scholar_actor:
+            branches["google_scholar"] = _timed("google_scholar", _gscholar)
 
         keys = list(branches)
         results = await asyncio.gather(*branches.values(), return_exceptions=True)
@@ -2511,9 +2593,10 @@ class Tools:
         biorxiv_result = outcome.get("biorxiv")
         medrxiv_result = outcome.get("medrxiv")
         iacr_result = outcome.get("iacr")
+        gscholar_result = outcome.get("google_scholar")
 
         # 后端失败处理：若任一直连源有结果则保留，否则报错
-        direct_ok = [r for r in (zh_result, hal_result, dblp_result, zenodo_result, openaire_result, firecrawl_result, ieee_result, pubmed_result, pmc_result, arxiv_result, semantic_result, openalex_result, crossref_result, europepmc_result, core_result, biorxiv_result, medrxiv_result, iacr_result) if isinstance(r, list) and r]
+        direct_ok = [r for r in (zh_result, hal_result, dblp_result, zenodo_result, openaire_result, firecrawl_result, ieee_result, pubmed_result, pmc_result, arxiv_result, semantic_result, openalex_result, crossref_result, europepmc_result, core_result, biorxiv_result, medrxiv_result, iacr_result, gscholar_result) if isinstance(r, list) and r]
         if isinstance(backend_result, Exception):
             if direct_ok:
                 result = {"papers": [], "source_results": {},
@@ -2676,6 +2759,15 @@ class Tools:
                 ip = [self._trim_paper(p) for p in ieee_result]
                 papers.extend(ip)
                 source_results["ieee"] = len(ip)
+        if want_scholar_actor:
+            # actor 直连时覆盖后端同名字段（后端本轮未请 scholar）
+            if isinstance(gscholar_result, Exception):
+                source_results["google_scholar"] = 0
+                errors["google_scholar"] = str(gscholar_result)
+            elif gscholar_result is not None:
+                gp = [self._trim_paper(p) for p in gscholar_result]
+                papers.extend(gp)
+                source_results["google_scholar"] = len(gp)
 
         out = {"query": query, "total": len(papers),
                "source_results": source_results, "errors": errors, "papers": papers}
