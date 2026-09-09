@@ -24,38 +24,43 @@
 
 ---
 
-## 🏛 Architecture
+## 🏛 Architecture (v2.9.5)
 
 ```
 [User / OpenWebUI UI]
         │
-        ├── OpenWebUI Native Python Tool (Bridge & Interceptor Layer)
+        └── OpenWebUI Native Python Tool (tool.py — dispatch, query adaptation, merge & dedup)
                  │
-                 ├── search_papers()  ──┬─► POST http://mcpo:8000/papers/search_papers
-                 │                      │    (16+ open platforms via paper-search-mcp)
-                 │                      └─► zhihuiya MCP (direct, streamable-http, apikey)
-                 │                           search_literature + literature_bibliography
+                 ├── search_papers()
+                 │     │
+                 │     ├─► Direct REST/HTTP (no backend): arxiv, hal, pubmed, pmc, semantic,
+                 │     │    openalex, crossref, europepmc, core, zenodo, openaire, ieee,
+                 │     │    biorxiv/medrxiv (subject browse), iacr (HTML regex)
+                 │     │
+                 │     ├─► Direct MCP (streamable-http, zhihuiya_apikey): zhihuiya, patsnap
+                 │     │
+                 │     ├─► Via firecrawl/tavily (configured base URLs):
+                 │     │    · firecrawl as a standalone web-search source
+                 │     │    · google_scholar chain: firecrawl scrape → tavily extract(advanced)
+                 │     │      → Apify actor (johnvc/google-scholar-api) → backend (last resort)
+                 │     │    · dblp Anubis anti-bot fallback → firecrawl (headless solves JS PoW)
+                 │     │
+                 │     └─► Backend mcpo/paper-search-mcp (safety net only):
+                 │          doaj (live); ssrn/base/citeseerx (degraded/blocked, off by default);
+                 │          unpaywall (DOI lookup for downloads); acm (not implemented)
                  │
-                 ├── read_paper()     ──► Backend Tool (_READ_TOOLS) / zhihuiya bibliography
-                 │                        ──► PDF Direct Fallback
+                 ├── read_paper() ──► backend read tools (fast lane, arxiv/semantic/hal/doaj/…)
+                 │                     → unsupported → pdf_url direct → jina reader fallback
                  │
-                 ├── search_patents() ──► patsnap MCP (direct, streamable-http, apikey)
-                 │                         patsnap_search (source=patent, semantic)
-                 ├── read_patent()    ──► patsnap_fetch → claims+description+legal (Markdown)
+                 ├── search_patents() / read_patent() ──► patsnap MCP (direct, streamable-http)
                  │
                  └── download_paper_to_knowledge()
-                          │
-                          ├─► [Path 1] Direct pdf_url download (fastest)
-                          │
-                          └─► [Path 2] mcpo POST /papers/download_with_fallback
-                                   │  (Saves PDF to shared Docker volume)
-                                   ▼
-                             Read from `/downloads/` (shared volume)
-                                   │
-                             Push to OpenWebUI `/api/v1/files/` with metadata
-                                   │
-                             Automatic RAG Vectorization & Knowledge Association
+                        ├─► [1] direct pdf_url download
+                        └─► [2] backend download_with_fallback (OA chain + optional Sci-Hub)
+                                  → shared Docker volume /downloads → OWUI /api/v1/files → RAG
 ```
+
+**Why the backend is only a safety net**: every source with a healthy public API was moved to direct connect (v2.9 series) — the backend's synchronous `requests` without timeouts once hung whole search batches, its scholar/ssrn/base adapters hit anti-bot walls, and its OR-query semantics returned irrelevant papers. What remains on the backend is either fine (doaj), special-purpose (unpaywall DOI lookup), or broken upstream (ssrn/base/citeseerx/acm).
 
 ---
 
@@ -94,8 +99,8 @@
 |---|---|---|
 | **bioRxiv / medRxiv** | ❌ (subject-category browse) | Return latest ~30 days in a subject, **not** keyword search — would inject irrelevant results. Use explicitly via `sources="biorxiv"` + `biorxiv_category` |
 | **Google Scholar** | ✅ | Anti-bot 403 without help — set `firecrawl_base_url` (tier 1), `tavily_base_url` (tier 2) and/or `apify_rotator_base_url` (tier 3); see Key-gated Sources |
-| **SSRN** | ✅ | Cloudflare 403 |
-| **BASE** | ✅ | IP blocked (403 Access denied) |
+| **SSRN** | ✅ | Search endpoints retired (soft-404/empty) + Cloudflare interactive challenge on api.ssrn.com (2026-09 verified). Backend silently returns 0. Marginal value for bio/CS (overlaps bioRxiv/medRxiv/arXiv) — not worth fixing |
+| **BASE** | ✅ | Anubis JS-PoW anti-bot (same family as dblp). firecrawl with `waitFor≥12s` penetrates (verified 2026-09) — fixable, but heavy overlap with OpenAlex/CORE/OpenAIRE makes it low priority |
 | **CiteSeerX** | ✅ (code) | Endpoint dead (redirects to archive.org 404) |
 | **ACM** | ⚠️ skeleton | `search is not yet implemented`, no public REST API |
 | **Unpaywall** | ❌ | **DOI lookup only** — used in the download fallback chain to find OA PDFs, not a search source |
@@ -110,7 +115,7 @@ Different sources have very different query tolerances. `search_papers` automati
 |---|---|---|
 | **Semantic / tokenizing** | openalex, semantic, crossref, pmc, europepmc, pubmed, openaire, core, patsnap | Your **original** full natural-language query (semantics preserved) |
 | **Literal keyword** | zhihuiya, doaj | A **cleaned core-keyword** variant — quotes, bare `OR/AND/NOT`, and filler words stripped, then distilled to ≤5 high-specificity terms |
-| **Direct (bypasses backend)** | hal, zhihuiya, patsnap, dblp, zenodo, ieee, pubmed, pmc, arxiv, semantic, openalex, crossref, europepmc, core, biorxiv, medrxiv, iacr | hal/arxiv use core; zhihuiya uses distilled; the rest use original. Backend mcpo now only serves doaj/google_scholar/ssrn/unpaywall/citeseerx/base/acm as a safety net |
+| **Direct (bypasses backend)** | hal, zhihuiya, patsnap, dblp, zenodo, ieee, pubmed, pmc, arxiv, semantic, openalex, crossref, europepmc, core, biorxiv, medrxiv, iacr (+ google_scholar when any of firecrawl/tavily/apify valves set) | hal/arxiv use core; zhihuiya uses distilled; the rest use original. Backend mcpo now only serves doaj/google_scholar/ssrn/unpaywall/citeseerx/base/acm as a safety net |
 
 > `bioRxiv` / `medRxiv` are **not keyword search** — they return the latest ~30 days of papers in a subject category, so they're **excluded from `default_sources`** (a keyword query would inject irrelevant results). To browse a subject's new papers, call explicitly: `sources="biorxiv"` + `biorxiv_category="biochemistry"` (or `medrxiv_category="cardiovascular_medicine"`).
 
