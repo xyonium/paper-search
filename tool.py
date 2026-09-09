@@ -37,7 +37,7 @@ description: 学术论文搜索、全文阅读、PDF 下载入 Knowledge（RAG�
   5. read_patent(patent_number) → 读专利全文 markdown（权利要求+说明书+法律状态）
 author: openags-bridge
 requirements: requests, pymupdf, anyio
-version: 2.9.5
+version: 2.9.6
 license: MIT
 """
 
@@ -362,6 +362,59 @@ class Tools:
             return True
         # 后端"无全文"提示通常很短且含特征词；放宽到 <3000 兜底（真实全文远超此长度）
         return len(t) < 3000 and any(m in t for m in cls._UNSUPPORTED_MARKERS)
+
+    # ---------- 下载身份闸（v2.9.6）：防 OA 链下错文档进 RAG ----------
+    # 事故（2026-09）：搜 sensor 论文，OA fallback 下到一个几百 MB 的临床验证
+    # 数据"论文集"直接入库，把 OWUI RAG 卡死。闸 = 全文 token 与标题匹配；
+    # 无大小限制（OA 链拿不到 Content-Length，且合集含目标文即放行）。
+    _TITLE_STOP = frozenset(
+        (
+            "a an the of in on for with and or to is are was were be by at as from "
+            "its their his her our your via using based study research analysis"
+        ).split()
+    )
+
+    @classmethod
+    def _title_tokens(cls, s: str) -> set:
+        """小写字母数字 token，去停用词。中文按字拆（标题无空格），单字也保留。"""
+        import re as _re
+
+        out = set()
+        for w in _re.findall(r"[0-9a-z]+|[一-鿿]", (s or "").lower()):
+            if len(w) > 1 or w.isdigit() or _re.match(r"[一-鿿]", w):
+                if w not in cls._TITLE_STOP:
+                    out.add(w)
+        return out
+
+    @classmethod
+    def _title_in_pdf(cls, pdf_text: str, title: str) -> tuple[bool, float]:
+        """标题 token 在 PDF 全文页的覆盖率；>=0.6 视为同一文档（论文集含目标文也算）。"""
+        want = cls._title_tokens(title)
+        if not want:
+            return True, 1.0  # 无可校验 token（纯符号标题）→ 不拦
+        got = cls._title_tokens((pdf_text or "")[:6000])  # 首部足够；只取样控制成本
+        if not got:
+            return True, 0.0  # 提取不出 token（扫描版）→ 无法校验，不拦
+        hit = len(want & got) / len(want)
+        return hit >= 0.6, hit
+
+    def _verify_downloaded_pdf(self, data: bytes, title: str, via: str) -> None:
+        """下载后核对全文与标题的匹配度，不匹配拒绝入库（防止 OA 链下错文档）。
+        提取失败（扫描版）不拦——宁可放过不可误杀。"""
+        try:
+            text = self._pdf_to_text(data)
+        except Exception:
+            return
+        if not text:
+            return
+        ok, ratio = self._title_in_pdf(text, title)
+        if ok:
+            return
+        head = " ".join(text[:120].split())
+        raise RuntimeError(
+            f"身份校验未通过（标题 token 覆盖率 {ratio:.0%} < 60%）：{via} 下载的内容与"
+            f"《{title}》不匹配，疑似下错文档（开头为：{head[:100]}）。已拒绝入库。"
+        )
 
     def __init__(self):
         self.valves = self.Valves()
@@ -3504,14 +3557,22 @@ class Tools:
                     )
                     r.raise_for_status()
                     if r.content.startswith(b"%PDF"):
+                        # v2.9.6 身份闸：核对全文与标题匹配，防 OA 链下错文档
+                        self._verify_downloaded_pdf(r.content, title, f"pdf_url({pdf_url[:80]})")
                         return self._upload_pdf(r.content, title, knowledge_id, __request__)
                     return None
 
                 res = await anyio.to_thread.run_sync(_direct_download)
                 if res:
                     return res
-            except Exception:
-                pass  # 静默落入 fallback 链
+            except Exception as gate_err:
+                if "身份校验未通过" in str(gate_err):
+                    return json.dumps(
+                        {"error": str(gate_err),
+                         "hint": "可改用 read_paper 先读摘要确认论文身份，或换 pdf_url/doi 重试"},
+                        ensure_ascii=False,
+                    )
+                pass  # 其他错误静默落入 fallback 链
 
         # 路径2: 后端 download_with_fallback（OA链 + 可选Sci-Hub），落盘共享卷后读回
         if not (source and paper_id) and not doi:
@@ -3570,6 +3631,8 @@ class Tools:
                 def _read_and_upload():
                     with open(local_path, "rb") as f:
                         data = f.read()
+                    # v2.9.6 身份闸：核对全文与标题匹配，防 OA 链/Sci-Hub 下错文档
+                    self._verify_downloaded_pdf(data, title, f"fallback 链({os.path.basename(local_path)})")
                     try:
                         os.remove(local_path)  # 上传后清理，避免共享卷膨胀
                     except OSError:
@@ -3581,6 +3644,16 @@ class Tools:
                     msg += "（来源：Sci-Hub fallback）"
                 return msg
             except Exception as e:
+                if "身份校验未通过" in str(e):
+                    try:
+                        os.remove(local_path)  # 拒收的文档也不留落盘
+                    except OSError:
+                        pass
+                    return json.dumps(
+                        {"error": str(e),
+                         "hint": "可改用 read_paper 先读摘要确认论文身份，或手动获取"},
+                        ensure_ascii=False,
+                    )
                 return json.dumps(
                     {
                         "error": "读取落盘 PDF 并上传到 OpenWebUI 失败",
