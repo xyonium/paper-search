@@ -35,6 +35,7 @@ def _mk():
     v.zenodo_access_token = os.environ.get("ZENODO_ACCESS_TOKEN", "")
     v.zhihuiya_apikey = os.environ.get("ZHIHUIYA_APIKEY", "")
     v.ncbi_api_key = os.environ.get("NCBI_API_KEY", "")
+    v.antibot_proxy_url = os.environ.get("ANTIBOT_PROXY_URL", "")
     return t
 
 

@@ -74,7 +74,7 @@ async def test_semantic_parses_results():
     t = _mk()
     monkey = pytest.MonkeyPatch()
     monkey.setattr(tool_mod.requests, "get",
-                   lambda url, params=None, headers=None, timeout=None: _FakeResp(_S2_JSON))
+                   lambda url, params=None, headers=None, timeout=None, **_:  _FakeResp(_S2_JSON))
     papers = await t._semantic_search("conformal coating biosensor", 5)
     monkey.undo()
     assert len(papers) == 2
@@ -97,7 +97,7 @@ async def test_semantic_403_drops_key_and_retries_anonymous():
     t.valves.semantic_api_key = "bad-key"
     seen_headers = []
 
-    def fake_get(url, params=None, headers=None, timeout=None):
+    def fake_get(url, params=None, headers=None, timeout=None, **_):
         seen_headers.append(dict(headers or {}))
         if headers and headers.get("x-api-key"):
             return _FakeResp(status=403)
@@ -118,7 +118,7 @@ async def test_semantic_429_honors_retry_after():
     calls = {"n": 0}
     sleeps = []
 
-    def flaky(url, params=None, headers=None, timeout=None):
+    def flaky(url, params=None, headers=None, timeout=None, **_):
         calls["n"] += 1
         if calls["n"] == 1:
             return _FakeResp(status=429, headers={"Retry-After": "3"})
@@ -170,7 +170,7 @@ async def test_openalex_parses_and_reconstructs_abstract():
     t = _mk()
     seen = {}
 
-    def fake_get(url, params=None, headers=None, timeout=None):
+    def fake_get(url, params=None, headers=None, timeout=None, **_):
         seen.update(params)
         return _FakeResp(_OPENALEX_JSON)
 
@@ -224,7 +224,7 @@ async def test_crossref_parses_list_title_jats_dateparts():
     t = _mk()
     monkey = pytest.MonkeyPatch()
     monkey.setattr(tool_mod.requests, "get",
-                   lambda url, params=None, headers=None, timeout=None: _FakeResp(_CROSSREF_JSON))
+                   lambda url, params=None, headers=None, timeout=None, **_:  _FakeResp(_CROSSREF_JSON))
     papers = await t._crossref_search("q", 5)
     monkey.undo()
     assert len(papers) == 2
@@ -273,7 +273,7 @@ async def test_europepmc_id_mapping_and_urls():
     t = _mk()
     monkey = pytest.MonkeyPatch()
     monkey.setattr(tool_mod.requests, "get",
-                   lambda url, params=None, headers=None, timeout=None: _FakeResp(_EUPMC_JSON))
+                   lambda url, params=None, headers=None, timeout=None, **_:  _FakeResp(_EUPMC_JSON))
     papers = await t._europepmc_search("q", 5)
     monkey.undo()
     assert len(papers) == 2
@@ -318,7 +318,7 @@ async def test_core_parses_results():
     t = _mk()
     monkey = pytest.MonkeyPatch()
     monkey.setattr(tool_mod.requests, "get",
-                   lambda url, params=None, headers=None, timeout=None: _FakeResp(_CORE_JSON))
+                   lambda url, params=None, headers=None, timeout=None, **_:  _FakeResp(_CORE_JSON))
     papers = await t._core_search("q", 5)
     monkey.undo()
     assert len(papers) == 2
@@ -339,7 +339,7 @@ async def test_core_sends_bearer_and_drops_on_401():
     t.valves.core_api_key = "core-key"
     seen = []
 
-    def fake_get(url, params=None, headers=None, timeout=None):
+    def fake_get(url, params=None, headers=None, timeout=None, **_):
         seen.append(dict(headers or {}))
         if headers and headers.get("Authorization"):
             return _FakeResp(status=401)
@@ -383,7 +383,7 @@ async def test_rxiv_browse_parses_and_formats_category():
     t = _mk()
     seen = {}
 
-    def fake_get(url, params=None, headers=None, timeout=None):
+    def fake_get(url, params=None, headers=None, timeout=None, **_):
         seen["url"] = url
         seen["params"] = params or {}
         return _FakeResp(_RXIV_JSON)
@@ -434,7 +434,7 @@ async def test_iacr_regex_parses_html():
     t = _mk()
     monkey = pytest.MonkeyPatch()
     monkey.setattr(tool_mod.requests, "get",
-                   lambda url, params=None, headers=None, timeout=None:
+                   lambda url, params=None, headers=None, timeout=None, **_: 
                    _FakeResp(text=_IACR_HTML))
     papers = await t._iacr_search("zero knowledge", 5)
     monkey.undo()
@@ -472,7 +472,7 @@ async def test_new_direct_sources_not_sent_to_backend():
         "eprint.iacr.org": _FakeResp(text=_IACR_HTML),
     }
 
-    def fake_get(url, params=None, headers=None, timeout=None):
+    def fake_get(url, params=None, headers=None, timeout=None, **_):
         for host, resp in canned.items():
             if host in url:
                 return resp
@@ -499,7 +499,7 @@ async def test_direct_error_isolated_in_errors():
     t = _mk()
     t._mcp_call = lambda tool, args, timeout=180: {"papers": [], "source_results": {}, "errors": {}}
 
-    def fake_get(url, params=None, headers=None, timeout=None):
+    def fake_get(url, params=None, headers=None, timeout=None, **_):
         if "api.crossref.org" in url:
             raise ConnectionError("connection reset")
         if "api.openalex.org" in url:

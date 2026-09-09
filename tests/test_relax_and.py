@@ -180,3 +180,78 @@ async def test_dblp_json_200_still_works(monkeypatch):
     assert len(papers) == 1
     assert papers[0]["title"] == "ZK Survey"
     assert papers[0]["source"] == "dblp"
+
+
+# ---------- 反爬 → 住宅代理一次性重试（v2.9.2） ----------
+
+def _antibot_page():
+    r = MagicMock()
+    r.status_code = 200
+    r.headers = {"content-type": "text/html; charset=utf-8"}
+    r.text = "<html>Making sure you're not a bot!</html>"
+    return r
+
+
+def test_antibot_proxies_helper():
+    t = make_tool()
+    assert t._antibot_proxies() == {}  # 未配 → 空
+    t.valves.antibot_proxy_url = "http://groups-RESIDENTIAL:pw@proxy.apify.com:8000"
+    px = t._antibot_proxies()
+    assert px["http"].startswith("http://groups-RESIDENTIAL")
+    assert px["https"] == px["http"]
+
+
+@pytest.mark.asyncio
+async def test_dblp_antibot_retries_via_proxy_when_configured(monkeypatch):
+    """直连被拦 + 配了代理 → 换代理（带浏览器 UA）重试一次并成功。"""
+    t = make_tool()
+    t.valves.antibot_proxy_url = "http://u:p@proxy.example:8000"
+    seen = []
+
+    def fake_get(url, params=None, headers=None, proxies=None, **kw):
+        seen.append({"proxies": proxies, "ua": (headers or {}).get("User-Agent", "")})
+        if not proxies:
+            return _antibot_page()  # 直连被拦
+        r = MagicMock()  # 代理出口干净 → 正常 JSON
+        r.status_code = 200
+        r.headers = {"content-type": "application/json"}
+        r.json.return_value = {"result": {"hits": {"hit": [{
+            "info": {"title": "Via Proxy", "year": "2024"},
+        }]}}}
+        return r
+
+    monkeypatch.setattr(tool_mod.requests, "get", fake_get)
+    papers = await t._dblp_search("zero knowledge proof", 5)
+    assert len(papers) == 1 and papers[0]["title"] == "Via Proxy"
+    assert seen[0]["proxies"] is None            # 第一次直连
+    assert seen[1]["proxies"]["https"].startswith("http://u:p@")  # 第二次走代理
+    assert "Mozilla" in seen[1]["ua"]            # 代理重试换浏览器 UA
+    assert len(seen) == 2                        # 代理只重试一轮
+
+
+@pytest.mark.asyncio
+async def test_dblp_antibot_proxy_still_blocked(monkeypatch):
+    """代理重试仍被拦 → 明确报错，不无限重试。"""
+    t = make_tool()
+    t.valves.antibot_proxy_url = "http://u:p@proxy.example:8000"
+    calls = []
+
+    def fake_get(url, **kw):
+        calls.append(kw.get("proxies"))
+        return _antibot_page()
+
+    monkeypatch.setattr(tool_mod.requests, "get", fake_get)
+    with pytest.raises(RuntimeError) as ei:
+        await t._dblp_search("zero knowledge proof", 5)
+    assert "代理重试仍被反爬拦截" in str(ei.value)
+    assert len(calls) == 2  # 直连 1 + 代理 1，仅此而已
+
+
+@pytest.mark.asyncio
+async def test_dblp_antibot_no_proxy_suggests_valve(monkeypatch):
+    """未配代理时错误信息应引导配置 antibot_proxy_url。"""
+    t = make_tool()
+    monkeypatch.setattr(tool_mod.requests, "get", lambda url, **kw: _antibot_page())
+    with pytest.raises(RuntimeError) as ei:
+        await t._dblp_search("zero knowledge proof", 5)
+    assert "antibot_proxy_url" in str(ei.value)

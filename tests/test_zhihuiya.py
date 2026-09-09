@@ -639,7 +639,7 @@ async def test_all_mode_rxiv_requires_category():
         return []
     t._rxiv_search = fake_rxiv
 
-    def boom(url, params=None, headers=None, timeout=None):
+    def boom(url, params=None, headers=None, timeout=None, **_):
         raise ConnectionError("no network in test")
     monkey = pytest.MonkeyPatch()
     monkey.setattr(tool_mod.requests, "get", boom)
@@ -677,7 +677,7 @@ async def test_search_papers_all_mode_excludes_direct_sources():
         return []
     t._hal_search = fake_hal
 
-    def boom(url, params=None, headers=None, timeout=None):
+    def boom(url, params=None, headers=None, timeout=None, **_):
         raise ConnectionError("no network in test")
     monkey = pytest.MonkeyPatch()
     monkey.setattr(tool_mod.requests, "get", boom)
@@ -699,7 +699,7 @@ async def test_all_mode_split_gives_literal_sources_core():
     async def fake_hal(q, limit): return []
     t._hal_search = fake_hal
 
-    def boom(url, params=None, headers=None, timeout=None):
+    def boom(url, params=None, headers=None, timeout=None, **_):
         raise ConnectionError("no network in test")
     monkey = pytest.MonkeyPatch()
     monkey.setattr(tool_mod.requests, "get", boom)

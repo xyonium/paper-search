@@ -15,6 +15,8 @@ description: 学术论文搜索、全文阅读、PDF 下载入 Knowledge（RAG�
     后端 mcpo 仅剩 doaj/google_scholar/ssrn/unpaywall/citeseerx/base/acm 作安全网
   · v2.9.1：AND 语义源（hal/pubmed/pmc/europepmc/openaire/ieee）长查询 0 命中时
     自动逐级砍尾词放宽；dblp 反爬拦截页（200+HTML）明确报错不再误报 JSON 解析失败
+  · v2.9.2：检出反爬拦截（_AntiBotBlocked，当前 dblp/Anubis）且配了
+    antibot_proxy_url 时，自动换住宅代理+浏览器 UA 重试一次（代理额度有限，仅此场景用）
 
   【查询适配】search_papers 按源自动分发查询变体（不损语义，LLM 无需处理）：
   · 大多数源用原始完整查询；zhihuiya/doaj 对长自然语言会 0 命中，
@@ -32,7 +34,7 @@ description: 学术论文搜索、全文阅读、PDF 下载入 Knowledge（RAG�
   5. read_patent(patent_number) → 读专利全文 markdown（权利要求+说明书+法律状态）
 author: openags-bridge
 requirements: requests, pymupdf, anyio
-version: 2.9.1
+version: 2.9.2
 license: MIT
 """
 
@@ -177,6 +179,11 @@ def _relax_and(query: str, try_fn, max_terms: int = 6):
     return []
 
 
+class _AntiBotBlocked(RuntimeError):
+    """源明确返回反爬拦截页（如 Anubis 质询、人机验证）。
+    区别于普通网络错误：触发 antibot_proxy_url 住宅代理的一次性重试（额度有限）。"""
+
+
 class Tools:
     class Valves(BaseModel):
         mcpo_url: str = Field(
@@ -229,6 +236,13 @@ class Tools:
         core_api_key: str = Field(
             default="",
             description="CORE API key（管理员级，可选）。用于 core 直连检索：留空走匿名（配额低），401/403 时自动降级匿名重试一次",
+        )
+        antibot_proxy_url: str = Field(
+            default="",
+            description="反爬兜底住宅代理（管理员级，可选，仅明确检出反爬拦截时用一次，省月度额度）。"
+            "完整代理 URL，如 http://groups-RESIDENTIAL:<proxy密码>@proxy.apify.com:8000。"
+            "注意 Apify 密码是控制台 Proxy 页的独立 proxy password，不是 API token（token 会 407）。"
+            "留空则反爬拦截直接报错。当前仅 dblp（Anubis 质询页）接入",
         )
 
     class UserValves(BaseModel):
@@ -572,14 +586,20 @@ class Tools:
     async def _dblp_search(self, query: str, limit: int) -> list:
         """直连 dblp JSON API，绕后端 dblp.py 的并发 ConnectionError + 无退避重试。
         退避策略：429/5xx/连接错误最多重试3次，间隔 2s/4s/8s。
+        反爬（v2.9.2）：200 但非 JSON = Anubis 质询页 → _AntiBotBlocked，
+        配了 antibot_proxy_url 则换住宅代理+浏览器 UA 重试一次（额度有限，仅此场景用）。
         注意：dblp 是 CS 书目库，仅收录计算机科学文献，非 CS 查询返回空属正常。"""
         max_attempts = 3
         backoff = [2, 4, 8]
 
-        def _fetch():
+        def _fetch(proxies: dict = None):
             last_exc = None
             for attempt in range(max_attempts):
                 try:
+                    # 走住宅代理时换浏览器 UA（Anubis 按 IP 信誉+UA 加权判定）
+                    ua = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                          "(KHTML, like Gecko) Chrome/126.0 Safari/537.36") if proxies else \
+                         "paper-search-tool/2.5 (OpenWebUI academic search)"
                     r = requests.get(
                         self._DBLP_SEARCH_URL,
                         params={
@@ -588,26 +608,27 @@ class Tools:
                             "h": max(1, min(int(limit), 100)),
                         },
                         headers={
-                            "User-Agent": "paper-search-tool/2.5 (OpenWebUI academic search)",
+                            "User-Agent": ua,
                             "Accept": "application/json",
                         },
                         timeout=30,
+                        proxies=proxies,
                     )
                     if r.status_code == 200:
                         # 200 但非 JSON = 反爬拦截页（2026-09 实测 dblp 上 Anubis
                         # "Making sure you're not a bot" 质询页，requests 解不了 PoW）
-                        # —— 持续性拦截，重试无意义，直接报清原因
+                        # —— 持续性拦截，同一路径重试无意义，抛 _AntiBotBlocked 交外层
                         ct = r.headers.get("content-type", "")
                         if "json" not in ct:
-                            raise RuntimeError(
+                            raise _AntiBotBlocked(
                                 f"dblp 返回非 JSON（{ct or 'unknown'}），疑似反爬拦截页"
-                                "（Anubis 质询），当前 IP 暂时无法直连")
+                                "（Anubis 质询）")
                         return r.json()
                     if r.status_code in (429, 500, 502, 503, 504):
                         raise RuntimeError(f"dblp HTTP {r.status_code}")
                     r.raise_for_status()
                 except RuntimeError:
-                    raise
+                    raise  # 含 _AntiBotBlocked：立即上抛，不重试
                 except Exception as e:
                     last_exc = e
                 if attempt < max_attempts - 1:
@@ -617,6 +638,18 @@ class Tools:
 
         try:
             data = await anyio.to_thread.run_sync(_fetch)
+        except _AntiBotBlocked as ab:
+            proxies = self._antibot_proxies()
+            if not proxies:
+                raise RuntimeError(
+                    f"dblp 检索失败: {ab}，当前 IP 暂时无法直连；"
+                    "可在 Valves 配 antibot_proxy_url（住宅代理）自动兜底重试")
+            try:
+                data = await anyio.to_thread.run_sync(lambda: _fetch(proxies))
+            except _AntiBotBlocked:
+                raise RuntimeError("dblp 检索失败: 住宅代理重试仍被反爬拦截（Anubis）")
+            except Exception as e2:
+                raise RuntimeError(f"dblp 检索失败: 住宅代理重试出错: {e2}")
         except Exception as e:
             raise RuntimeError(f"dblp 检索失败: {e}")
 
@@ -1306,10 +1339,11 @@ class Tools:
     # 全部用 original 查询变体（这些 API 原生支持自然语言/全文检索，不需要 arxiv 式字段布尔）。
 
     def _http_get(self, url: str, params: dict, name: str, headers: dict = None,
-                  honor_retry_after: bool = False):
+                  honor_retry_after: bool = False, proxies: dict = None):
         """JSON/HTML API GET，3 次退避；429/5xx 重试，其余 4xx 立即失败（RuntimeError
         含 "HTTP <code>"，供调用方识别 401/403 做降级）。honor_retry_after=True 时
-        429 优先遵守 Retry-After 头（上限 10s）。返回 response 对象。"""
+        429 优先遵守 Retry-After 头（上限 10s）。proxies 用于反爬兜底代理（v2.9.2）。
+        返回 response 对象。"""
         import time
         last_exc = None
         for attempt in range(3):
@@ -1320,6 +1354,7 @@ class Tools:
                     headers={"User-Agent": "paper-search-tool/2.9 (OpenWebUI academic search)",
                              **(headers or {})},
                     timeout=20,
+                    proxies=proxies,
                 )
                 if r.status_code == 200:
                     return r
@@ -1344,6 +1379,12 @@ class Tools:
     _S2_API = "https://api.semanticscholar.org/graph/v1/paper/search"
     _S2_FIELDS = ("title,abstract,year,citationCount,authors,url,"
                   "publicationDate,externalIds,openAccessPdf")
+
+    def _antibot_proxies(self) -> dict:
+        """反爬兜底代理（v2.9.2）。配了 antibot_proxy_url 才返回非空。
+        仅在源明确检出反爬拦截页（_AntiBotBlocked）时用一次——住宅代理月度额度有限。"""
+        url = (getattr(self.valves, "antibot_proxy_url", "") or "").strip()
+        return {"http": url, "https": url} if url else {}
 
     def _semantic_key(self, __user__=None) -> str:
         uv = __user__.get("valves") if __user__ else None

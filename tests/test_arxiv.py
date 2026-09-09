@@ -121,7 +121,7 @@ async def test_arxiv_error_surfaces_in_errors_not_crash():
     t = Tools(); t.valves = Tools.Valves()
     t._mcp_call = lambda tool, args, timeout=180: {"papers": [], "source_results": {}, "errors": {}}
 
-    def boom(url, params=None, headers=None, timeout=None):
+    def boom(url, params=None, headers=None, timeout=None, **_):
         raise ConnectionError("connection reset")
 
     monkey = pytest.MonkeyPatch()
@@ -188,7 +188,7 @@ async def test_arxiv_all_levels_empty_returns_empty():
     t = Tools(); t.valves = Tools.Valves()
     monkey = pytest.MonkeyPatch()
     monkey.setattr(tool_mod.requests, "get",
-                   lambda url, params=None, headers=None, timeout=None: _FakeResp(_EMPTY_FEED))
+                   lambda url, params=None, headers=None, timeout=None, **_:  _FakeResp(_EMPTY_FEED))
     papers = await t._arxiv_search("zzzqQQ nonexistentterm", 5)
     monkey.undo()
     assert papers == []
