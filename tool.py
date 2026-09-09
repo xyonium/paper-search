@@ -13,6 +13,8 @@ description: 学术论文搜索、全文阅读、PDF 下载入 Knowledge（RAG�
   · 不可用: acm（未实现）, unpaywall（仅DOI查询，用于下载 fallback）
   · v2.9 起 semantic/openalex/crossref/europepmc/core/biorxiv/medrxiv/iacr 转直连，
     后端 mcpo 仅剩 doaj/google_scholar/ssrn/unpaywall/citeseerx/base/acm 作安全网
+  · v2.9.1：AND 语义源（hal/pubmed/pmc/europepmc/openaire/ieee）长查询 0 命中时
+    自动逐级砍尾词放宽；dblp 反爬拦截页（200+HTML）明确报错不再误报 JSON 解析失败
 
   【查询适配】search_papers 按源自动分发查询变体（不损语义，LLM 无需处理）：
   · 大多数源用原始完整查询；zhihuiya/doaj 对长自然语言会 0 命中，
@@ -30,7 +32,7 @@ description: 学术论文搜索、全文阅读、PDF 下载入 Knowledge（RAG�
   5. read_patent(patent_number) → 读专利全文 markdown（权利要求+说明书+法律状态）
 author: openags-bridge
 requirements: requests, pymupdf, anyio
-version: 2.9.0
+version: 2.9.1
 license: MIT
 """
 
@@ -155,6 +157,24 @@ def _distill_core_terms(text: str, max_terms: int = 5) -> str:
         if w in keep and w not in seen:
             seen.append(w)
     return " ".join(seen)
+
+
+def _relax_and(query: str, try_fn, max_terms: int = 6):
+    """AND 语义源（空格=AND：hal/europepmc/pubmed/pmc/openaire/ieee）的逐级放宽：
+    词数 >max_terms 先按区分度蒸馏；然后 AND 前 min(len,5) 词，0 命中砍尾词重试，
+    直到 1 词。try_fn(q)->list，返回首个非空结果；全空返回 []。
+    动机（2026-09 实测）：11 词自然语言查询在这些源全 AND → 0 命中，砍到 2-3 词即恢复
+    （hal 0→61、europepmc 0→55）。短查询首次即中，行为不变。"""
+    terms = (query or "").split()
+    if len(terms) > max_terms:
+        terms = _distill_core_terms(" ".join(terms), max_terms=max_terms).split()
+    if not terms:
+        return []
+    for k in range(min(len(terms), 5), 0, -1):
+        papers = try_fn(" ".join(terms[:k]))
+        if papers:
+            return papers
+    return []
 
 
 class Tools:
@@ -487,12 +507,13 @@ class Tools:
 
     async def _hal_search(self, query: str, limit: int) -> list:
         """直连 HAL API（Solr JSON，无需 key）检索，返回 _trim_paper 兼容 dict 列表。
-        绕过第三方后端 hal.py 的 isoformat bug。anyio 线程池包装，不阻塞事件循环。"""
-        def _fetch():
+        绕过第三方后端 hal.py 的 isoformat bug。anyio 线程池包装，不阻塞事件循环。
+        Solr 空格=AND：长查询 0 命中时经 _relax_and 逐级砍尾词放宽（v2.9.1）。"""
+        def _try(q):
             r = requests.get(
                 self._HAL_SEARCH_URL,
                 params={
-                    "q": query,
+                    "q": q,
                     "fl": self._HAL_FIELDS,
                     "rows": max(1, min(int(limit), 100)),
                     "wt": "json",
@@ -502,49 +523,48 @@ class Tools:
                 timeout=20,
             )
             r.raise_for_status()
-            return r.json()
+            data = r.json()
+            docs = ((data or {}).get("response") or {}).get("docs") or []
+            papers = []
+            for d in docs:
+                if not isinstance(d, dict):
+                    continue
+                hal_id = d.get("halId_s", "")
+                if not hal_id:
+                    continue
+                year = d.get("publicationDateY_i") or d.get("producedDateY_i") or ""
+                pub = str(year) if year else (str(d.get("submittedDate_s", "") or "")[:10])
+                title = d.get("title_s") or [""]
+                title = (title[0] if isinstance(title, list) else str(title)).strip()
+                if not title:
+                    continue
+                authors = d.get("authFullName_s") or []
+                abstract = d.get("abstract_s") or [""]
+                abstract = (
+                    " ".join(x for x in abstract if x) if isinstance(abstract, list)
+                    else str(abstract or "")
+                ).strip()
+                doi = d.get("doiId_s", "")
+                if isinstance(doi, list):
+                    doi = doi[0] if doi else ""
+                papers.append({
+                    "title": title,
+                    "authors": "; ".join(a for a in authors if a),
+                    "published_date": pub,
+                    "abstract": abstract,
+                    "paper_id": f"hal:{hal_id}",
+                    "doi": doi,
+                    "source": "hal",
+                    "pdf_url": d.get("fileMain_s") or "",
+                    "citations": 0,
+                    "url": d.get("uri_s") or "",
+                })
+            return papers
 
         try:
-            data = await anyio.to_thread.run_sync(_fetch)
+            return await anyio.to_thread.run_sync(lambda: _relax_and(query, _try))
         except Exception as e:
             raise RuntimeError(f"HAL 检索失败: {e}")
-
-        docs = ((data or {}).get("response") or {}).get("docs") or []
-        papers = []
-        for d in docs:
-            if not isinstance(d, dict):
-                continue
-            hal_id = d.get("halId_s", "")
-            if not hal_id:
-                continue
-            year = d.get("publicationDateY_i") or d.get("producedDateY_i") or ""
-            pub = str(year) if year else (str(d.get("submittedDate_s", "") or "")[:10])
-            title = d.get("title_s") or [""]
-            title = (title[0] if isinstance(title, list) else str(title)).strip()
-            if not title:
-                continue
-            authors = d.get("authFullName_s") or []
-            abstract = d.get("abstract_s") or [""]
-            abstract = (
-                " ".join(x for x in abstract if x) if isinstance(abstract, list)
-                else str(abstract or "")
-            ).strip()
-            doi = d.get("doiId_s", "")
-            if isinstance(doi, list):
-                doi = doi[0] if doi else ""
-            papers.append({
-                "title": title,
-                "authors": "; ".join(a for a in authors if a),
-                "published_date": pub,
-                "abstract": abstract,
-                "paper_id": f"hal:{hal_id}",
-                "doi": doi,
-                "source": "hal",
-                "pdf_url": d.get("fileMain_s") or "",
-                "citations": 0,
-                "url": d.get("uri_s") or "",
-            })
-        return papers
 
     _DBLP_SEARCH_URL = "https://dblp.org/search/publ/api"
     _UNPAYWALL_API = "https://api.unpaywall.org/v2"
@@ -574,6 +594,14 @@ class Tools:
                         timeout=30,
                     )
                     if r.status_code == 200:
+                        # 200 但非 JSON = 反爬拦截页（2026-09 实测 dblp 上 Anubis
+                        # "Making sure you're not a bot" 质询页，requests 解不了 PoW）
+                        # —— 持续性拦截，重试无意义，直接报清原因
+                        ct = r.headers.get("content-type", "")
+                        if "json" not in ct:
+                            raise RuntimeError(
+                                f"dblp 返回非 JSON（{ct or 'unknown'}），疑似反爬拦截页"
+                                "（Anubis 质询），当前 IP 暂时无法直连")
                         return r.json()
                     if r.status_code in (429, 500, 502, 503, 504):
                         raise RuntimeError(f"dblp HTTP {r.status_code}")
@@ -654,19 +682,21 @@ class Tools:
         绕后端 ieee.py 骨架（raise NotImplementedError，无实际 API 调用）。
         实测（2026-08，host/容器均复现）：IEEE API 对含常见词的较长 querytext 会间歇性
         挂起连接（~80s 后 SSL EOF / Read timeout），同查询重试即恢复 → 与 dblp 一致，
-        网络类错误最多重试3次，退避 2s/4s。"""
+        网络类错误最多重试3次，退避 2s/4s。
+        querytext 空格=AND：长查询 0 命中时经 _relax_and 逐级砍尾词放宽（v2.9.1）。"""
         max_attempts = 3
         backoff = [2, 4]
 
-        def _fetch():
+        def _try(q: str) -> list:
             last_exc = None
+            data = None
             for attempt in range(max_attempts):
                 try:
                     r = requests.get(
                         self._IEEE_SEARCH_URL,
                         params={
                             "apikey": key,
-                            "querytext": query,
+                            "querytext": q,
                             "max_records": max(1, min(int(limit), 200)),
                             "format": "json",
                             "sort_order": "desc",
@@ -676,7 +706,8 @@ class Tools:
                         timeout=30,
                     )
                     if r.status_code == 200:
-                        return r.json()
+                        data = r.json()
+                        break
                     if r.status_code in (429, 500, 502, 503, 504):
                         last_exc = RuntimeError(f"IEEE HTTP {r.status_code}")
                     else:
@@ -689,51 +720,52 @@ class Tools:
                 if attempt < max_attempts - 1:
                     import time
                     time.sleep(backoff[attempt])
-            raise RuntimeError(f"IEEE 检索失败（重试{max_attempts}次）: {last_exc}")
+            if data is None:
+                raise RuntimeError(f"IEEE 检索失败（重试{max_attempts}次）: {last_exc}")
+
+            articles = (data or {}).get("articles") or []
+            papers = []
+            for a in articles[:limit]:
+                if not isinstance(a, dict):
+                    continue
+                title = str(a.get("title") or "").strip()
+                if not title:
+                    continue
+                authors_raw = (a.get("authors") or {}).get("authors") or []
+                authors = [
+                    str(au.get("full_name") or "").strip()
+                    for au in authors_raw if isinstance(au, dict) and au.get("full_name")
+                ]
+                pub_year = str(a.get("publication_year") or "")
+                doi = str(a.get("doi") or "")
+                article_number = str(a.get("article_number") or "")
+                pdf_url = str(a.get("pdf_url") or "")
+                abstract = str(a.get("abstract") or "").strip()
+                access_type = str(a.get("access_type") or "")
+                # OA 论文可直接下载，LOCKED 需机构访问
+                is_oa = access_type.upper() == "OPEN_ACCESS" or "open" in access_type.lower()
+                papers.append({
+                    "title": title,
+                    "authors": "; ".join(authors),
+                    "published_date": pub_year,
+                    "abstract": abstract,
+                    "paper_id": f"ieee:{article_number}",
+                    "doi": doi,
+                    "source": "ieee",
+                    "pdf_url": pdf_url if is_oa else "",
+                    "citations": int(a.get("citing_paper_count") or 0),
+                    "url": str(a.get("html_url") or a.get("abstract_url") or ""),
+                })
+            return papers
 
         try:
-            data = await anyio.to_thread.run_sync(_fetch)
+            return await anyio.to_thread.run_sync(lambda: _relax_and(query, _try))
         except Exception as e:
             # 错误信息可能包含 apikey，需脱敏
             err_msg = str(e)
             if "apikey=" in err_msg:
                 err_msg = re.sub(r"apikey=[^&\s]+", "apikey=***", err_msg)
             raise RuntimeError(f"IEEE 检索失败: {err_msg}")
-
-        articles = (data or {}).get("articles") or []
-        papers = []
-        for a in articles[:limit]:
-            if not isinstance(a, dict):
-                continue
-            title = str(a.get("title") or "").strip()
-            if not title:
-                continue
-            authors_raw = (a.get("authors") or {}).get("authors") or []
-            authors = [
-                str(au.get("full_name") or "").strip()
-                for au in authors_raw if isinstance(au, dict) and au.get("full_name")
-            ]
-            pub_year = str(a.get("publication_year") or "")
-            doi = str(a.get("doi") or "")
-            article_number = str(a.get("article_number") or "")
-            pdf_url = str(a.get("pdf_url") or "")
-            abstract = str(a.get("abstract") or "").strip()
-            access_type = str(a.get("access_type") or "")
-            # OA 论文可直接下载，LOCKED 需机构访问
-            is_oa = access_type.upper() == "OPEN_ACCESS" or "open" in access_type.lower()
-            papers.append({
-                "title": title,
-                "authors": "; ".join(authors),
-                "published_date": pub_year,
-                "abstract": abstract,
-                "paper_id": f"ieee:{article_number}",
-                "doi": doi,
-                "source": "ieee",
-                "pdf_url": pdf_url if is_oa else "",
-                "citations": int(a.get("citing_paper_count") or 0),
-                "url": str(a.get("html_url") or a.get("abstract_url") or ""),
-            })
-        return papers
 
     _ZENODO_SEARCH_URL = "https://zenodo.org/api/records"
 
@@ -828,18 +860,19 @@ class Tools:
         绕后端 openaire.py 双 bug（2026-08 实测 100% 必现）：
         路径1 researchProducts 端点 404（已废弃，Tomcat 报错）；路径2 legacy fallback
         用 query= 参数 → OpenAIRE 只认 keywords → 400 Bad Request。
-        与 dblp/zenodo 同模式，网络类错误 3 次退避（2s/4s），4xx 不重试。"""
+        与 dblp/zenodo 同模式，网络类错误 3 次退避（2s/4s），4xx 不重试。
+        keywords= 是 AND 语义：长查询 0 命中时经 _relax_and 逐级砍尾词放宽（v2.9.1）。"""
         max_attempts = 3
         backoff = [2, 4]
 
-        def _fetch():
+        def _try(q):
             last_exc = None
             for attempt in range(max_attempts):
                 try:
                     r = requests.get(
                         self._OPENAIRE_SEARCH_URL,
                         params={
-                            "keywords": query,
+                            "keywords": q,
                             "format": "json",
                             "size": max(1, min(int(limit), 100)),
                             "page": 1,
@@ -851,7 +884,8 @@ class Tools:
                         timeout=30,
                     )
                     if r.status_code == 200:
-                        return r.json()
+                        data = r.json()
+                        break
                     if r.status_code in (429, 500, 502, 503, 504):
                         last_exc = RuntimeError(f"OpenAIRE HTTP {r.status_code}")
                     else:
@@ -863,76 +897,78 @@ class Tools:
                 if attempt < max_attempts - 1:
                     import time
                     time.sleep(backoff[attempt])
-            raise RuntimeError(f"OpenAIRE 检索失败（重试{max_attempts}次）: {last_exc}")
+            else:
+                raise RuntimeError(f"OpenAIRE 检索失败（重试{max_attempts}次）: {last_exc}")
+
+            # OpenAIRE json: response.results.result[]，每条 metadata.oaf:entity.oaf:result
+            # 实测结构（2026-08）：title/creator/pid 是 dict 或 dict 列表，文本在 "$" 键
+            resp = (data or {}).get("response") or {}
+            results = (resp.get("results") or {}).get("result") or []
+            if isinstance(results, dict):
+                results = [results]
+
+            papers = []
+
+            def _text(node):
+                """dict -> node['$']；list -> 第一个 dict 的 '$'；str -> 原样"""
+                if isinstance(node, dict):
+                    return str(node.get("$") or "")
+                if isinstance(node, list):
+                    for n in node:
+                        t = _text(n)
+                        if t:
+                            return t
+                    return ""
+                return str(node or "")
+
+            for r in results[:limit]:
+                if not isinstance(r, dict):
+                    continue
+                ent = ((r.get("metadata") or {}).get("oaf:entity") or {}).get("oaf:result") or {}
+                title = _text(ent.get("title")).strip()
+                if not title:
+                    continue
+                creators = ent.get("creator") or []
+                if isinstance(creators, (str, dict)):
+                    creators = [creators]
+                authors = [_text(c).strip() for c in creators]
+                authors = [a for a in authors if a]
+                pub_date = _text(ent.get("dateofacceptance"))[:10]
+                pids = ent.get("pid") or []
+                if isinstance(pids, dict):
+                    pids = [pids]
+                doi = next((_text(p) for p in pids
+                            if isinstance(p, dict) and p.get("@classid") == "doi"), "")
+                bar = ent.get("bestaccessright") or {}
+                oa = "open" in str(bar.get("@classid", "")).lower() if isinstance(bar, dict) else False
+                pdf_url = ""
+                ch = (ent.get("children") or {}).get("instance") or []
+                if isinstance(ch, dict):
+                    ch = [ch]
+                for inst in ch:
+                    url = _text((inst.get("webresource") or {}).get("url") if isinstance(inst, dict) else "")
+                    if url and ".pdf" in url.lower():
+                        pdf_url = url
+                        break
+                obj_id = _text((r.get("header") or {}).get("dri:objIdentifier"))
+                papers.append({
+                    "title": title,
+                    "authors": "; ".join(authors),
+                    "published_date": pub_date,
+                    "abstract": "",
+                    "paper_id": f"openaire:{obj_id[:50]}",
+                    "doi": doi,
+                    "source": "openaire",
+                    "pdf_url": pdf_url if oa else "",
+                    "citations": 0,
+                    "url": f"https://doi.org/{doi}" if doi else "",
+                })
+            return papers
 
         try:
-            data = await anyio.to_thread.run_sync(_fetch)
+            return await anyio.to_thread.run_sync(lambda: _relax_and(query, _try))
         except Exception as e:
             raise RuntimeError(f"OpenAIRE 检索失败: {e}")
-
-        # OpenAIRE json: response.results.result[]，每条 metadata.oaf:entity.oaf:result
-        # 实测结构（2026-08）：title/creator/pid 是 dict 或 dict 列表，文本在 "$" 键
-        resp = (data or {}).get("response") or {}
-        results = (resp.get("results") or {}).get("result") or []
-        if isinstance(results, dict):
-            results = [results]
-
-        def _text(node):
-            """dict -> node['$']；list -> 第一个 dict 的 '$'；str -> 原样"""
-            if isinstance(node, dict):
-                return str(node.get("$") or "")
-            if isinstance(node, list):
-                for n in node:
-                    t = _text(n)
-                    if t:
-                        return t
-                return ""
-            return str(node or "")
-
-        papers = []
-        for r in results[:limit]:
-            if not isinstance(r, dict):
-                continue
-            ent = ((r.get("metadata") or {}).get("oaf:entity") or {}).get("oaf:result") or {}
-            title = _text(ent.get("title")).strip()
-            if not title:
-                continue
-            creators = ent.get("creator") or []
-            if isinstance(creators, (str, dict)):
-                creators = [creators]
-            authors = [_text(c).strip() for c in creators]
-            authors = [a for a in authors if a]
-            pub_date = _text(ent.get("dateofacceptance"))[:10]
-            pids = ent.get("pid") or []
-            if isinstance(pids, dict):
-                pids = [pids]
-            doi = next((_text(p) for p in pids
-                        if isinstance(p, dict) and p.get("@classid") == "doi"), "")
-            bar = ent.get("bestaccessright") or {}
-            oa = "open" in str(bar.get("@classid", "")).lower() if isinstance(bar, dict) else False
-            pdf_url = ""
-            ch = (ent.get("children") or {}).get("instance") or []
-            if isinstance(ch, dict):
-                ch = [ch]
-            for inst in ch:
-                url = _text((inst.get("webresource") or {}).get("url") if isinstance(inst, dict) else "")
-                if url and ".pdf" in url.lower():
-                    pdf_url = url
-                    break
-            obj_id = _text((r.get("header") or {}).get("dri:objIdentifier"))
-            papers.append({
-                "title": title,
-                "authors": "; ".join(authors),
-                "published_date": pub_date,
-                "abstract": "",
-                "paper_id": f"openaire:{obj_id[:50]}",
-                "doi": doi,
-                "source": "openaire",
-                "pdf_url": pdf_url if oa else "",
-                "citations": 0,
-                "url": f"https://doi.org/{doi}" if doi else "",
-            })
-        return papers
 
     # ---------- NCBI 直连（pubmed/pmc）----------
     # 2026-08 实测根因：后端 paper-search-mcp 的 pubmed.py 走 HTTPS 且 requests.get 无
@@ -1101,20 +1137,25 @@ class Tools:
         }
 
     async def _pubmed_search(self, query: str, limit: int, __user__=None) -> list:
-        """直连 NCBI E-utilities 搜 PubMed（esearch+efetch），绕后端 pubmed.py 无 timeout 挂起 bug。"""
+        """直连 NCBI E-utilities 搜 PubMed（esearch+efetch），绕后端 pubmed.py 无 timeout 挂起 bug。
+        term 空格=AND：长查询 0 命中时经 _relax_and 逐级砍尾词放宽（v2.9.1）。"""
         from xml.etree import ElementTree as ET
 
         def _fetch():
             key = self._ncbi_key(__user__)
-            r1 = self._eutils_get("esearch.fcgi", {
-                "db": "pubmed", "term": query, "retmax": max(1, min(int(limit), 200)),
-                "retmode": "xml", "sort": "relevance"}, key)
-            ids = [e.text for e in ET.fromstring(r1.content).findall(".//Id") if e.text]
-            if not ids:
-                return []
-            r2 = self._eutils_get("efetch.fcgi", {
-                "db": "pubmed", "id": ",".join(ids), "retmode": "xml"}, key)
-            return self._parse_pubmed_xml(ET.fromstring(r2.content), "pubmed", limit)
+
+            def _try(q):
+                r1 = self._eutils_get("esearch.fcgi", {
+                    "db": "pubmed", "term": q, "retmax": max(1, min(int(limit), 200)),
+                    "retmode": "xml", "sort": "relevance"}, key)
+                ids = [e.text for e in ET.fromstring(r1.content).findall(".//Id") if e.text]
+                if not ids:
+                    return []
+                r2 = self._eutils_get("efetch.fcgi", {
+                    "db": "pubmed", "id": ",".join(ids), "retmode": "xml"}, key)
+                return self._parse_pubmed_xml(ET.fromstring(r2.content), "pubmed", limit)
+
+            return _relax_and(query, _try)
 
         try:
             return await anyio.to_thread.run_sync(_fetch)
@@ -1123,28 +1164,33 @@ class Tools:
 
     async def _pmc_search(self, query: str, limit: int, __user__=None) -> list:
         """直连 NCBI E-utilities 搜 PMC 全文库（esearch+efetch），绕后端 pmc.py 同 host HTTPS 风险。
-        PMC efetch 返回 JATS 全文 XML（pmc-articleset），非 PubmedArticleSet → 用 JATS 解析。"""
+        PMC efetch 返回 JATS 全文 XML（pmc-articleset），非 PubmedArticleSet → 用 JATS 解析。
+        term 空格=AND：长查询 0 命中时经 _relax_and 逐级砍尾词放宽（v2.9.1）。"""
         from xml.etree import ElementTree as ET
 
         def _fetch():
             key = self._ncbi_key(__user__)
-            r1 = self._eutils_get("esearch.fcgi", {
-                "db": "pmc", "term": query, "retmax": max(1, min(int(limit), 200)),
-                "retmode": "xml", "sort": "relevance"}, key)
-            ids = [e.text for e in ET.fromstring(r1.content).findall(".//Id") if e.text]
-            if not ids:
-                return []
-            r2 = self._eutils_get("efetch.fcgi", {
-                "db": "pmc", "id": ",".join(ids), "retmode": "xml"}, key)
-            root = ET.fromstring(r2.content)
-            papers = []
-            for art in root.findall(".//article"):
-                p = self._parse_pmc_article(art, len(papers))
-                if p:
-                    papers.append(p)
-                if len(papers) >= limit:
-                    break
-            return papers
+
+            def _try(q):
+                r1 = self._eutils_get("esearch.fcgi", {
+                    "db": "pmc", "term": q, "retmax": max(1, min(int(limit), 200)),
+                    "retmode": "xml", "sort": "relevance"}, key)
+                ids = [e.text for e in ET.fromstring(r1.content).findall(".//Id") if e.text]
+                if not ids:
+                    return []
+                r2 = self._eutils_get("efetch.fcgi", {
+                    "db": "pmc", "id": ",".join(ids), "retmode": "xml"}, key)
+                root = ET.fromstring(r2.content)
+                papers = []
+                for art in root.findall(".//article"):
+                    p = self._parse_pmc_article(art, len(papers))
+                    if p:
+                        papers.append(p)
+                    if len(papers) >= limit:
+                        break
+                return papers
+
+            return _relax_and(query, _try)
 
         try:
             return await anyio.to_thread.run_sync(_fetch)
@@ -1477,10 +1523,11 @@ class Tools:
 
     async def _europepmc_search(self, query: str, limit: int) -> list:
         """直连 Europe PMC。id 按 source 字段区分：MED→pmid:、PMC→pmc:（补 PMC 前缀）、
-        其他→europepmc:。pdf_url 从 fullTextUrlList 挑 documentStyle=pdf。"""
-        def _fetch():
+        其他→europepmc:。pdf_url 从 fullTextUrlList 挑 documentStyle=pdf。
+        query 空格=AND：长查询 0 命中时经 _relax_and 逐级砍尾词放宽（v2.9.1）。"""
+        def _try(q):
             data = self._http_get(self._EUPMC_API,
-                                  {"query": query, "format": "json",
+                                  {"query": q, "format": "json",
                                    "pageSize": min(max(1, int(limit)), 100)},
                                   "Europe PMC").json()
             papers = []
@@ -1547,7 +1594,7 @@ class Tools:
             return papers
 
         try:
-            return await anyio.to_thread.run_sync(_fetch)
+            return await anyio.to_thread.run_sync(lambda: _relax_and(query, _try))
         except Exception as e:
             raise RuntimeError(f"Europe PMC 检索失败: {e}")
 

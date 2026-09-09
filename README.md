@@ -211,6 +211,27 @@ Once installed, OpenWebUI models can call the following tools:
 
 ---
 
+## 🧪 Testing
+
+**Offline unit tests** (mocked HTTP, no network):
+
+```bash
+python3 -m pytest tests/ -q
+```
+
+**Per-source live smoke test** — tells network/rate-limit/anti-bot problems apart from code bugs:
+
+```bash
+python3 scripts/live_sources.py            # all key-free sources
+python3 scripts/live_sources.py hal dblp   # specific sources only
+SEMANTIC_API_KEY=... IEEE_APIKEY=... CORE_API_KEY=... ZENODO_ACCESS_TOKEN=... \
+    python3 scripts/live_sources.py        # include key-gated sources
+```
+
+Each source is queried with a known-stable term; the report shows PASS/FAIL/EMPTY + hit count + latency. FAIL containing `429` = rate limit (configure a key or retry later), `504`/timeout = transient network, `反爬/非 JSON` = IP blocked by anti-bot (e.g. dblp's Anubis challenge) — none of these are code bugs.
+
+---
+
 ## 🙏 Acknowledgments & Credits
 
 Special thanks to the open-source projects that make this integration possible:
