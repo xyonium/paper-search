@@ -288,7 +288,7 @@ _SCHOLAR_ITEMS = [{
 @pytest.mark.asyncio
 async def test_scholar_actor_parses_items(monkeypatch):
     t = make_tool()
-    t.valves.apify_rotator_base_url = "http://api-key-rotator:8788"
+    t.valves.apify_rotator_base_url = "http://api-key-rotator:8788/apify"
     seen = {}
 
     def fake_post(url, json=None, headers=None, timeout=None):

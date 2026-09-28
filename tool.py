@@ -243,8 +243,8 @@ class Tools:
         )
         apify_rotator_base_url: str = Field(
             default="",
-            description="api-key-rotator 的 Apify 转发基址（管理员级，可选），如 http://api-key-rotator:8788"
-            "（转发 /v2/acts → api.apify.com，key 池自动轮转）。google_scholar 的最终兜底通路："
+            description="api-key-rotator 的 Apify 转发基址（管理员级，可选），如 http://api-key-rotator:8788/apify"
+            "（rotator 剥离 /apify 前缀后转发 /v2/acts → api.apify.com，key 池自动轮转）。google_scholar 的最终兜底通路："
             "首选 firecrawl_base_url 抓搜索页，次选 tavily_base_url 的 extract(advanced)，"
             "最后才落 Apify actor（johnvc/google-scholar-api，PAY_PER_EVENT 付费按次计费）；"
             "三个都没配则 google_scholar 仍走后端",
