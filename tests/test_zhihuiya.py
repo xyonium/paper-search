@@ -63,14 +63,23 @@ def _text_content(payload):
     return c
 
 
+def _mcp_result(is_error, content):
+    """Stand-in for mcp's CallToolResult across SDK majors.
+
+    Sets BOTH the pre-2.0 camelCase `isError` and the 2.x snake_case
+    `is_error`, mirroring how a real result object behaves on each major.
+    Do not use a bare MagicMock here: it invents whichever name the code
+    reads, so an attribute rename goes unnoticed.
+    """
+    return SimpleNamespace(is_error=is_error, isError=is_error, content=content)
+
+
 @pytest.mark.asyncio
 async def test_zhihuiya_call_parses_json_text():
     t = Tools()
     payload = {"success": True, "data": {"results": [{"paper_id": "p1"}]},
                "error_code": 0, "error_msg": ""}
-    result = MagicMock()
-    result.isError = False
-    result.content = [_text_content(payload)]
+    result = _mcp_result(False, [_text_content(payload)])
     session = _fake_session(result)
 
     with patch.object(tool_mod, "streamablehttp_client") as m_client, \
@@ -89,9 +98,9 @@ async def test_zhihuiya_call_parses_json_text():
 @pytest.mark.asyncio
 async def test_zhihuiya_call_raises_on_error_result():
     t = Tools()
-    result = MagicMock()
-    result.isError = True
-    result.content = [_text_content({"error_msg": "apikey not Pass and call failed!"})]
+    result = _mcp_result(
+        True, [_text_content({"error_msg": "apikey not Pass and call failed!"})]
+    )
     session = _fake_session(result)
 
     with patch.object(tool_mod, "streamablehttp_client") as m_client, \
@@ -361,9 +370,7 @@ async def test_zhihuiya_search_degrades_when_bibliography_fails():
 async def test_zhihuiya_call_uses_custom_url():
     t = Tools()
     payload = {"status": "success", "data": {"docs": []}}
-    result = MagicMock()
-    result.isError = False
-    result.content = [_text_content(payload)]
+    result = _mcp_result(False, [_text_content(payload)])
     session = _fake_session(result)
     captured = {}
 

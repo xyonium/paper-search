@@ -54,16 +54,23 @@ import requests
 from mcp import ClientSession
 
 # mcp 2.x renamed the StreamableHTTP helper (streamablehttp_client ->
-# streamable_http_client) and its context manager now yields a 2-tuple
-# (read, write) instead of 1.x's (read, write, get_session_id). Import the
-# new name and keep the old symbol name bound, so callers/tests that patch
-# `streamablehttp_client` keep working across both majors.
+# streamable_http_client), and its context manager now yields a 2-tuple
+# (read, write) instead of 1.x's (read, write, get_session_id).
+#
+# Select the helper by attribute rather than by a bare `from ... import`:
+# an unrelated ImportError inside the transport module (or its deps) must
+# propagate untouched instead of silently falling back and masking the real
+# cause. Only a missing new-style attribute selects the legacy name.
+#
+# The module-level name stays `streamablehttp_client`, so callers and tests
+# that patch that name keep intercepting the call site.
+import mcp.client.streamable_http as _streamable_http
+
 try:
-    from mcp.client.streamable_http import (
-        streamable_http_client as streamablehttp_client,
-    )
-except ImportError:  # mcp 1.x
-    from mcp.client.streamable_http import streamablehttp_client
+    streamablehttp_client = _streamable_http.streamable_http_client  # mcp >= 2.0
+except AttributeError:  # mcp 1.x: only the legacy camelCase name exists
+    streamablehttp_client = _streamable_http.streamablehttp_client
+
 from pydantic import BaseModel, Field
 
 
@@ -455,10 +462,10 @@ class Tools:
         url = (url or self._ZHIHUIYA_MCP_URL).format(key=key)
 
         async def _run():
-            async with streamablehttp_client(url) as _streams:
-                # mcp 1.x yields (read, write, get_session_id); 2.x yields a
-                # 2-tuple (read, write). Positional slicing fits both.
-                read, write = _streams[0], _streams[1]
+            # mcp 1.x yields (read, write, get_session_id); 2.x yields a
+            # 2-tuple (read, write). Star-unpack takes the first two from
+            # either shape (and stays correct for any longer tuple).
+            async with streamablehttp_client(url) as (read, write, *_):
                 async with ClientSession(read, write) as session:
                     await session.initialize()
                     return await session.call_tool(tool_name, args)
@@ -472,7 +479,11 @@ class Tools:
                 f"智慧芽 {tool_name} 连接失败: {self._redact_zhihuiya_key(e)}"
             )
 
-        if getattr(result, "isError", False):
+        # mcp 2.x renamed this field to snake_case (is_error); 1.x used the
+        # camelCase isError, which on 2.x survives only as a constructor/wire
+        # alias and is NOT readable as an attribute. Reading the wrong one
+        # silently treats a failed tool call as success.
+        if getattr(result, "is_error", getattr(result, "isError", False)):
             msg = ""
             for c in getattr(result, "content", []) or []:
                 msg = getattr(c, "text", "") or msg
