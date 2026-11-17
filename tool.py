@@ -27,6 +27,9 @@ description: 学术论文搜索、全文阅读、PDF 下载入 Knowledge（RAG�
   · 大多数源用原始完整查询；zhihuiya/doaj 对长自然语言会 0 命中，
     自动精简为核心术语后恢复（返回含 query_adapted 字段说明）
 
+  · v2.9.10：修 mcp 2.x 兼容——streamablehttp_client 改名 streamable_http_client、
+    上下文管理器由 3 元组变 2 元组。旧导入在 OWUI(mcp 2.3.0) 下 exec 即 ImportError，
+    工具整体加载失败且 Valve 面板显示 no valve；现双版本兼容。
   【web 搜索兜底】源出现连接/超时错误时自动触发，tavily 主 → firecrawl 备，
   域名限定动态映射自失败源（如 arxiv 失败只补 arxiv.org）。配 tavily_base_url /
   firecrawl_base_url 启用，返回含 fallback_domains/fallback_limit 字段。
@@ -39,7 +42,7 @@ description: 学术论文搜索、全文阅读、PDF 下载入 Knowledge（RAG�
   5. read_patent(patent_number) → 读专利全文 markdown（权利要求+说明书+法律状态）
 author: openags-bridge
 requirements: requests, pymupdf, anyio
-version: 2.9.9
+version: 2.9.10
 license: MIT
 """
 
@@ -49,7 +52,18 @@ import re
 import anyio
 import requests
 from mcp import ClientSession
-from mcp.client.streamable_http import streamablehttp_client
+
+# mcp 2.x renamed the StreamableHTTP helper (streamablehttp_client ->
+# streamable_http_client) and its context manager now yields a 2-tuple
+# (read, write) instead of 1.x's (read, write, get_session_id). Import the
+# new name and keep the old symbol name bound, so callers/tests that patch
+# `streamablehttp_client` keep working across both majors.
+try:
+    from mcp.client.streamable_http import (
+        streamable_http_client as streamablehttp_client,
+    )
+except ImportError:  # mcp 1.x
+    from mcp.client.streamable_http import streamablehttp_client
 from pydantic import BaseModel, Field
 
 
@@ -441,7 +455,10 @@ class Tools:
         url = (url or self._ZHIHUIYA_MCP_URL).format(key=key)
 
         async def _run():
-            async with streamablehttp_client(url) as (read, write, _):
+            async with streamablehttp_client(url) as _streams:
+                # mcp 1.x yields (read, write, get_session_id); 2.x yields a
+                # 2-tuple (read, write). Positional slicing fits both.
+                read, write = _streams[0], _streams[1]
                 async with ClientSession(read, write) as session:
                     await session.initialize()
                     return await session.call_tool(tool_name, args)
