@@ -27,9 +27,11 @@ description: 学术论文搜索、全文阅读、PDF 下载入 Knowledge（RAG�
   · 大多数源用原始完整查询；zhihuiya/doaj 对长自然语言会 0 命中，
     自动精简为核心术语后恢复（返回含 query_adapted 字段说明）
 
-  · v2.9.10：修 mcp 2.x 兼容——streamablehttp_client 改名 streamable_http_client、
-    上下文管理器由 3 元组变 2 元组。旧导入在 OWUI(mcp 2.3.0) 下 exec 即 ImportError，
-    工具整体加载失败且 Valve 面板显示 no valve；现双版本兼容。
+  · v2.9.10：修 mcp 2.x 三处改名——(a) streamablehttp_client 改名
+    streamable_http_client；(b) 上下文管理器由 3 元组变 2 元组；(c) 结果字段
+    isError 改名为 is_error（camelCase 在 2.x 仅作构造别名，读不到，会让工具级
+    错误被当成成功、返回 {"raw": 错误文本}）。(a) 曾使 OWUI(mcp 2.3.0) 下 exec
+    即 ImportError，工具整体加载失败且 Valve 面板显示 no valve。现三处均双版本兼容。
   【web 搜索兜底】源出现连接/超时错误时自动触发，tavily 主 → firecrawl 备，
   域名限定动态映射自失败源（如 arxiv 失败只补 arxiv.org）。配 tavily_base_url /
   firecrawl_base_url 启用，返回含 fallback_domains/fallback_limit 字段。
