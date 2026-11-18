@@ -135,7 +135,10 @@ The retired `mcpo` + `paper-search-mcp` backend is replaced by a self-hosted
 (`search_{source}` / `read_{source}_paper` / `download_with_fallback`). Reference
 deployment lives in the
 [firecrawl-portainer](https://github.com/xyonium/firecrawl/tree/portainer-stack/papers-service)
-branch (source + GH Actions image build + digest-pinned compose). Point the tool at it:
+branch (`xyonium/compose`, branch `firecrawl`: source + GH Actions image build +
+digest-pinned compose). The image **vendors this repo's `tool.py` at build time**
+(`papers-service/Dockerfile` → `ADD .../xyonium/paper-search/${PAPER_SEARCH_REF}/tool.py`),
+so source adapters are maintained in exactly one place. Point the tool at it:
 
 ```yaml
 services:
@@ -151,6 +154,18 @@ Since v2.9.7 downloads are streamed as **in-memory bytes** — no shared Docker
 volume between the backend and open-webui is needed anymore.
 
 ### 2. OpenWebUI Tool Configuration
+
+**Recommended: sync from this repo instead of copy-pasting.** OWUI stores the tool
+content in its own DB, so a manual paste silently drifts from the repo (2026-11: repo
+was 2.9.11 while OWUI still had 2.9.9 — which does not even import under mcp 2.x).
+
+```bash
+export OWUI_API_KEY=sk-...            # OpenWebUI -> Settings -> Account -> API keys
+python3 scripts/deploy_owui_tool.py --check   # 比对版本，漂移退出码 1（可进 CI）
+python3 scripts/deploy_owui_tool.py           # 有差异才推送；Valves 不动
+```
+
+Manual fallback:
 1. Open **OpenWebUI** -> **Workspace** -> **Tools**.
 2. Create a new Tool and copy the contents of [`tool.py`](./tool.py).
 3. Save the tool and optionally configure the **Valves** / **UserValves**:
