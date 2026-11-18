@@ -76,7 +76,10 @@
 5. **默认路径别刷屏**：显式 `sources=` 才逐条回报；落回 valve 默认值时只在 `notes` 汇总一句。
 6. **sentinel 会真的被调用**：`_READ_TOOLS` 里给 zhihuiya 放的假工具名曾击穿到 mcpo（300s 超时）
    并覆盖真实错误 → 加了 `src != "zhihuiya"` 守卫。给映射表放假值必须同时加调用侧守卫。
-7. **改 mapper 的键要和 `_trim_paper` 的契约同步**：`_trim_paper` 只认 `published_date`，
+7. **错误信息必须带因**：dblp 曾因未预期的 3xx 状态落成 `"...（重试3次）: None"` ——
+   既没法判断是反爬/限流还是接口漂移，`admin_alert` 也等于没信息。遇到
+   status/异常时把状态码或 `type(e).__name__` 打进消息里。
+8. **改 mapper 的键要和 `_trim_paper` 的契约同步**：`_trim_paper` 只认 `published_date`，
    若源适配器给的是 `year`，字段会被静默丢掉（测试构造数据时尤其容易写错）。
 
 ## 6. 测试与提交惯例

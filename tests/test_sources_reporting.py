@@ -398,3 +398,26 @@ async def test_read_failure_explains_junk_rejection():
     t._web_read_fallback = junk
     out = json.loads(await t.read_paper("openalex", "W123", url="http://example.org/x"))
     assert "过短" in out["error"] and "挑战页" in out["error"]
+
+@pytest.mark.asyncio
+async def test_dblp_unexpected_status_produces_actionable_error():
+    """3xx/304 这类未预期状态必须带状态码上抛：否则错误是 "...: None"，
+    既没法判断是反爬/限流还是接口漂移，admin_alert 也没有信息量。"""
+    t = Tools(); t.valves = Tools.Valves()
+
+    class FakeResp:
+        status_code = 304
+        headers = {"content-type": "application/json"}
+
+        def raise_for_status(self):
+            return None
+
+    monkey = pytest.MonkeyPatch()
+    monkey.setattr(tool_mod.requests, "get", lambda *a, **k: FakeResp())
+    try:
+        t._papers_call = lambda *a, **k: {"papers": [], "source_results": {}, "errors": {}}
+        out = json.loads(await t.search_papers("q", 3, "dblp", "", "", {}))
+    finally:
+        monkey.undo()
+    assert "304" in out["errors"]["dblp"]
+    assert "304" in out["admin_alert"]["sources"]["dblp"]

@@ -728,6 +728,10 @@ class Tools:
                     if r.status_code in (429, 500, 502, 503, 504):
                         raise RuntimeError(f"dblp HTTP {r.status_code}")
                     r.raise_for_status()
+                    # 未预期状态（3xx/304 等）：必须显式带状态码上抛，否则 last_exc 仍为
+                    # None，最终错误变成 "...（重试3次）: None" —— 无法判断是反爬、限流
+                    # 还是接口漂移（2026-11 容器内全源实测踩到）
+                    raise RuntimeError(f"dblp HTTP {r.status_code}（未预期状态）")
                 except RuntimeError:
                     raise  # 含 _AntiBotBlocked：立即上抛，不重试
                 except Exception as e:
