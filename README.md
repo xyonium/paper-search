@@ -118,9 +118,9 @@ Different sources have very different query tolerances. `search_papers` automati
 
 | Source class | Sources | Query sent |
 |---|---|---|
-| **Semantic / tokenizing** | openalex, semantic, crossref, pmc, europepmc, pubmed, openaire, core, patsnap | Your **original** full natural-language query (semantics preserved) |
+| **Semantic / tokenizing** | openalex, semantic, crossref, pmc, europepmc, pubmed, openaire, core | Your **original** full natural-language query (semantics preserved) |
 | **Literal keyword** | zhihuiya, doaj | A **cleaned core-keyword** variant — quotes, bare `OR/AND/NOT`, and filler words stripped, then distilled to ≤5 high-specificity terms |
-| **Direct (bypasses backend)** | hal, zhihuiya, patsnap, dblp, zenodo, ieee, pubmed, pmc, arxiv, semantic, openalex, crossref, europepmc, core, biorxiv, medrxiv, iacr (+ google_scholar when any of firecrawl/tavily/apify valves set) | hal/arxiv use core; zhihuiya uses distilled; the rest use original. The papers-service backend serves the search safety net (doaj, google_scholar chain) — paper-search-mcp is retired |
+| **Direct (bypasses backend)** | hal, zhihuiya, dblp, zenodo, ieee, pubmed, pmc, arxiv, semantic, openalex, crossref, europepmc, core, biorxiv, medrxiv, iacr (+ google_scholar when any of firecrawl/tavily/apify valves set) | hal/arxiv use core; zhihuiya uses distilled; the rest use original. The papers-service backend serves the search safety net (doaj, google_scholar chain) — paper-search-mcp is retired |
 
 > `bioRxiv` / `medRxiv` are **not keyword search** — they return the latest ~30 days of papers in a subject category, so they're **excluded from `default_sources`** (a keyword query would inject irrelevant results). To browse a subject's new papers, call explicitly: `sources="biorxiv"` + `biorxiv_category="biochemistry"` (or `medrxiv_category="cardiovascular_medicine"`).
 

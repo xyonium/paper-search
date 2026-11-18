@@ -32,6 +32,14 @@ description: 学术论文搜索、全文阅读、PDF 下载入 Knowledge（RAG�
     isError 改名为 is_error（camelCase 在 2.x 仅作构造别名，读不到，会让工具级
     错误被当成成功、返回 {"raw": 错误文本}）。(a) 曾使 OWUI(mcp 2.3.0) 下 exec
     即 ImportError，工具整体加载失败且 Valve 面板显示 no valve。现三处均双版本兼容。
+  · v2.9.11：不再"静默不搜" + 接口漂移告警。
+    (a) sources 里请求了但本轮不会执行的源统一进 ignored_sources（patsnap 专利源误传、
+    拼错/未知源名、zhihuiya/ieee/firecrawl 未配 key/url），未知源与专利源不再发给后端；
+    (b) 新增 admin_alert：非连接/限流类的检索错误（4xx、字段缺失、解析失败）视为
+    上游可能漂移，冒泡给使用者转告管理员核对（反爬/未实现等已知类别除外）；
+    (c) 跨源去重按 DOI 精确匹配（不做标题模糊合并，避免误杀预印本/正式版），
+    返回 duplicates_removed；(d) download 端点跟随 papers_service_url valve。
+    注：AND 源的逐级放宽（_relax_and）与 biorxiv/medrxiv 学科浏览是既定设计，未改动。
   【web 搜索兜底】源出现连接/超时错误时自动触发，tavily 主 → firecrawl 备，
   域名限定动态映射自失败源（如 arxiv 失败只补 arxiv.org）。配 tavily_base_url /
   firecrawl_base_url 启用，返回含 fallback_domains/fallback_limit 字段。
@@ -44,7 +52,7 @@ description: 学术论文搜索、全文阅读、PDF 下载入 Knowledge（RAG�
   5. read_patent(patent_number) → 读专利全文 markdown（权利要求+说明书+法律状态）
 author: openags-bridge
 requirements: requests, pymupdf, anyio
-version: 2.9.10
+version: 2.9.11
 license: MIT
 """
 
@@ -100,6 +108,12 @@ _QUERY_PREFIXES = (
 )
 
 LITERAL_SOURCES = frozenset({"zhihuiya", "doaj"})
+# 专利专用源：patsnap 只有专利 MCP（search_patents/read_patent），不参与论文检索。
+# 单列出来是为了 (a) 不让后端收到它，(b) 显式传 sources=patsnap 时能明确回报，
+# 而不是静默 0 结果（2026-11 审计：它曾混在 DIRECT_SOURCES 里被无声丢弃）。
+PATENT_ONLY_SOURCES = frozenset({"patsnap"})
+# 需配 key/url 才真正启用的源（未配置时跳过，但显式请求要回报，见 search_papers）
+KEY_GATED_SOURCES = frozenset({"zhihuiya", "ieee", "firecrawl"})
 # 直连源（绕 papers 服务）。pubmed/pmc 直连原因（2026-08 实测）：旧后端 pubmed.py 走 HTTPS 且
 # requests.get 无 timeout，境外出口对突发并发 TLS 不稳（SSL EOF）时会无限挂起，asyncio.gather
 # 等齐所有源 → 整批 180s 超时，首批尤甚（DNS/连接冷 + 并发突发）；改走 HTTP + timeout=20 + 3次退避。
@@ -108,7 +122,7 @@ LITERAL_SOURCES = frozenset({"zhihuiya", "doaj"})
 # v2.9：semantic/openalex/crossref/europepmc/core/biorxiv/medrxiv/iacr 全部转直连
 # v2.9.8 起安全网/快车道后端是自托管 papers-service（papers_service_url）。
 DIRECT_SOURCES = frozenset({
-    "arxiv", "zhihuiya", "hal", "patsnap", "dblp", "zenodo", "ieee", "openaire",
+    "arxiv", "zhihuiya", "hal", "dblp", "zenodo", "ieee", "openaire",
     "firecrawl", "pubmed", "pmc",
     "semantic", "openalex", "crossref", "europepmc", "core",
     "biorxiv", "medrxiv", "iacr",
@@ -122,6 +136,9 @@ _BACKEND_ALL_SOURCES = (
 _SEMANTIC_ALL_SOURCES = ",".join(
     s for s in _BACKEND_ALL_SOURCES.split(",") if s not in LITERAL_SOURCES
 )
+# 全部可识别的 sources 取值（不含 'all'）：用于把拼错/不适用的源回报给调用方
+KNOWN_SOURCES = (DIRECT_SOURCES | LITERAL_SOURCES | PATENT_ONLY_SOURCES
+                 | KEY_GATED_SOURCES | frozenset(_BACKEND_ALL_SOURCES.split(",")))
 
 
 def _make_query_variants(query: str) -> dict:
@@ -2066,6 +2083,12 @@ class Tools:
         "超时", "timed out", "timeout", "ssl", "eof", "connection", "refused",
         "reset", "unreachable", "dns", "502", "503", "504", "429",
     )
+    # 非连接/限流类错误里，这些是"已知且可自理"的，不该让管理员去查接口漂移：
+    # 反爬拦截（站点行为，已有 firecrawl 兜底）、明确的功能未实现（写在文档里）。
+    _ADMIN_DRIFT_EXCLUDE = (
+        "反爬", "anubis", "captcha", "人机验证", "unusual traffic", "拦截页",
+        "未实现", "not implemented", "not yet implemented", "不支持",
+    )
     # 源 → 学术域名映射（fallback 的 include_domains 动态限定用）。
     # 每个源对应其官方/主站点域名；未映射的源不参与域名限定（fallback 用全量域名）。
     _SOURCE_TO_DOMAINS = {
@@ -2120,6 +2143,28 @@ class Tools:
             m = str(msg).lower()
             if any(k in m for k in self._FC_NET_ERR_MARKERS):
                 out.append(src)
+        return out
+
+    def _admin_drift_errors(self, errors: dict) -> dict:
+        """把「非连接/限流类」的检索错误挑出来，交给人看。
+
+        动机（2026-11）：连接类错误已有 web 兜底链，但 400/404/字段缺失/JSON 解析失败
+        这类错误说明的是**上游接口可能漂移**（路径改名、参数改名、返回结构变了）。
+        这类问题本工具无法自愈，也不能让 LLM 当成"没有结果"咽下去 —— 必须冒泡给
+        使用者，让他转告管理员去核对那个源。反爬/未实现属已知类别，排除。
+        """
+        out = {}
+        for src, msg in (errors or {}).items():
+            if src == "web_fallback":
+                continue  # 兜底服务自身的失败（非学术源），已在 errors 里，不算源漂移
+            m = str(msg).lower()
+            # _backend_split 的两个子分支标签对人不友好（sem/lit），归并成 backend
+            src = {"sem": "backend", "lit": "backend"}.get(src, src)
+            if any(k in m for k in self._FC_NET_ERR_MARKERS):
+                continue                      # 连接/限流类 → 走 web 兜底，不算漂移
+            if any(k in m for k in self._ADMIN_DRIFT_EXCLUDE):
+                continue                      # 反爬/未实现 → 已知，不惊动管理员
+            out[src] = str(msg)[:300]
         return out
 
     def _web_fallback_backend(self, __user__=None) -> str:
@@ -2420,6 +2465,33 @@ class Tools:
         return headers
 
     @staticmethod
+    def _dedupe_papers(papers: list) -> tuple:
+        """跨源去重：**只按 DOI 精确匹配**（同一篇论文的唯一稳定标识）。
+        刻意不做"标题+年"模糊合并：预印本/正式版、勘误、同名综述都会被误杀，
+        宁可留两条让调用方自己判断。保留先出现的一条，但补齐后来者更新的
+        pdf_url/url/abstract —— 同一篇论文常是 A 源有 PDF、B 源有摘要。
+        返回 (去重后列表, 移除条数)。"""
+        kept = []
+        index = {}
+        removed = 0
+        for p in papers:
+            doi = (p.get("doi") or "").strip().lower()
+            if not doi:
+                kept.append(p)          # 无 DOI 不参与去重
+                continue
+            k = "doi:" + doi
+            if k not in index:
+                index[k] = len(kept)
+                kept.append(p)
+                continue
+            removed += 1
+            base = kept[index[k]]
+            for f in ("pdf_url", "url", "abstract", "paper_id"):
+                if not base.get(f) and p.get(f):
+                    base[f] = p[f]
+        return kept, removed
+
+    @staticmethod
     def _trim_paper(p: dict, max_abstract: int = 600) -> dict:
         authors = [a.strip() for a in (p.get("authors") or "").split(";") if a.strip()]
         if len(authors) > 3:
@@ -2549,7 +2621,20 @@ class Tools:
             or "arxiv,semantic,openalex,pubmed,pmc,core,europepmc,google_scholar"
         )
         src_set = {s.strip().lower() for s in src.split(",") if s.strip()}
-        all_mode = src.strip().lower() == "all"
+        # 'all' 整串 = 全源模式；列表里出现 all（"all,arxiv"）历史上等价于全源
+        # （后端直接收到 "all"），这里沿用该语义并在 notes 说明，避免被我改成"只搜 arxiv"
+        _all_in_list = "all" in src_set and src.strip().lower() != "all"
+        all_mode = src.strip().lower() == "all" or "all" in src_set
+        if _all_in_list:
+            src_set.discard("all")
+        # 是否由调用方显式点名 sources（而非落回 valve 默认值）。显式点名时，
+        # 「请求了但不会执行」的源必须逐条回报；默认路径只在 notes 里汇总一句，
+        # 否则每次默认调用都会刷 3 条「未配 key」噪声。
+        explicit_sources = bool((sources or "").strip())
+        # 请求了但本函数不会执行的源：patsnap（专利专用）+ 拼错/不支持的源。
+        # 必须回报，否则调用方看到的是「0 结果、无错误」，会被误读成「确实没有论文」。
+        _ignored = (src_set & PATENT_ONLY_SOURCES) if not all_mode else set()
+        _unknown = (src_set - KNOWN_SOURCES) if not all_mode else set()
 
         variants = _make_query_variants(query)
         original, core = variants["original"], variants["core"]
@@ -2600,8 +2685,38 @@ class Tools:
         want_scholar_tav = bool(self._tavily_base(__user__)) and _scholar_req
         want_scholar_direct = want_scholar_fc or want_scholar_tav or want_scholar_actor
 
-        # 直连源不进后端 sources；scholar 有任一直接通路时也从后端剔除
-        backend_set = src_set - DIRECT_SOURCES
+        # key/url 门控源被跳过：显式点名 sources 时逐条进 ignored_sources（用户要知道
+        # 自己点的源没跑）；落回 valve 默认值时不逐条刷屏，只在 notes 里汇总一句。
+        _disabled = set()
+        _disabled_quiet = set()
+        for _s, _on in (("zhihuiya", want_zh), ("ieee", want_ieee),
+                        ("firecrawl", want_firecrawl)):
+            if _s in src_set and not _on:
+                (_disabled if explicit_sources else _disabled_quiet).add(_s)
+        _reason = {
+            "zhihuiya": "未配置 zhihuiya_apikey（或 zhihuiya_enabled=false），该源未执行",
+            "ieee": "未配置 ieee_apikey，该源未执行",
+            "firecrawl": "未配置 firecrawl_base_url，该源未执行",
+        }
+
+        def _ignored_payload() -> dict:
+            """本次「请求了但不会执行」的源 → 原因。
+            独立字段，不塞 errors：errors 会触发 web 兜底链，且文案里内插源名时
+            可能误命中连接类关键词（timeout/ssl/connection…）。"""
+            payload = {}
+            for s in sorted(_ignored):
+                payload[s] = ("patsnap 是专利源，不参与论文检索；"
+                              "请改用 search_patents(query) 或 read_patent(patent_number)")
+            for s in sorted(_unknown):
+                payload[s] = (f"未知源 {s}，未执行；可用值见 sources 参数说明"
+                              f"（或传 sources='all'）")
+            for s in sorted(_disabled):
+                payload[s] = _reason.get(s, "该源未启用，未执行")
+            return payload
+
+        # 直连源不进后端 sources；scholar 有任一直接通路时也从后端剔除；
+        # 专利专用源与未知源同样不能发给后端（后端没有这些源，发过去只会被忽略或报错）
+        backend_set = src_set - DIRECT_SOURCES - PATENT_ONLY_SOURCES - _unknown
         if want_scholar_direct:
             backend_set = backend_set - {"google_scholar"}
         if all_mode:
@@ -2626,7 +2741,7 @@ class Tools:
         async def _backend_all():
             # core==original 或无需拆分时，一次调用（含全部后端源）
             if not all_mode and not backend_set:
-                # 只请了直连源（hal/zhihuiya/patsnap）→ 不调后端
+                # 只请了直连源（hal/zhihuiya）或专利/未知源 → 不调后端
                 return {"papers": [], "source_results": {}, "errors": {}}
             t = _time.monotonic()
             try:
@@ -2840,9 +2955,10 @@ class Tools:
                 result = {"papers": [], "source_results": {},
                           "errors": {"backend": str(backend_result)}}
             else:
-                return json.dumps(
-                    {"error": f"后端 search_papers 调用失败: {backend_result}"},
-                    ensure_ascii=False)
+                _err = {"error": f"后端 search_papers 调用失败: {backend_result}"}
+                if _ignored or _unknown or _disabled:
+                    _err["ignored_sources"] = _ignored_payload()
+                return json.dumps(_err, ensure_ascii=False)
         else:
             result = backend_result
 
@@ -3009,6 +3125,39 @@ class Tools:
 
         out = {"query": query, "total": len(papers),
                "source_results": source_results, "errors": errors, "papers": papers}
+        # 跨源去重（v2.9.11）：docstring/README 一直声称"去重"，实际从未做过 —— 同一篇
+        # 论文在 arxiv+semantic 各返回一次会让 LLM 上下文翻倍、Knowledge 重复入库。
+        # key 只认 DOI（不做标题模糊合并）。同一 DOI 保留先出现的那条，
+        # 但补齐后出现条目里更完整的 pdf_url/url/abstract（不改变 source/paper_id 归属）。
+        papers, _dups = self._dedupe_papers(papers)
+        out["papers"] = papers
+        out["total"] = len(papers)
+        if _dups:
+            # total < sum(source_results) 的唯一原因就是它，显式给出避免 LLM 困惑
+            out["duplicates_removed"] = _dups
+        if _ignored or _unknown or _disabled:
+            out["ignored_sources"] = _ignored_payload()
+        # 默认路径下被跳过的 key 门控源：只在这个汇总里说一句（避免每次默认调用刷屏）。
+        # 注意 biorxiv/medrxiv 的"学科浏览、query 不参与检索"是既定设计（工具描述已写明），
+        # 不在返回体里重复提示——2026-11 审计曾误当缺陷，此处不重复加噪声。
+        _notes = []
+        if _all_in_list:
+            _notes.append("sources 里包含 'all'，已按全源模式执行；建议单独传 sources='all'")
+        if _disabled_quiet:
+            _notes.append("默认源中的 " + "、".join(sorted(_disabled_quiet))
+                          + " 未配置 key/url，已跳过（配好后自动启用）")
+        if _notes:
+            out["notes"] = _notes
+        # 接口漂移告警：非连接/限流类错误无法自愈，必须让使用者知道去找管理员。
+        # 字段独立于 errors（errors 会触发兜底、也可能被 LLM 当成"重试即可"）。
+        _drift = self._admin_drift_errors(errors)
+        if _drift:
+            out["admin_alert"] = {
+                "message": ("以下源返回非连接/限流类错误，本工具无法自动恢复；"
+                            "可能是上游接口漂移（端点/参数/返回结构变化）。"
+                            "请把本段转告管理员，核对对应源。"),
+                "sources": _drift,
+            }
         # 字面源发生截断时给出提示（LLM/用户可见），避免误以为用了完整查询
         if literal_query != original:
             adapted = {}
@@ -3047,6 +3196,11 @@ class Tools:
                     original, fb_limit, __user__, fb_domains)
                 if wp:
                     papers.extend(wp)
+                    # 兜底结果同样过一遍去重（常与主结果同 DOI，例：arxiv 超时 → tavily
+                    # 补回的正是同一篇）；否则主路径去重后又被兜底加回重复条目
+                    papers, _dup2 = self._dedupe_papers(papers)
+                    if _dup2:
+                        out["duplicates_removed"] = out.get("duplicates_removed", 0) + _dup2
                     source_results[fb_name] = len(wp)
                     out["total"] = len(papers)
                     out["source_results"] = source_results
@@ -3417,7 +3571,10 @@ class Tools:
                 return f"{web_meta_header}{note}\n\n" + text[:max_chars] + (
                     "\n\n[…全文截断…]" if len(text) > max_chars else ""
                 )
-            backend_err = f"{backend_err}；网页抓取（jina/tavily/firecrawl）失败".strip("；")
+            backend_err = (
+                f"{backend_err}；网页抓取（jina/tavily/firecrawl）均无可信内容"
+                "（返回过短 <500 字符，或被判为反爬挑战页/占位页）"
+            ).strip("；")
 
         # google_scholar 仅 paper_id(gs_xxx，hash 不可反推) 且无 url 时的专属引导
         if src == "google_scholar" and not url and not pdf_url:
@@ -3625,8 +3782,10 @@ class Tools:
                 ensure_ascii=False,
             )
 
+        # 端点必须跟随 papers_service_url valve（v2.9.11 修：此前硬编码容器名，
+        # 改 valve 的部署会出现「搜索/read 正常、下载永远打默认地址」的配置漂移）
         data, via = await self._download_via_endpoint(
-            "http://papers-service:3200/papers/download_with_fallback",
+            f"{self._papers_base()}/download_with_fallback",
             source, paper_id, doi, title, allow_scihub, scihub_url,
         )
         if data is None:
