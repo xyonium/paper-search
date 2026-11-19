@@ -13,6 +13,8 @@ on:
     branches: [main]
     paths:
       - "tool.py"
+  # 手动重发（PAT 换新/补跑/验证链路）；不受 paths 过滤影响
+  workflow_dispatch:
 
 permissions:
   contents: read
