@@ -293,7 +293,7 @@ class Tools:
     class UserValves(BaseModel):
         default_sources: str = Field(
             default="arxiv,pubmed,semantic,crossref,openalex,pmc,core,europepmc,dblp,openaire,doaj,hal,zenodo,google_scholar,zhihuiya,ieee,firecrawl",
-            description="默认搜索源：'all'=全部21源（慢，30s+）；或逗号分隔子集。默认未包含的源：iacr（密码学 ePrint 细分库，需要时 sources=iacr 显式调用）、citeseerx,ssrn,base,acm,unpaywall；biorxiv/medrxiv 为学科近30天浏览（非关键词检索），需 sources+biorxiv_category 显式调用。zhihuiya/ieee/firecrawl 在默认列表中，但仅当配了对应 key/url 才真正启用（未配静默跳过）",
+            description="默认搜索源：'all'=全部 25 个论文源（18 直连 + 7 后端，慢，30s+）；或逗号分隔子集。默认未包含的源：iacr（密码学 ePrint 细分库，需要时 sources=iacr 显式调用）、citeseerx,ssrn,base,acm,unpaywall；biorxiv/medrxiv 为学科近30天浏览（非关键词检索），需 sources+biorxiv_category 显式调用。zhihuiya/ieee/firecrawl 在默认列表中，但仅当配了对应 key/url 才真正启用（未配静默跳过）",
         )
         knowledge_id: str = Field(
             default="", description="下载 PDF 自动加入的 Knowledge 集合 ID"

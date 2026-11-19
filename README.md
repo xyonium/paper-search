@@ -15,10 +15,10 @@
 - 📖 **Full-Text Reading**: Instant full-text for Open Access platforms, automatic PDF-parsing fallback, and metadata-level reads (abstract + bibliographic record) for index-only sources.
 - 📥 **Automated Knowledge Base Ingestion**: Download papers and auto-upload & index them into **OpenWebUI Knowledge Base** for RAG citation and retrieval.
 - 🔄 **Built-in OA Fallback Chain**: Source-native download ➔ Open Access Repositories (OpenAIRE / CORE / Europe PMC / PMC) ➔ Unpaywall ➔ (Optional) Sci-Hub mirror.
-- 🔑 **Key-gated sources (auto-on/off)**: zhihuiya literature + patents and IEEE Xplore are enabled **automatically when their apikey is set** and skipped silently when not — no source list changes needed.
+- 🔑 **Key-gated sources (auto-on/off)**: zhihuiya literature + patents and IEEE Xplore are enabled **automatically when their apikey is set** and skipped when not (explicitly requested ones are reported in `ignored_sources`) — no source list changes needed.
 - 🏛 **Patent Search & Full-Text (patsnap)**: First-ever patent source — semantic patent search (`search_patents`) plus full claims + description + legal status as Markdown (`read_patent`). Shares the same zhihuiya apikey, also direct-connected.
 - 🔬 **IEEE Xplore**: Direct REST API search (bypasses backend skeleton). Metadata-level results with abstract + citation count; OA papers include pdf_url.
-- 🎯 **Smart Query Adaptation**: Automatically adapts your query per source — semantic sources (OpenAlex, Semantic Scholar, PubMed…) get the full natural-language query, while literal keyword sources (zhihuiya, DOAJ, IACR) get a cleaned core-keyword variant (quotes/boolean/noise stripped, then distilled to ≤5 high-specificity terms). Recovers hits that would otherwise return zero, without losing semantics.
+- 🎯 **Smart Query Adaptation**: Automatically adapts your query per source — semantic sources (OpenAlex, Semantic Scholar, PubMed…) get the full natural-language query, while literal keyword sources (zhihuiya, DOAJ) get a cleaned core-keyword variant (quotes/boolean/noise stripped, then distilled to ≤5 high-specificity terms). Recovers hits that would otherwise return zero, without losing semantics.
 - 🇫🇷 **HAL via Direct Connect**: HAL is queried directly (bypassing a backend date-parsing bug) so it reliably returns results.
 - 🗄 **dblp & Zenodo via Direct Connect**: dblp (CS bibliography) and Zenodo (OA repository) are queried directly, bypassing backend bugs (concurrency ConnectionError, isoformat crash). Zenodo records often include direct PDF links.
 
@@ -195,7 +195,7 @@ Once installed, OpenWebUI models can call the following tools:
 
 1. **`search_papers(query, sources, max_results_per_source)`**  
    Searches papers concurrently across sources and returns formatted metadata with DOI & PDF links.  
-   - Key-gated sources (zhihuiya, ieee) are **auto-enabled when their key is set**, auto-skipped otherwise — no need to list them in `sources` or `default_sources`.
+   - Key-gated sources (zhihuiya, ieee, firecrawl) are **auto-enabled when their key/url is set**, auto-skipped otherwise — no need to list them in `sources` or `default_sources`.
 
 2. **`read_paper(source, paper_id, pdf_url)`**  
    Reads the full text of a target paper (with automatic PDF fallback).

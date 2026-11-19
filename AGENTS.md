@@ -19,7 +19,7 @@ This repository integrates multi-source academic paper searching, reading, and d
         └── OpenWebUI Python Tool (Bridge & Interceptor Layer)
                  │
                  ├── search_papers()  ──┬─► POST http://mcpo:8000/papers/search_papers
-                 │                      │    (Aggregates 16 active academic platforms)
+                 │                      │    (18 direct adapters + 7 backend-only = 25 paper sources)
                  │                      └─► zhihuiya MCP 直连 (streamable-http, apikey 启用)
                  │                           search_literature + literature_bibliography
                  │
