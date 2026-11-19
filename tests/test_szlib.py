@@ -200,3 +200,117 @@ def test_szlib_not_in_default_sources():
     assert "szlib" in tool_mod.DIRECT_SOURCES
     assert "szlib" in tool_mod.KNOWN_SOURCES
     assert tool_mod.Tools._READ_TOOLS.get("szlib", "missing") is None
+
+# ---------- 评审补测（A1 + 边界） ----------
+
+@pytest.mark.asyncio
+async def test_login_required_survives_backend_failure(monkeypatch):
+    """sources="szlib,doaj" 且后端炸了：login_url 不能被 early-return 吞掉。"""
+    t = Tools(); t.valves = Tools.Valves()
+    t.valves.szlib_url = "http://szlib.test:8765"
+    _patch_post(monkeypatch, FakeResp(202, {
+        "status": "AWAITING_LOGIN", "url": "https://pub.example/szlib/verify/x",
+        "login_token": "tok", "expires_in": 300}))
+
+    def boom(*a, **k):
+        raise RuntimeError("backend down")
+    t._papers_call = boom
+
+    out = json.loads(await t.search_papers(
+        "glucose biosensor", 3, "szlib,doaj", "", "", {}))
+    assert "error" in out, "后端失败仍应报错"
+    assert out["login_required"]["login_url"] == "https://pub.example/szlib/verify/x"
+    assert out["login_required"]["login_token"] == "tok"
+
+
+@pytest.mark.asyncio
+async def test_szlib_token_timeout_says_token_invalid_and_skips_web_fallback(monkeypatch):
+    """带 token 的请求超时：token 已作废要明说；且 szlib 不该触发 web 兜底。"""
+    t = Tools(); t.valves = Tools.Valves()
+    t.valves.szlib_url = "http://szlib.test:8765"
+    t.valves.tavily_base_url = "http://tavily.local"
+    _no_backend(t)
+    fallback_calls = []
+
+    async def fake_fallback(*a, **k):
+        fallback_calls.append(1)
+        return "tavily", []
+    t._web_search_fallback = fake_fallback
+
+    def timeout_post(*a, **k):
+        raise tool_mod.requests.exceptions.ReadTimeout("read timed out")
+    monkeypatch.setattr(tool_mod.requests, "post", timeout_post)
+
+    out = json.loads(await t.search_papers(
+        "城市更新", 3, "szlib", "", "", {}, szlib_login_token="tok-x"))
+    assert "作废" in out["errors"]["szlib"] and "重新发起" in out["errors"]["szlib"]
+    assert not fallback_calls, "szlib 需要浏览器登录，不应触发 tavily/firecrawl 兜底"
+    assert "fallback_domains" not in out
+
+
+@pytest.mark.asyncio
+async def test_szlib_non_json_200_is_error(monkeypatch):
+    t = Tools(); t.valves = Tools.Valves()
+    t.valves.szlib_url = "http://szlib.test:8765"
+    _no_backend(t)
+
+    class BadResp:
+        status_code = 200
+        text = "<html>not json</html>"
+
+        def json(self):
+            raise ValueError("no json")
+    monkeypatch.setattr(tool_mod.requests, "post", lambda *a, **k: BadResp())
+    out = json.loads(await t.search_papers("q", 3, "szlib", "", "", {}))
+    assert "非 JSON" in out["errors"]["szlib"]
+
+
+@pytest.mark.asyncio
+async def test_szlib_filters_bad_items(monkeypatch):
+    t = Tools(); t.valves = Tools.Valves()
+    t.valves.szlib_url = "http://szlib.test:8765"
+    _no_backend(t)
+    _patch_post(monkeypatch, FakeResp(200, {"ok": True, "items": [
+        "not-a-dict", {"title": ""}, {"title": "有效标题", "year": "2024", "context": "刊"}]}))
+    out = json.loads(await t.search_papers("q", 3, "szlib", "", "", {}))
+    assert out["total"] == 1
+    assert out["papers"][0]["title"] == "有效标题"
+
+
+@pytest.mark.asyncio
+async def test_szlib_limit_is_clamped_to_50(monkeypatch):
+    t = Tools(); t.valves = Tools.Valves()
+    t.valves.szlib_url = "http://szlib.test:8765"
+    _no_backend(t)
+    rec = []
+    _patch_post(monkeypatch, FakeResp(200, {"ok": True, "items": []}), rec)
+    await t.search_papers("q", 100, "szlib", "", "", {})
+    assert rec[0]["json"]["limit"] == 50
+
+
+@pytest.mark.asyncio
+async def test_szlib_user_valve_url_wins(monkeypatch):
+    from types import SimpleNamespace
+    t = Tools(); t.valves = Tools.Valves()
+    t.valves.szlib_url = "http://admin-szlib:8765"
+    _no_backend(t)
+    rec = []
+    _patch_post(monkeypatch, FakeResp(200, {"ok": True, "items": [_item()]}), rec)
+    await t.search_papers("q", 3, "szlib", "", "", {"valves": SimpleNamespace(
+        szlib_url="http://user-szlib:9999")})
+    assert rec[0]["url"].startswith("http://user-szlib:9999")
+
+
+@pytest.mark.asyncio
+async def test_szlib_never_sent_to_backend(monkeypatch):
+    t = Tools(); t.valves = Tools.Valves()
+    t.valves.szlib_url = "http://szlib.test:8765"
+    calls = []
+
+    def fake_backend(tool, args, timeout=180):
+        calls.append(dict(args))
+        return {"papers": [], "source_results": {}, "errors": {}}
+    t._papers_call = fake_backend
+    _patch_post(monkeypatch, FakeResp(200, {"ok": True, "items": [_item()]}))
+    await t.search_papers("glucose biosensor", 3, "szlib,doaj", "", "", {})
+    assert calls and calls[0]["sources"] == "doaj", "szlib 不能出现在后端 sources 里"

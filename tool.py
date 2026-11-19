@@ -52,6 +52,10 @@ description: 学术论文搜索、全文阅读、PDF 下载入 Knowledge（RAG�
     带 szlib_login_token 重试同一查询；login_token 一次性、带 token 的请求服务端会阻塞
     等验证（最长 300s，客户端超时设 330s）。仅元数据（类型/标题/出处/年），无全文无 DOI；
     paper_id 由标题+出处+年哈希稳定生成，跨源去重不涉及（无 DOI）。
+  · v2.9.14：szlib 评审修复——(a) 后端失败且无直连结果时不再丢失 login_required
+    （sources="szlib,doaj" 这类混合请求仍能拿到登录链接）；(b) 带 token 的请求超时会
+    明确"login_token 已作废、请重新发起"，且 szlib 不再触发 web 兜底（读秀要登录，
+    tavily/firecrawl 对它必然无效）；(c) 补 7 个边界测试。
   【web 搜索兜底】源出现连接/超时错误时自动触发，tavily 主 → firecrawl 备，
   域名限定动态映射自失败源（如 arxiv 失败只补 arxiv.org）。配 tavily_base_url /
   firecrawl_base_url 启用，返回含 fallback_domains/fallback_limit 字段。
@@ -68,7 +72,7 @@ description: 学术论文搜索、全文阅读、PDF 下载入 Knowledge（RAG�
   5. read_patent(patent_number) → 读专利全文 markdown（权利要求+说明书+法律状态）
 author: openags-bridge
 requirements: requests, pymupdf, anyio
-version: 2.9.13
+version: 2.9.14
 license: MIT
 """
 
@@ -713,6 +717,10 @@ class Tools:
         try:
             r = await anyio.to_thread.run_sync(_fetch)
         except Exception as e:
+            if login_token:
+                raise RuntimeError(
+                    f"szlib 登录验证未在 330s 内完成（{e}）。login_token 已作废，"
+                    "请不带 szlib_login_token 重新发起同一次检索，拿到新的登录链接再完成验证")
             raise RuntimeError(f"szlib 检索失败: {e}")
 
         if r.status_code == 202:
@@ -2290,6 +2298,10 @@ class Tools:
         """从 errors dict 挑出连接/超时类失败的源（0 命中/400 参数错不算）。"""
         out = []
         for src, msg in (errors or {}).items():
+            if src == "szlib":
+                # 读秀要浏览器登录，web 兜底（tavily/firecrawl）对它必然无效，
+                # 只会多打一次外部请求；szlib 的错误走 errors 展示即可
+                continue
             m = str(msg).lower()
             if any(k in m for k in self._FC_NET_ERR_MARKERS):
                 out.append(src)
@@ -3122,8 +3134,42 @@ class Tools:
         szlib_result = outcome.get("szlib")
         gscholar_result = outcome.get("google_scholar")
 
+        def _szlib_login_payload(res):
+            """202 → 给调用方的登录引导；非 202 返回 None。
+
+            三种 202：AWAITING_LOGIN（带 url+token）/ LOGIN_TIMEOUT / LOGIN_FAILED
+            （后两者没有新链接，只能提示重新发起）。
+            """
+            if not isinstance(res, _SzlibLoginRequired):
+                return None
+            if res.code == "AWAITING_LOGIN" and res.url:
+                return {
+                    "source": "szlib",
+                    "login_url": res.url,
+                    "login_token": res.login_token,
+                    "expires_in": res.expires_in,
+                    "notice": (
+                        "深圳图书馆（读秀）需要先用浏览器登录："
+                        f"打开 login_url 完成（{max(1, res.expires_in // 60)} 分钟内有效），"
+                        "然后带同一个 szlib_login_token 重试同样的查询即可。"
+                    ),
+                }
+            return {
+                "source": "szlib",
+                "code": res.code,
+                "notice": (
+                    "深圳图书馆登录未完成（"
+                    f"{res.code}{('：' + res.message) if res.message else ''}）。"
+                    "login_token 是一次性的；请不带 szlib_login_token 重新发起同一次检索，"
+                    "拿到新的登录链接后再完成登录。"
+                ),
+            }
+
+        # 登录引导必须在任何 early-return 之前算好：后端挂掉时也不能把 login_url 丢了
+        _login_req = _szlib_login_payload(szlib_result) if want_szlib else None
+
         # 后端失败处理：若任一直连源有结果则保留，否则报错
-        direct_ok = [r for r in (zh_result, hal_result, dblp_result, zenodo_result, openaire_result, firecrawl_result, ieee_result, pubmed_result, pmc_result, arxiv_result, semantic_result, openalex_result, crossref_result, europepmc_result, core_result, biorxiv_result, medrxiv_result, iacr_result, gscholar_result) if isinstance(r, list) and r]
+        direct_ok = [r for r in (zh_result, hal_result, dblp_result, zenodo_result, openaire_result, firecrawl_result, ieee_result, pubmed_result, pmc_result, arxiv_result, semantic_result, openalex_result, crossref_result, europepmc_result, core_result, biorxiv_result, medrxiv_result, iacr_result, szlib_result, gscholar_result) if isinstance(r, list) and r]
         if isinstance(backend_result, Exception):
             if direct_ok:
                 result = {"papers": [], "source_results": {},
@@ -3132,6 +3178,8 @@ class Tools:
                 _err = {"error": f"后端 search_papers 调用失败: {backend_result}"}
                 if _ignored or _unknown or _disabled:
                     _err["ignored_sources"] = _ignored_payload()
+                if _login_req:
+                    _err["login_required"] = _login_req
                 return json.dumps(_err, ensure_ascii=False)
         else:
             result = backend_result
@@ -3271,34 +3319,9 @@ class Tools:
                 iap = [self._trim_paper(p) for p in iacr_result]
                 papers.extend(iap)
                 source_results["iacr"] = len(iap)
-        _login_req = None
         if want_szlib:
-            if isinstance(szlib_result, _SzlibLoginRequired):
+            if _login_req:
                 source_results["szlib"] = 0
-                # 三种 202：待登录 / 验证超时 / 登录失败。只有第一种带新链接。
-                if szlib_result.code == "AWAITING_LOGIN" and szlib_result.url:
-                    _login_req = {
-                        "source": "szlib",
-                        "login_url": szlib_result.url,
-                        "login_token": szlib_result.login_token,
-                        "expires_in": szlib_result.expires_in,
-                        "notice": (
-                            "深圳图书馆（读秀）需要先用浏览器登录："
-                            f"打开 login_url 完成（{max(1, szlib_result.expires_in // 60)} 分钟内有效），"
-                            "然后带同一个 szlib_login_token 重试同样的查询即可。"
-                        ),
-                    }
-                else:
-                    _login_req = {
-                        "source": "szlib",
-                        "code": szlib_result.code,
-                        "notice": (
-                            "深圳图书馆登录未完成（"
-                            f"{szlib_result.code}{('：' + szlib_result.message) if szlib_result.message else ''}）。"
-                            "login_token 是一次性的；请不带 szlib_login_token 重新发起同一次检索，"
-                            "拿到新的登录链接后再完成登录。"
-                        ),
-                    }
             elif isinstance(szlib_result, Exception):
                 source_results["szlib"] = 0
                 errors["szlib"] = str(szlib_result)
