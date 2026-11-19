@@ -10,7 +10,8 @@ description: 学术论文搜索、全文阅读、PDF 下载入 Knowledge（RAG�
     ieee (ieee_apikey), firecrawl (firecrawl_base_url，web文献检索)
   · 学科新论文浏览（非关键词检索，需 sources+biorxiv_category 显式用）: biorxiv, medrxiv
   · 不稳定（可能 403/超时，失败自动降级）: google_scholar, ssrn, base, citeseerx
-  · 不可用: acm（未实现）, unpaywall（仅DOI查询，用于下载 fallback）
+  · 不可用: acm（未实现）, unpaywall（仅DOI查询，用于下载 fallback）,
+    patsnap（专利源，不参与论文检索；请用 search_patents）
   · v2.9 起 semantic/openalex/crossref/europepmc/core/biorxiv/medrxiv/iacr 转直连
   · v2.9.1：AND 语义源（hal/pubmed/pmc/europepmc/openaire/ieee）长查询 0 命中时
     自动逐级砍尾词放宽；dblp 反爬拦截页（200+HTML）明确报错不再误报 JSON 解析失败
@@ -40,19 +41,25 @@ description: 学术论文搜索、全文阅读、PDF 下载入 Knowledge（RAG�
     (c) 跨源去重按 DOI 精确匹配（不做标题模糊合并，避免误杀预印本/正式版），
     返回 duplicates_removed；(d) download 端点跟随 papers_service_url valve。
     注：AND 源的逐级放宽（_relax_and）与 biorxiv/medrxiv 学科浏览是既定设计，未改动。
+  · v2.9.12：只改工具描述（无行为变更）——把 v2.9.11 新增的返回字段写进 LLM 可见的
+    docstring（ignored_sources/admin_alert/duplicates_removed/notes），并点明
+    "未知源不静默 0""patsnap 是专利源"；sources 参数说明同步。
   【web 搜索兜底】源出现连接/超时错误时自动触发，tavily 主 → firecrawl 备，
   域名限定动态映射自失败源（如 arxiv 失败只补 arxiv.org）。配 tavily_base_url /
   firecrawl_base_url 启用，返回含 fallback_domains/fallback_limit 字段。
 
   【工具用法】
   1. search_papers(query)      → 多源并发搜索+去重，返回标题/作者/摘要/引用数/pdf_url
+     另有 ignored_sources（请求了但未执行的源及原因）/ admin_alert（疑似上游接口漂移，
+     请转告管理员核对）/ duplicates_removed（DOI 去重条数）/ notes / diagnostics；
+     0 命中时先看这几项，再判断是不是真的没有论文
   2. read_paper(source, paper_id, pdf_url) → 读全文（pdf_url 作 fallback，建议总传）
   3. download_paper_to_knowledge(...)      → PDF 下载并加入 Knowledge 知识库
   4. search_patents(query)     → 智慧芽专利语义检索（需配 zhihuiya_apikey）
   5. read_patent(patent_number) → 读专利全文 markdown（权利要求+说明书+法律状态）
 author: openags-bridge
 requirements: requests, pymupdf, anyio
-version: 2.9.11
+version: 2.9.12
 license: MIT
 """
 
@@ -2606,12 +2613,18 @@ class Tools:
         搜索学术论文：多源并发查询 + 去重，返回 title/authors/year/source/paper_id/doi/citations/pdf_url/abstract。
         - source+paper_id → read_paper 读全文；doi/pdf_url → download_paper_to_knowledge 入库
         - 单源失败不影响整体（见返回的 errors 字段）；源连接错误自动触发 tavily→firecrawl 兜底
+        - 返回还含：source_results（每源命中数）、ignored_sources（请求了但未执行的源及原因，
+          如 patsnap/未知源名/未配 key）、admin_alert（非连接类错误，疑似上游接口漂移，
+          请转告管理员核对）、duplicates_removed（DOI 去重条数）、notes、diagnostics（耗时）。
+          **0 命中时先看 ignored_sources / admin_alert / errors，再判断是否真的没有论文。**
         :param query: 学术检索词，越具体越好（如 'CRISPR base editing off-target'）
         :param max_results_per_source: 每源条数（默认5）。调大会显著拖慢响应（后端多源并发，
             每源都要等最慢的那个），一般不建议超过10
         :param sources: 留空用默认；或逗号分隔子集。可选值见模块顶部【搜索源清单】，
             常用: arxiv, semantic, openalex, pubmed, pmc, core, europepmc, zhihuiya, ieee,
-            firecrawl, dblp, hal, zenodo, openaire, doaj, iacr, crossref, google_scholar
+            firecrawl, dblp, hal, zenodo, openaire, doaj, iacr, crossref, google_scholar。
+            未知/拼错的源会进 ignored_sources 并在后端被剔除（不会静默返回 0）；
+            patsnap 是专利源，请改用 search_patents。
         :param biorxiv_category: 可选 bioRxiv 学科分类（如 biochemistry, cell_biology,
             bioinformatics, neuroscience 等，空格转下划线）。biorxiv/medrxiv 非关键词检索，
             返回该学科近30天新论文；传学科可提高相关性。
