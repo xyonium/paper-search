@@ -6,7 +6,8 @@ name: Notify compose to rebuild papers-service
 #
 # 需要 secret COMPOSE_DISPATCH_TOKEN：fine-grained PAT，仅 xyonium/compose 的
 # contents: write（创建后到 Settings → Secrets and variables → Actions 添加）。
-# 未配置时只告警并跳过，不把 workflow 标红（compose 侧还有手动 dispatch 兜底）。
+# 未配置时直接失败（不再绿色跳过）：notify 绿必须等于 dispatch 已送达，
+# 否则 tool.py 更新会静默不重建。手动补跑用 workflow_dispatch。
 
 on:
   push:
@@ -30,8 +31,8 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "${COMPOSE_DISPATCH_TOKEN}" ]; then
-            echo "::warning::COMPOSE_DISPATCH_TOKEN 未配置，跳过 dispatch（compose 侧靠漂移检测或手动 workflow_dispatch）"
-            exit 0
+            echo "::error::COMPOSE_DISPATCH_TOKEN 未配置——tool.py 更新不会触发 compose 重建；到仓库 Settings → Secrets 添加"
+            exit 1
           fi
           code=$(curl -sS -o /tmp/dispatch.json -w '%{http_code}' -X POST \
             -H "Authorization: Bearer ${COMPOSE_DISPATCH_TOKEN}" \
