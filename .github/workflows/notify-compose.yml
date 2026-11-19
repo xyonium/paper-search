@@ -1,0 +1,45 @@
+name: Notify compose to rebuild papers-service
+
+# tool.py 的唯一实现在本仓库；compose 的 papers-service 镜像构建时用
+# PAPER_SEARCH_REF=<main sha> 把 tool.py ADD 进去，所以本仓库 push 不会命中
+# compose 的 paths 过滤——这里用 repository_dispatch 显式通知它重建。
+#
+# 需要 secret COMPOSE_DISPATCH_TOKEN：fine-grained PAT，仅 xyonium/compose 的
+# contents: write（创建后到 Settings → Secrets and variables → Actions 添加）。
+# 未配置时只告警并跳过，不把 workflow 标红（compose 侧还有手动 dispatch 兜底）。
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "tool.py"
+
+permissions:
+  contents: read
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Dispatch paper-search-updated to xyonium/compose
+        env:
+          COMPOSE_DISPATCH_TOKEN: ${{ secrets.COMPOSE_DISPATCH_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${COMPOSE_DISPATCH_TOKEN}" ]; then
+            echo "::warning::COMPOSE_DISPATCH_TOKEN 未配置，跳过 dispatch（compose 侧靠漂移检测或手动 workflow_dispatch）"
+            exit 0
+          fi
+          code=$(curl -sS -o /tmp/dispatch.json -w '%{http_code}' -X POST \
+            -H "Authorization: Bearer ${COMPOSE_DISPATCH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            https://api.github.com/repos/xyonium/compose/dispatches \
+            -d '{"event_type":"paper-search-updated"}')
+          cat /tmp/dispatch.json
+          if [ "$code" != "204" ]; then
+            echo "::error::repository_dispatch 失败（HTTP $code）——检查 PAT 是否过期/权限是否含 compose contents:write"
+            exit 1
+          fi
+          echo "dispatched paper-search-updated"
