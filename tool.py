@@ -9,6 +9,8 @@ description: 学术论文搜索、全文阅读、PDF 下载入 Knowledge（RAG�
   · 需配 key/url 才启用（未配静默跳过）: zhihuiya (zhihuiya_apikey),
     ieee (ieee_apikey), firecrawl (firecrawl_base_url，web文献检索)
   · 学科新论文浏览（非关键词检索，需 sources+biorxiv_category 显式用）: biorxiv, medrxiv
+  · 需浏览器登录（仅显式点名，不进 all/默认）: szlib（深圳图书馆/读秀中文库）；
+    未登录时返回 login_required.login_url，浏览器完成验证后带 szlib_login_token 重试
   · 不稳定（可能 403/超时，失败自动降级）: google_scholar, ssrn, base, citeseerx
   · 不可用: acm（未实现）, unpaywall（仅DOI查询，用于下载 fallback）,
     patsnap（专利源，不参与论文检索；请用 search_patents）
@@ -44,6 +46,12 @@ description: 学术论文搜索、全文阅读、PDF 下载入 Knowledge（RAG�
   · v2.9.12：只改工具描述（无行为变更）——把 v2.9.11 新增的返回字段写进 LLM 可见的
     docstring（ignored_sources/admin_alert/duplicates_removed/notes），并点明
     "未知源不静默 0""patsnap 是专利源"；sources 参数说明同步。
+  · v2.9.13：接入 szlib（深圳图书馆/读秀，中文库）——sources=szlib 走 szlib-mcp 的
+    REST（POST /api/search）。需真实浏览器，故只能显式点名（不进 all/默认源）：
+    未登录时返回 login_required{login_url,login_token,expires_in}，用户完成浏览器验证后
+    带 szlib_login_token 重试同一查询；login_token 一次性、带 token 的请求服务端会阻塞
+    等验证（最长 300s，客户端超时设 330s）。仅元数据（类型/标题/出处/年），无全文无 DOI；
+    paper_id 由标题+出处+年哈希稳定生成，跨源去重不涉及（无 DOI）。
   【web 搜索兜底】源出现连接/超时错误时自动触发，tavily 主 → firecrawl 备，
   域名限定动态映射自失败源（如 arxiv 失败只补 arxiv.org）。配 tavily_base_url /
   firecrawl_base_url 启用，返回含 fallback_domains/fallback_limit 字段。
@@ -51,7 +59,8 @@ description: 学术论文搜索、全文阅读、PDF 下载入 Knowledge（RAG�
   【工具用法】
   1. search_papers(query)      → 多源并发搜索+去重，返回标题/作者/摘要/引用数/pdf_url
      另有 ignored_sources（请求了但未执行的源及原因）/ admin_alert（疑似上游接口漂移，
-     请转告管理员核对）/ duplicates_removed（DOI 去重条数）/ notes / diagnostics；
+     请转告管理员核对）/ duplicates_removed（DOI 去重条数）/ login_required（szlib 需登录）/
+     notes / diagnostics；
      0 命中时先看这几项，再判断是不是真的没有论文
   2. read_paper(source, paper_id, pdf_url) → 读全文（pdf_url 作 fallback，建议总传）
   3. download_paper_to_knowledge(...)      → PDF 下载并加入 Knowledge 知识库
@@ -59,12 +68,14 @@ description: 学术论文搜索、全文阅读、PDF 下载入 Knowledge（RAG�
   5. read_patent(patent_number) → 读专利全文 markdown（权利要求+说明书+法律状态）
 author: openags-bridge
 requirements: requests, pymupdf, anyio
-version: 2.9.12
+version: 2.9.13
 license: MIT
 """
 
 import asyncio
+import hashlib
 import json
+import os
 import re
 import anyio
 import requests
@@ -132,7 +143,7 @@ DIRECT_SOURCES = frozenset({
     "arxiv", "zhihuiya", "hal", "dblp", "zenodo", "ieee", "openaire",
     "firecrawl", "pubmed", "pmc",
     "semantic", "openalex", "crossref", "europepmc", "core",
-    "biorxiv", "medrxiv", "iacr",
+    "biorxiv", "medrxiv", "iacr", "szlib",
 })
 # 后端可提供服务的全部源（v2.9 起仅剩未直连的：doaj 字面源 + 不稳定源 + 特殊用途源；
 # citeseerx/base/ssrn/unpaywall/acm 等虽在后端但默认不启用）
@@ -230,6 +241,25 @@ def _relax_and(query: str, try_fn, max_terms: int = 6):
     return []
 
 
+class _SzlibLoginRequired(RuntimeError):
+    """szlib（深圳图书馆/读秀）需要用户在浏览器里登录一次。
+
+    202 响应携带一次性验证 URL 与 login_token：上层应把 URL 原样交给用户，
+    用户完成后带 login_token + 同一 session 重试。
+    """
+
+    def __init__(self, url: str, login_token: str, expires_in: int = 300,
+                 code: str = "AWAITING_LOGIN", message: str = ""):
+        self.url = url or ""
+        self.login_token = login_token or ""
+        self.expires_in = int(expires_in or 300)
+        # szlib 的 202 有两种形态：带 url+login_token 的 AWAITING_LOGIN，
+        # 以及只有 code+message 的 LOGIN_TIMEOUT / LOGIN_FAILED（没有新链接）
+        self.code = code or "AWAITING_LOGIN"
+        self.message = message or ""
+        super().__init__(f"szlib 需要登录: {self.url or self.message or self.code}")
+
+
 class _AntiBotBlocked(RuntimeError):
     """源明确返回反爬拦截页（如 Anubis 质询、人机验证）。
     区别于普通网络错误：触发 firecrawl（headless 浏览器自动解 JS 质询）兜底重试一次。"""
@@ -297,10 +327,17 @@ class Tools:
             "三个都没配则 google_scholar 仍走后端",
         )
 
+        szlib_url: str = Field(
+            default="http://szlib-mcp:8765",
+            description="深圳图书馆 szlib-mcp 的 REST 地址（同一 Docker 网络）。"
+            "sources=szlib 时使用：首次检索若未登录会返回一次性验证 URL，"
+            "用户浏览器登录后用 szlib_login_token 重试同一查询",
+        )
+
     class UserValves(BaseModel):
         default_sources: str = Field(
             default="arxiv,pubmed,semantic,crossref,openalex,pmc,core,europepmc,dblp,openaire,doaj,hal,zenodo,google_scholar,zhihuiya,ieee,firecrawl",
-            description="默认搜索源：'all'=全部 25 个论文源（18 直连 + 7 后端，慢，30s+）；或逗号分隔子集。默认未包含的源：iacr（密码学 ePrint 细分库，需要时 sources=iacr 显式调用）、citeseerx,ssrn,base,acm,unpaywall；biorxiv/medrxiv 为学科近30天浏览（非关键词检索），需 sources+biorxiv_category 显式调用。zhihuiya/ieee/firecrawl 在默认列表中，但仅当配了对应 key/url 才真正启用（未配静默跳过）",
+            description="默认搜索源：'all'=全部 26 个论文源（19 直连 + 7 后端，慢，30s+）；或逗号分隔子集。默认未包含的源：iacr（密码学 ePrint 细分库，需要时 sources=iacr 显式调用）、szlib（深圳图书馆/读秀，需浏览器登录，只能显式点名）、citeseerx,ssrn,base,acm,unpaywall；biorxiv/medrxiv 为学科近30天浏览（非关键词检索），需 sources+biorxiv_category 显式调用。zhihuiya/ieee/firecrawl 在默认列表中，但仅当配了对应 key/url 才真正启用（未配静默跳过）",
         )
         knowledge_id: str = Field(
             default="", description="下载 PDF 自动加入的 Knowledge 集合 ID"
@@ -380,6 +417,8 @@ class Tools:
         # ↓ 可选付费源（配 key 后工具存在，未配时调用会 404，被异常处理兜住）
         "ieee": None,  # 直连搜索（metadata 级）；read 走 pdf_url fallback（OA 可下）
         "acm": "read_acm_paper",
+        # ↓ 深圳图书馆/读秀：只有检索结果（元数据），无全文
+        "szlib": None,
         # ↓ 智慧芽：直连元数据级 read（literature_bibliography），非后端工具
         "zhihuiya": "zhihuiya_bibliography",
     }
@@ -630,6 +669,105 @@ class Tools:
     _HAL_FIELDS = ("halId_s,title_s,authFullName_s,abstract_s,doiId_s,"
                    "publicationDateY_i,producedDateY_i,submittedDate_s,"
                    "fileMain_s,uri_s,docType_s")
+
+    # ---------- 深圳图书馆 / 读秀（szlib-mcp REST，v2.9.13）----------
+    def _szlib_base(self, __user__=None) -> str:
+        """szlib-mcp 地址：UserValves 优先，否则 admin valve；都没有返回空串。"""
+        uv = __user__.get("valves") if __user__ else None
+        user_url = (getattr(uv, "szlib_url", "") or "").strip() if uv else ""
+        base = user_url or (getattr(self.valves, "szlib_url", "") or "").strip() \
+            or os.environ.get("SZLIB_URL", "").strip()
+        return base.rstrip("/")
+
+    async def _szlib_search(self, query: str, limit: int, session: str = "default",
+                            login_token: str = "", __user__=None) -> list:
+        """读秀中文文献检索（经 szlib-mcp 的极简 REST）。
+
+        契约（szlib-mcp/docs/paper-search-integration.md）：
+          POST {base}/api/search {"query","limit","session","login_token"?}
+          200 → {"ok","total","by_type","items":[{"type","title","context"|"author","year"}]}
+          202 → {"status":"AWAITING_LOGIN","url","login_token","expires_in"} → 抛 _SzlibLoginRequired
+          400/500 → {"error"} → RuntimeError
+
+        只有检索元数据（无全文/无 DOI），论文条目 source=szlib、paper_id 由标题+出处+年哈希稳定生成。
+        szlib 需要真实浏览器（读秀 JS 渲染），所以是显式点名声源：不进 all、不进默认源。
+        """
+        base = self._szlib_base(__user__)
+        if not base:
+            raise RuntimeError("未配置 szlib_url（Valves.szlib_url，例如 http://szlib-mcp:8765）")
+        payload = {
+            "query": query,
+            "limit": max(1, min(int(limit), 50)),
+            "session": (session or "default").strip() or "default",
+        }
+        if login_token:
+            payload["login_token"] = login_token
+
+        # 带 login_token 时服务端会阻塞等用户完成验证（默认最长 300s），
+        # 超时设 330s；不能沿用默认 30s，否则客户端先断、用户以为失败了
+        timeout = 330 if login_token else 180
+
+        def _fetch():
+            return requests.post(f"{base}/api/search", json=payload, timeout=timeout)
+
+        try:
+            r = await anyio.to_thread.run_sync(_fetch)
+        except Exception as e:
+            raise RuntimeError(f"szlib 检索失败: {e}")
+
+        if r.status_code == 202:
+            try:
+                d = r.json() or {}
+            except ValueError:
+                d = {}
+            url = str(d.get("url") or "")
+            if url.startswith("/"):      # 未配 SZLIB_PUBLIC_BASE_URL 时返回相对路径
+                url = base + url
+            raise _SzlibLoginRequired(
+                url, d.get("login_token", ""), d.get("expires_in", 300),
+                code=str(d.get("code") or d.get("status") or "AWAITING_LOGIN"),
+                message=str(d.get("message") or ""))
+        if r.status_code != 200:
+            body = (r.text or "")[:300]
+            raise RuntimeError(f"szlib API {r.status_code}: {body}")
+        try:
+            data = r.json() or {}
+        except ValueError:
+            raise RuntimeError(f"szlib 返回非 JSON: {(r.text or '')[:200]}")
+
+        # 200 不等于有结果：duxiu 页面结构没匹配上时会给 ok=false + error
+        # （例如 SEARCH_BOX_NOT_FOUND）——这是上游页面漂移的信号，不能当 0 命中吞掉
+        if data.get("error"):
+            raise RuntimeError(f"szlib 返回异常: {str(data['error'])[:200]}")
+
+        papers = []
+        for it in (data.get("items") or [])[: limit]:
+            if not isinstance(it, dict):
+                continue
+            title = str(it.get("title") or "").strip()
+            if not title:
+                continue
+            ctx = str(it.get("context") or "").strip()
+            year = str(it.get("year") or "").strip()
+            ptype = str(it.get("type") or "").strip()
+            authors = str(it.get("author") or it.get("authors") or "").strip()
+            # 读秀只给"出处/类型/年份"这类上下文，塞进 abstract 供 LLM 判断相关性
+            abstract = " ".join(x for x in (f"[{ptype}]" if ptype else "", ctx) if x).strip()
+            pid = "szlib:" + hashlib.sha1(
+                f"{title}|{ctx}|{year}".encode("utf-8")).hexdigest()[:16]
+            papers.append({
+                "title": title,
+                "authors": authors,
+                "published_date": year,
+                "abstract": abstract,
+                "paper_id": pid,
+                "doi": "",
+                "source": "szlib",
+                "pdf_url": "",
+                "url": "",
+                "citations": 0,
+            })
+        return papers
 
     async def _hal_search(self, query: str, limit: int) -> list:
         """直连 HAL API（Solr JSON，无需 key）检索，返回 _trim_paper 兼容 dict 列表。
@@ -2125,6 +2263,7 @@ class Tools:
         "ssrn": ["ssrn.com"],
         "base": ["base-search.net"],
         "acm": ["dl.acm.org"],
+        "szlib": ["duxiu.com"],  # 深圳图书馆检索落读秀，兜底只搜这个域
     }
     # 全量学术域名（无源映射信息时的兜底集合）
     _ACADEMIC_DOMAINS = sorted({d for ds in _SOURCE_TO_DOMAINS.values() for d in ds} | {
@@ -2608,6 +2747,9 @@ class Tools:
         biorxiv_category: str = "",
         medrxiv_category: str = "",
         __user__={},
+        # ↓ 放在 __user__ 之后：保证既有位置参数调用（测试/外部）不受影响
+        szlib_session: str = "default",
+        szlib_login_token: str = "",
     ) -> str:
         """
         搜索学术论文：多源并发查询 + 去重，返回 title/authors/year/source/paper_id/doi/citations/pdf_url/abstract。
@@ -2615,7 +2757,8 @@ class Tools:
         - 单源失败不影响整体（见返回的 errors 字段）；源连接错误自动触发 tavily→firecrawl 兜底
         - 返回还含：source_results（每源命中数）、ignored_sources（请求了但未执行的源及原因，
           如 patsnap/未知源名/未配 key）、admin_alert（非连接类错误，疑似上游接口漂移，
-          请转告管理员核对）、duplicates_removed（DOI 去重条数）、notes、diagnostics（耗时）。
+          请转告管理员核对）、duplicates_removed（DOI 去重条数）、login_required
+          （szlib 需要用户浏览器登录，含 login_url/login_token）、notes、diagnostics（耗时）。
           **0 命中时先看 ignored_sources / admin_alert / errors，再判断是否真的没有论文。**
         :param query: 学术检索词，越具体越好（如 'CRISPR base editing off-target'）
         :param max_results_per_source: 每源条数（默认5）。调大会显著拖慢响应（后端多源并发，
@@ -2624,12 +2767,16 @@ class Tools:
             常用: arxiv, semantic, openalex, pubmed, pmc, core, europepmc, zhihuiya, ieee,
             firecrawl, dblp, hal, zenodo, openaire, doaj, iacr, crossref, google_scholar。
             未知/拼错的源会进 ignored_sources 并在后端被剔除（不会静默返回 0）；
-            patsnap 是专利源，请改用 search_patents。
+            patsnap 是专利源，请改用 search_patents；szlib（读秀）需浏览器登录，
+            只能显式点名（不进 all/默认），未登录时返回 login_required。
         :param biorxiv_category: 可选 bioRxiv 学科分类（如 biochemistry, cell_biology,
             bioinformatics, neuroscience 等，空格转下划线）。biorxiv/medrxiv 非关键词检索，
             返回该学科近30天新论文；传学科可提高相关性。
         :param medrxiv_category: 可选 medRxiv 学科分类（如 cardiovascular_medicine,
             epidemiology, infectious_diseases 等）。
+        :param szlib_session: szlib（深圳图书馆/读秀）会话名，默认 default；多人共用时按用户区分
+        :param szlib_login_token: szlib 需要登录时，把 login_required.login_token 原样带回来重试
+            （同一 query + 同一 session），登录完成后即可拿到结果
         """
         uv = __user__.get("valves") if __user__ else None
         src = (
@@ -2688,6 +2835,9 @@ class Tools:
         # all 模式下不传分类就是全学科噪声，故 all 需带对应 category 才启用
         want_biorxiv = "biorxiv" in src_set or (all_mode and bool(biorxiv_category))
         want_medrxiv = "medrxiv" in src_set or (all_mode and bool(medrxiv_category))
+        # szlib（深圳图书馆/读秀）要真实浏览器 + 可能弹登录：只认显式点名，
+        # 不进 all、不进默认源，否则整批检索会被一次登录卡住
+        want_szlib = "szlib" in src_set
         # firecrawl 是独立源：配了 firecrawl_base_url 且在 sources 里才启用
         want_firecrawl = bool(self._firecrawl_base(__user__)) and ("firecrawl" in src_set or all_mode)
         ieee_enabled, ieee_key = self._ieee_enabled_key(__user__)
@@ -2866,6 +3016,10 @@ class Tools:
         async def _iacr():
             return await self._iacr_search(original, max_results_per_source)
 
+        async def _szlib():
+            return await self._szlib_search(
+                original, max_results_per_source, szlib_session, szlib_login_token, __user__)
+
         async def _fc():
             # firecrawl 内部有查询处理，但保守起见用 core（去噪声词，保语义不截断）
             return await self._firecrawl_search_papers(core, max_results_per_source, __user__)
@@ -2933,6 +3087,8 @@ class Tools:
             branches["medrxiv"] = _timed("medrxiv", _medrxiv)
         if want_iacr:
             branches["iacr"] = _timed("iacr", _iacr)
+        if want_szlib:
+            branches["szlib"] = _timed("szlib", _szlib)
         if want_firecrawl:
             branches["firecrawl"] = _timed("firecrawl", _fc)
         if want_ieee:
@@ -2963,6 +3119,7 @@ class Tools:
         biorxiv_result = outcome.get("biorxiv")
         medrxiv_result = outcome.get("medrxiv")
         iacr_result = outcome.get("iacr")
+        szlib_result = outcome.get("szlib")
         gscholar_result = outcome.get("google_scholar")
 
         # 后端失败处理：若任一直连源有结果则保留，否则报错
@@ -3114,6 +3271,41 @@ class Tools:
                 iap = [self._trim_paper(p) for p in iacr_result]
                 papers.extend(iap)
                 source_results["iacr"] = len(iap)
+        _login_req = None
+        if want_szlib:
+            if isinstance(szlib_result, _SzlibLoginRequired):
+                source_results["szlib"] = 0
+                # 三种 202：待登录 / 验证超时 / 登录失败。只有第一种带新链接。
+                if szlib_result.code == "AWAITING_LOGIN" and szlib_result.url:
+                    _login_req = {
+                        "source": "szlib",
+                        "login_url": szlib_result.url,
+                        "login_token": szlib_result.login_token,
+                        "expires_in": szlib_result.expires_in,
+                        "notice": (
+                            "深圳图书馆（读秀）需要先用浏览器登录："
+                            f"打开 login_url 完成（{max(1, szlib_result.expires_in // 60)} 分钟内有效），"
+                            "然后带同一个 szlib_login_token 重试同样的查询即可。"
+                        ),
+                    }
+                else:
+                    _login_req = {
+                        "source": "szlib",
+                        "code": szlib_result.code,
+                        "notice": (
+                            "深圳图书馆登录未完成（"
+                            f"{szlib_result.code}{('：' + szlib_result.message) if szlib_result.message else ''}）。"
+                            "login_token 是一次性的；请不带 szlib_login_token 重新发起同一次检索，"
+                            "拿到新的登录链接后再完成登录。"
+                        ),
+                    }
+            elif isinstance(szlib_result, Exception):
+                source_results["szlib"] = 0
+                errors["szlib"] = str(szlib_result)
+            elif szlib_result is not None:
+                szp = [self._trim_paper(p) for p in szlib_result]
+                papers.extend(szp)
+                source_results["szlib"] = len(szp)
         if want_firecrawl:
             if isinstance(firecrawl_result, Exception):
                 source_results["firecrawl"] = 0
@@ -3154,6 +3346,11 @@ class Tools:
             out["duplicates_removed"] = _dups
         if _ignored or _unknown or _disabled:
             out["ignored_sources"] = _ignored_payload()
+        if _login_req:
+            out["login_required"] = _login_req
+            if _login_req.get("login_url"):
+                out.setdefault("notes", []).append(
+                    "szlib 需要登录：请把 login_required.login_url 打开完成验证后再试")
         # 默认路径下被跳过的 key 门控源：只在这个汇总里说一句（避免每次默认调用刷屏）。
         # 注意 biorxiv/medrxiv 的"学科浏览、query 不参与检索"是既定设计（工具描述已写明），
         # 不在返回体里重复提示——2026-11 审计曾误当缺陷，此处不重复加噪声。

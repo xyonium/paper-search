@@ -38,6 +38,7 @@ def _mk():
     v.firecrawl_base_url = os.environ.get("FIRECRAWL_BASE_URL", "")
     v.tavily_base_url = os.environ.get("TAVILY_BASE_URL", "")
     v.apify_rotator_base_url = os.environ.get("APIFY_ROTATOR_BASE_URL", "")
+    v.szlib_url = os.environ.get("SZLIB_URL", "")
     return t
 
 
@@ -84,6 +85,8 @@ CASES = {
     # --- 需 key（未配置则 SKIP） ---
     "ieee":      (lambda t: t._ieee_search("neural network", 3, t.valves.ieee_apikey), True),
     "zhihuiya":  (lambda t: t._zhihuiya_search("葡萄糖 传感器", 3, t.valves.zhihuiya_apikey), True),
+    # szlib（深圳图书馆/读秀）：需独立容器 + 可能弹登录，SZLIB_URL 未设则 SKIP
+    "szlib":     (lambda t: t._szlib_search("城市更新", 3), True),
     # google_scholar 三级链（v2.9.4）：FIRECRAWL_BASE_URL 首选 → APIFY_ROTATOR_BASE_URL 兜底
     "google_scholar": (_scholar_live, True),
 }
@@ -95,6 +98,7 @@ async def run_one(name, factory):
     if needs_key:
         key_map = {"ieee": t.valves.ieee_apikey,
                    "zhihuiya": t.valves.zhihuiya_apikey,
+                   "szlib": t.valves.szlib_url,
                    "google_scholar": (t.valves.firecrawl_base_url
                                       or t.valves.tavily_base_url
                                       or t.valves.apify_rotator_base_url)}

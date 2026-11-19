@@ -19,7 +19,7 @@ This repository integrates multi-source academic paper searching, reading, and d
         └── OpenWebUI Python Tool (Bridge & Interceptor Layer)
                  │
                  ├── search_papers()  ──┬─► POST http://mcpo:8000/papers/search_papers
-                 │                      │    (18 direct adapters + 7 backend-only = 25 paper sources)
+                 │                      │    (19 direct adapters + 7 backend-only = 26 paper sources)
                  │                      └─► zhihuiya MCP 直连 (streamable-http, apikey 启用)
                  │                           search_literature + literature_bibliography
                  │
@@ -113,7 +113,7 @@ zhihuiya/ieee/firecrawl 在默认列表中，但**必须同时满足两个条件
 |---|---|---|
 | **语义/分词** | openalex, semantic, crossref, europepmc, arxiv, core | `original`（原始完整查询，保语义） |
 | **字面关键词** | zhihuiya, doaj | `core`（去引号/裸露 OR/AND/NOT/中英噪声词）再 `_distill_core_terms` 截断到 ≤5 个高区分度术语 |
-| **直连**（绕后端） | hal, zhihuiya, dblp, zenodo, pubmed, pmc, arxiv, semantic, openalex, crossref, europepmc, core, biorxiv, medrxiv, iacr, ieee, openaire, firecrawl | hal 走 `_hal_search`（绕后端 hal.py 的 isoformat bug）；hal 用 core，zhihuiya 用 distilled；dblp 走 `_dblp_search`（v2.5.3+，绕后端 dblp.py 的并发 ConnectionError + 无退避重试 bug）用 original（CS 书目，非 CS 查询 0 结果属正常）；zenodo 走 `_zenodo_search`（v2.5.3+，绕后端 zenodo.py 的 published_date str→isoformat crash bug）用 original；pubmed/pmc 走 `_pubmed_search`/`_pmc_search`（v2.6+，绕后端 pubmed.py 无 timeout 无限挂起 bug）用 original |
+| **直连**（绕后端） | hal, zhihuiya, dblp, zenodo, pubmed, pmc, arxiv, semantic, openalex, crossref, europepmc, core, biorxiv, medrxiv, iacr, ieee, openaire, firecrawl, szlib（显式） | hal 走 `_hal_search`（绕后端 hal.py 的 isoformat bug）；hal 用 core，zhihuiya 用 distilled；dblp 走 `_dblp_search`（v2.5.3+，绕后端 dblp.py 的并发 ConnectionError + 无退避重试 bug）用 original（CS 书目，非 CS 查询 0 结果属正常）；zenodo 走 `_zenodo_search`（v2.5.3+，绕后端 zenodo.py 的 published_date str→isoformat crash bug）用 original；pubmed/pmc 走 `_pubmed_search`/`_pmc_search`（v2.6+，绕后端 pubmed.py 无 timeout 无限挂起 bug）用 original |
 
 **字面源截断临界点实测**（真实环境，决定 max_terms=5 的依据）：
 
@@ -213,6 +213,7 @@ Unpaywall 查 OA 直链（有 DOI 时）→ 是PDF下载 / 非PDF落地页则网
 | **CiteSeerX** | ✅（代码有） | 端点已死 | 支持搜索，但 API 重定向 archive.org 404，无法修复 |
 | **Zenodo** | ✅（Elasticsearch） | ✅ 已直连修复 | 后端 `zenodo.py` isoformat bug（published_date str 传给 Paper）→ v2.5.3 起改直连 `_zenodo_search`，多数记录有 OA PDF |
 | **IEEE** | ✅（REST API） | ✅ 已直连修复 | 后端 `ieee.py` 是骨架（`raise NotImplementedError`），但 IEEE Xplore 有公开 REST API → v2.5.3 起改直连 `_ieee_search`，需配 `ieee_apikey`（Valves/UserValves），metadata 级（abstract+著录），OA 论文有 pdf_url |
+| **szlib (深圳图书馆/读秀)** | ✅（中文库，需浏览器） | ✅ 已接入 | 走 szlib-mcp 的 `POST /api/search`；未登录返回 `login_required.login_url`，用户浏览器完成验证后带 `szlib_login_token` 重试；login_token 一次性、带 token 的请求服务端会阻塞等验证（客户端超时 330s）。**只认显式点名**，不进 all/默认源 |
 | **ACM** | ⚠️ 骨架 | 未实现 | `search is not yet implemented`，无公开 REST API，需 ACM 会员，tool.py 层无法绕过 |
 | **Unpaywall** | ❌ | 仅 DOI 查询 | **不支持关键词搜索**；用于 download fallback 链按 DOI 查 OA PDF |
 

@@ -98,6 +98,25 @@
 | **IEEE Xplore** | ✅ REST API | ⚠️ pdf_url (OA only) | Direct REST API. Enabled when `ieee_apikey` is non-empty; skipped silently when no key. Metadata-level (abstract+bibliographic); OA papers have pdf_url |
 | **Google Scholar (fallback chain)** | ✅ firecrawl → tavily → Apify actor | ❌ (use url) | Tier 1: `firecrawl_base_url` (e.g. mcpo → official firecrawl cloud) — scrapes the Scholar result page via stealth cloud egress, parses titles/authors/year/citations/PDF links from markdown. Tier 2: `tavily_base_url` — `/extract` with `extract_depth=advanced` (basic only returns bare titles). Tier 3: `apify_rotator_base_url` — the `johnvc/google-scholar-api` actor through the rotator's key pool (PAY_PER_EVENT; free tier works with reduced counts). None configured → scholar stays on the backend (anti-bot prone) |
 
+### szlib (深圳图书馆 / 读秀) — Chinese library, browser-backed
+
+Chinese-language coverage (journals/theses/conference papers) via a separate `szlib-mcp`
+container (Playwright + Firefox; it cannot live inside mcpo). paper-search talks to its tiny REST API:
+
+```
+POST {szlib_url}/api/search   {"query","limit","session","login_token"?}
+  200 → {ok,total,by_type,items:[{type,title,context,year}]}
+  202 → {status/code,url,login_token,expires_in}   ← user must log in once in a browser
+```
+
+- Set the `szlib_url` valve (default `http://szlib-mcp:8765`); both containers must share a Docker network.
+- First `sources="szlib"` call returns `login_required{login_url,login_token,expires_in}` — open the URL,
+  finish the library login, then retry the same query with `szlib_login_token` (and the same `szlib_session`).
+- `login_token` is single-use and the token-carrying request blocks until verification (up to 300 s;
+  client timeout is 330 s). Timeout/failure returns another 202 without a URL → re-issue **without** the token to get a fresh link.
+- Results are metadata only (no DOI/full text): `paper_id` is `szlib:<sha1>`, `abstract` carries `[type] context/year`.
+- Not in `all` and not in `default_sources` by design.
+
 ### Sources NOT in default (grouped by keyword-search capability)
 
 | Source | Keyword search | Why not default |
@@ -109,6 +128,7 @@
 | **CiteSeerX** | ✅ (code) | Endpoint dead (redirects to archive.org 404) |
 | **ACM** | ⚠️ skeleton | `search is not yet implemented`, no public REST API |
 | **Unpaywall** | ❌ | **DOI lookup only** — used in the download fallback chain to find OA PDFs, not a search source |
+| **szlib (深圳图书馆 / 读秀)** | ✅ (Chinese) | Needs a real browser + a one-time user login (szlib-mcp container). **Explicit only** — never in `all` or `default_sources`. See *szlib* below |
 
 ---
 
