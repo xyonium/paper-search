@@ -2,11 +2,11 @@
 
 > 来源：2026-11-18 一轮"静默失败"审计（含两次误判）＋ `.superpowers/sdd/` 历史记录
 > ＋ `docs/superpowers/specs/` 设计文档。目的只有一个：**别再把手艺当 bug 改坏**。
-> 与 `CLAUDE.md` 冲突时，以代码 + 设计文档为准，并回来修正本文件。
+> 与 `AGENTS.md` 冲突时，以代码 + 设计文档为准，并回来修正本文件。
 
 ## 0. 判断流程（顺序别跳）
 
-1. 这行为在 `CLAUDE.md` 的 `vX.Y.Z` 条目或 `docs/superpowers/specs/` 里有解释吗？
+1. 这行为在 `AGENTS.md` 的 `vX.Y.Z` 条目或 `docs/superpowers/specs/` 里有解释吗？
    → 有 = 既定设计，改之前先问"为什么当初这么写"。
 2. 代码里是否有对应分支/常量成员？（例：`DIRECT_SOURCES` 的每个成员都该有 `want_*` 分支）
    → 常量与实现不一致 = 真缺陷。
@@ -17,10 +17,10 @@
 
 | 行为 | 理由 | 出处 |
 |---|---|---|
-| AND 源逐级放宽：>6 词先蒸馏 → 取前 5 词 → 0 命中砍尾词 | hal/europepmc/pubmed/pmc/openaire/ieee 把空格当 AND；11 词自然语言实测全 0（hal 0→61、europepmc 0→55） | `CLAUDE.md:141`（v2.9.1）、`tool.py:191-206` |
-| 字面源截断到 5 词（zhihuiya/doaj） | 长自然语言 0 命中；doaj 5 词是硬需求（3 词 11 命中 → 5 词 0 的实测） | `docs/superpowers/specs/2026-08-05-literal-source-term-distillation-design.md`、`CLAUDE.md:103-110` |
-| biorxiv/medrxiv 忽略 query（近 30 天学科浏览） | 上游 API 只支持按学科分类浏览，非关键词检索；显式点名才启用 | `CLAUDE.md:128`、`:204`、`2026-08-05-biorxiv-medrxiv-repositioning-design.md` |
-| key 门控源未配 key 时跳过 | "配 key 是必要非充分条件"；v2.9.11 起**显式请求时会回报**，默认路径只在 `notes` 汇总 | `CLAUDE.md:101`、`tool.py` 的 `KEY_GATED_SOURCES` |
+| AND 源逐级放宽：>6 词先蒸馏 → 取前 5 词 → 0 命中砍尾词 | hal/europepmc/pubmed/pmc/openaire/ieee 把空格当 AND；11 词自然语言实测全 0（hal 0→61、europepmc 0→55） | `AGENTS.md:141`（v2.9.1）、`tool.py:191-206` |
+| 字面源截断到 5 词（zhihuiya/doaj） | 长自然语言 0 命中；doaj 5 词是硬需求（3 词 11 命中 → 5 词 0 的实测） | `docs/superpowers/specs/2026-08-05-literal-source-term-distillation-design.md`、`AGENTS.md:103-110` |
+| biorxiv/medrxiv 忽略 query（近 30 天学科浏览） | 上游 API 只支持按学科分类浏览，非关键词检索；显式点名才启用 | `AGENTS.md:128`、`:204`、`2026-08-05-biorxiv-medrxiv-repositioning-design.md` |
+| key 门控源未配 key 时跳过 | "配 key 是必要非充分条件"；v2.9.11 起**显式请求时会回报**，默认路径只在 `notes` 汇总 | `AGENTS.md:101`、`tool.py` 的 `KEY_GATED_SOURCES` |
 | `_is_web_junk` 判废过短/反爬页（<500 字符或含 cloudflare 等） | 抓回来的是 "Just a moment…" 挑战页时不能当全文 | `tool.py` 的 `_WEB_JUNK_MARKERS` |
 | 单源失败不影响整体 | 多源并发契约；失败进 `errors`，不抛 | `tool.py` search_papers docstring |
 | 后端挂掉仍保留直连结果；bibliography 挂只降级为空 abstract（search 自身错误才传播） | 最小化错误边界，别因为补元数据失败丢掉已拿到的论文 | `.superpowers/sdd/final-fix-report.md` Fix 2/3 |
@@ -65,12 +65,12 @@
 
 ## 5. 踩过的坑（血泪，别重犯）
 
-1. **把既定设计当 bug**：`_relax_and` 放宽、biorxiv 学科浏览都被我标成缺陷，实际 `CLAUDE.md:141/128`
+1. **把既定设计当 bug**：`_relax_and` 放宽、biorxiv 学科浏览都被我标成缺陷，实际 `AGENTS.md:141/128`
    写得很清楚。加运行时提示也是噪声，已回退。
 2. **只看常量不看分支**：`patsnap` 在 `DIRECT_SOURCES` 里"看起来"是直连源，实际只在
    `backend_set` 的减法里存在 —— 于是 `sources=patsnap` 既不调后端也无分支，静默 0。
 3. **计划文档会过期**：`2026-08-05-query-adaptation-layer-design.md:38` 写"patsnap 本就在
-   tool.py 直连"（错）；同文档把 iacr 归入字面组，而 v2.6 已移出（`CLAUDE.md:110`）。照抄计划会踩坑。
+   tool.py 直连"（错）；同文档把 iacr 归入字面组，而 v2.6 已移出（`AGENTS.md:110`）。照抄计划会踩坑。
 4. **标题模糊去重会误杀**：预印本/正式版/勘误同题不同年，用"标题+年"合并会把不同条目吞掉 →
    改成**只按 DOI 精确匹配**，无 DOI 一律保留。
 5. **默认路径别刷屏**：显式 `sources=` 才逐条回报；落回 valve 默认值时只在 `notes` 汇总一句。
@@ -98,7 +98,7 @@
 
 ## 7. 当前状态
 
-- 分支 `fix/silent-source-reporting`（未推送）：`tool.py` + `README.md` + `CLAUDE.md` +
+- 分支 `fix/silent-source-reporting`（未推送）：`tool.py` + `README.md` + `AGENTS.md` +
   `tests/test_sources_reporting.py`
 - `.superpowers/sdd/` 是本地未跟踪记录（`.gitignore: *`），不会进仓库；要留档就往
   `docs/superpowers/` 写
