@@ -421,3 +421,22 @@ async def test_dblp_unexpected_status_produces_actionable_error():
         monkey.undo()
     assert "304" in out["errors"]["dblp"]
     assert "304" in out["admin_alert"]["sources"]["dblp"]
+
+@pytest.mark.asyncio
+async def test_dblp_202_is_antibot_not_drift():
+    """dblp 的 Anubis 质询页现在回 202：要归反爬，不能报成"接口漂移"的 admin_alert。"""
+    t = Tools(); t.valves = Tools.Valves()
+
+    class R:
+        status_code = 202
+        headers = {}
+
+    monkey = pytest.MonkeyPatch()
+    monkey.setattr(tool_mod.requests, "get", lambda *a, **k: R())
+    try:
+        t._papers_call = lambda *a, **k: {"papers": [], "source_results": {}, "errors": {}}
+        out = json.loads(await t.search_papers("q", 3, "dblp", "", "", {}))
+    finally:
+        monkey.undo()
+    assert "反爬" in out["errors"]["dblp"]
+    assert "admin_alert" not in out

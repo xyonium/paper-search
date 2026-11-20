@@ -56,6 +56,9 @@ description: 学术论文搜索、全文阅读、PDF 下载入 Knowledge（RAG�
     （sources="szlib,doaj" 这类混合请求仍能拿到登录链接）；(b) 带 token 的请求超时会
     明确"login_token 已作废、请重新发起"，且 szlib 不再触发 web 兜底（读秀要登录，
     tavily/firecrawl 对它必然无效）；(c) 补 7 个边界测试。
+  · v2.9.15：dblp 的 Anubis 质询页现在以 HTTP 202 返回（2026-11 实测）——归入反爬
+    处理（抛 _AntiBotBlocked、有 firecrawl 则走浏览器兜底），不再被误报成"接口漂移"
+    的 admin_alert；403 同样处理。
   【web 搜索兜底】源出现连接/超时错误时自动触发，tavily 主 → firecrawl 备，
   域名限定动态映射自失败源（如 arxiv 失败只补 arxiv.org）。配 tavily_base_url /
   firecrawl_base_url 启用，返回含 fallback_domains/fallback_limit 字段。
@@ -72,7 +75,7 @@ description: 学术论文搜索、全文阅读、PDF 下载入 Knowledge（RAG�
   5. read_patent(patent_number) → 读专利全文 markdown（权利要求+说明书+法律状态）
 author: openags-bridge
 requirements: requests, pymupdf, anyio
-version: 2.9.14
+version: 2.9.15
 license: MIT
 """
 
@@ -868,6 +871,11 @@ class Tools:
                         },
                         timeout=30,
                     )
+                    # 2026-11 实测：dblp 的 Anubis 质询页会以 **202** 返回（不再只是
+                    # 200+text/html）——必须按反爬处理，否则会被当成"接口漂移"告警
+                    if r.status_code in (202, 403):
+                        raise _AntiBotBlocked(
+                            f"dblp HTTP {r.status_code}，疑似反爬拦截页（Anubis 质询）")
                     if r.status_code == 200:
                         # 200 但非 JSON = 反爬拦截页（2026-09 实测 dblp 上 Anubis
                         # "Making sure you're not a bot" 质询页，requests 解不了 PoW）
