@@ -59,6 +59,11 @@ description: 学术论文搜索、全文阅读、PDF 下载入 Knowledge（RAG�
   · v2.9.15：dblp 的 Anubis 质询页现在以 HTTP 202 返回（2026-11 实测）——归入反爬
     处理（抛 _AntiBotBlocked、有 firecrawl 则走浏览器兜底），不再被误报成"接口漂移"
     的 admin_alert；403 同样处理。
+  · v2.9.16：第二轮评审修复——(a) UserValves 补 szlib_url（个人级覆盖原先读不到字段，
+    被测试里的 SimpleNamespace 桩掩盖）；(b) 200 且 ok=false（error 可能为 null）不再当 0 命中；
+    (c) 202 非 JSON 直接报错，不再伪装成"待登录但没链接"；(d) 只有 ReadTimeout 才断言
+    login_token 已作废，连接类错误不误报；(e) _SzlibLoginRequired.__str__ 去掉内嵌 token 的
+    verify url（防日志泄露）；(f) 后端非 dict 返回与 notes 合并两处丢 login_required 的边界修复。
   【web 搜索兜底】源出现连接/超时错误时自动触发，tavily 主 → firecrawl 备，
   域名限定动态映射自失败源（如 arxiv 失败只补 arxiv.org）。配 tavily_base_url /
   firecrawl_base_url 启用，返回含 fallback_domains/fallback_limit 字段。
@@ -75,7 +80,7 @@ description: 学术论文搜索、全文阅读、PDF 下载入 Knowledge（RAG�
   5. read_patent(patent_number) → 读专利全文 markdown（权利要求+说明书+法律状态）
 author: openags-bridge
 requirements: requests, pymupdf, anyio
-version: 2.9.15
+version: 2.9.16
 license: MIT
 """
 
@@ -264,7 +269,9 @@ class _SzlibLoginRequired(RuntimeError):
         # 以及只有 code+message 的 LOGIN_TIMEOUT / LOGIN_FAILED（没有新链接）
         self.code = code or "AWAITING_LOGIN"
         self.message = message or ""
-        super().__init__(f"szlib 需要登录: {self.url or self.message or self.code}")
+        # 注意：url 里内嵌一次性 login_token，不能进 __str__（日志/回溯会泄露）；
+        # 需要链接的地方显式读 .url（search_papers 的 login_required）
+        super().__init__(f"szlib 需要登录（{self.code}）")
 
 
 class _AntiBotBlocked(RuntimeError):
@@ -393,6 +400,10 @@ class Tools:
             default="",
             description="Jina Reader API key（个人级，非空时覆盖管理员 key）",
             json_schema_extra={"input": {"type": "password"}},
+        )
+        szlib_url: str = Field(
+            default="",
+            description="szlib-mcp 地址（个人级，非空时覆盖管理员 szlib_url，如 http://szlib-mcp:8765）",
         )
 
     # 覆盖全部 21 个源 + 可选 IEEE/ACM（配 key 后动态注册）
@@ -720,17 +731,27 @@ class Tools:
         try:
             r = await anyio.to_thread.run_sync(_fetch)
         except Exception as e:
-            if login_token:
+            # 只有 ReadTimeout 能断言"请求已发出、token 可能已被消耗"；
+            # 连接失败/DNS 错误时 token 大概率还没用上，不能误报"已作废"
+            if login_token and isinstance(e, requests.exceptions.ReadTimeout):
                 raise RuntimeError(
                     f"szlib 登录验证未在 330s 内完成（{e}）。login_token 已作废，"
                     "请不带 szlib_login_token 重新发起同一次检索，拿到新的登录链接再完成验证")
+            if login_token:
+                raise RuntimeError(
+                    f"szlib 带 token 检索失败（{type(e).__name__}: {e}）。token 是否已消耗未知，"
+                    "请先不带 szlib_login_token 重试；仍要登录就重新发起拿新链接")
             raise RuntimeError(f"szlib 检索失败: {e}")
 
         if r.status_code == 202:
             try:
                 d = r.json() or {}
             except ValueError:
-                d = {}
+                # 202 但不是 JSON：多半是网关/反爬页，不是 szlib-mcp 的登录信号。
+                # 当成"待登录但没链接"会骗用户去点不存在的链接，直接报错更有用
+                raise RuntimeError(f"szlib 202 非 JSON: {(r.text or '')[:200]}")
+            if not isinstance(d, dict):
+                raise RuntimeError(f"szlib 202 非对象 JSON: {str(d)[:200]}")
             url = str(d.get("url") or "")
             if url.startswith("/"):      # 未配 SZLIB_PUBLIC_BASE_URL 时返回相对路径
                 url = base + url
@@ -745,9 +766,15 @@ class Tools:
             data = r.json() or {}
         except ValueError:
             raise RuntimeError(f"szlib 返回非 JSON: {(r.text or '')[:200]}")
+        if not isinstance(data, dict):
+            raise RuntimeError(f"szlib 返回非对象 JSON: {str(data)[:200]}")
 
-        # 200 不等于有结果：duxiu 页面结构没匹配上时会给 ok=false + error
-        # （例如 SEARCH_BOX_NOT_FOUND）——这是上游页面漂移的信号，不能当 0 命中吞掉
+        # 200 不等于有结果：duxiu 页面结构没匹配上时会给 ok=false（error 可能为 null，
+        # 如渲染超时）或 ok=false + error（如 SEARCH_BOX_NOT_FOUND）——都是上游漂移信号，
+        # 不能当 0 命中吞掉
+        if data.get("ok") is False:
+            raise RuntimeError(
+                f"szlib 返回 ok=false: {str(data.get('error') or '上游未给 error')[:200]}")
         if data.get("error"):
             raise RuntimeError(f"szlib 返回异常: {str(data['error'])[:200]}")
 
@@ -3193,7 +3220,10 @@ class Tools:
             result = backend_result
 
         if not isinstance(result, dict):
-            return json.dumps({"error": "backend 返回异常", "raw": str(result)[:500]}, ensure_ascii=False)
+            _err = {"error": "backend 返回异常", "raw": str(result)[:500]}
+            if _login_req:
+                _err["login_required"] = _login_req
+            return json.dumps(_err, ensure_ascii=False)
 
         papers = [self._trim_paper(p) for p in result.get("papers", [])]
         source_results = dict(result.get("source_results") or {})
@@ -3392,7 +3422,8 @@ class Tools:
             _notes.append("默认源中的 " + "、".join(sorted(_disabled_quiet))
                           + " 未配置 key/url，已跳过（配好后自动启用）")
         if _notes:
-            out["notes"] = _notes
+            # 用 extend 而不是赋值：login_required 可能已经追加过一条提示
+            out.setdefault("notes", []).extend(_notes)
         # 接口漂移告警：非连接/限流类错误无法自愈，必须让使用者知道去找管理员。
         # 字段独立于 errors（errors 会触发兜底、也可能被 LLM 当成"重试即可"）。
         _drift = self._admin_drift_errors(errors)

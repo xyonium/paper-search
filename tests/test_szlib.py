@@ -290,13 +290,13 @@ async def test_szlib_limit_is_clamped_to_50(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_szlib_user_valve_url_wins(monkeypatch):
-    from types import SimpleNamespace
     t = Tools(); t.valves = Tools.Valves()
     t.valves.szlib_url = "http://admin-szlib:8765"
     _no_backend(t)
     rec = []
     _patch_post(monkeypatch, FakeResp(200, {"ok": True, "items": [_item()]}), rec)
-    await t.search_papers("q", 3, "szlib", "", "", {"valves": SimpleNamespace(
+    # 必须用真的 UserValves：SimpleNamespace 桩会掩盖"字段根本没声明"的 bug
+    await t.search_papers("q", 3, "szlib", "", "", {"valves": Tools.UserValves(
         szlib_url="http://user-szlib:9999")})
     assert rec[0]["url"].startswith("http://user-szlib:9999")
 
@@ -314,3 +314,63 @@ async def test_szlib_never_sent_to_backend(monkeypatch):
     _patch_post(monkeypatch, FakeResp(200, {"ok": True, "items": [_item()]}))
     await t.search_papers("glucose biosensor", 3, "szlib,doaj", "", "", {})
     assert calls and calls[0]["sources"] == "doaj", "szlib 不能出现在后端 sources 里"
+
+# ---------- 第二轮评审（carbon）补测 ----------
+
+@pytest.mark.asyncio
+async def test_szlib_ok_false_without_error_is_not_zero(monkeypatch):
+    """duxiu 渲染超时会回 ok:false + error:null，不能当 0 命中吞掉。"""
+    t = Tools(); t.valves = Tools.Valves(); t.valves.szlib_url = "http://szlib.test:8765"
+    _no_backend(t)
+    _patch_post(monkeypatch, FakeResp(200, {"ok": False, "error": None, "items": []}))
+    out = json.loads(await t.search_papers("q", 3, "szlib", "", "", {}))
+    assert "ok=false" in out["errors"]["szlib"]
+
+
+@pytest.mark.asyncio
+async def test_szlib_202_non_json_is_error_not_login(monkeypatch):
+    """202 非 JSON 多半是网关/反爬页，不能伪装成"待登录但没链接"。"""
+    t = Tools(); t.valves = Tools.Valves(); t.valves.szlib_url = "http://szlib.test:8765"
+    _no_backend(t)
+    _patch_post(monkeypatch, FakeResp(202, None, text="<html>gateway</html>"))
+    out = json.loads(await t.search_papers("q", 3, "szlib", "", "", {}))
+    assert "202 非 JSON" in out["errors"]["szlib"]
+    assert "login_required" not in out
+
+
+@pytest.mark.asyncio
+async def test_szlib_token_connection_error_does_not_claim_token_dead(monkeypatch):
+    """连接错误时 token 大概率还没用上，不能说"已作废"。"""
+    t = Tools(); t.valves = Tools.Valves(); t.valves.szlib_url = "http://szlib.test:8765"
+    _no_backend(t)
+
+    def refused(*a, **k):
+        raise tool_mod.requests.exceptions.ConnectionError("connection refused")
+    monkeypatch.setattr(tool_mod.requests, "post", refused)
+    out = json.loads(await t.search_papers(
+        "城市更新", 3, "szlib", "", "", {}, szlib_login_token="tok"))
+    err = out["errors"]["szlib"]
+    assert "已作废" not in err and "是否已消耗未知" in err
+
+
+@pytest.mark.asyncio
+async def test_login_note_survives_disabled_source_notes(monkeypatch):
+    """login_required 的提示不能被后面的 notes 赋值整段覆盖。"""
+    t = Tools(); t.valves = Tools.Valves(); t.valves.szlib_url = "http://szlib.test:8765"
+    t.valves.zhihuiya_apikey = ""
+    _no_backend(t)
+    _patch_post(monkeypatch, FakeResp(202, {
+        "status": "AWAITING_LOGIN", "url": "https://pub.example/szlib/verify/x",
+        "login_token": "tok", "expires_in": 300}))
+    out = json.loads(await t.search_papers("城市更新", 3, "szlib", "", "", {}))
+    notes = out.get("notes") or []
+    assert any("login_required.login_url" in n for n in notes)
+
+
+@pytest.mark.asyncio
+async def test_szlib_login_exception_str_has_no_token_url():
+    """__str__ 不能带内嵌 token 的 verify url（日志/回溯泄露）。"""
+    exc = tool_mod._SzlibLoginRequired(
+        "https://pub.example/szlib/verify/secret-token", "secret-token", 300)
+    assert "secret-token" not in str(exc)
+    assert exc.url.endswith("secret-token")   # 需要链接的地方显式读属性
